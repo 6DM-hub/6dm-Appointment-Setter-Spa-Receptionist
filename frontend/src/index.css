@@ -1,0 +1,41 @@
+﻿@import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer components {
+  .field-label {
+    @apply mb-2 block text-[11px] font-medium text-slate-400;
+  }
+
+  .field-input {
+    @apply w-full rounded-lg border border-slate-700 bg-[#07111f] px-3 py-2.5 text-xs text-white outline-none placeholder:text-slate-600 focus:border-cyan-400;
+  }
+}
+
+:root {
+  font-family: "Manrope", "Segoe UI", sans-serif;
+  color: #e2e8f0;
+  background: #07111f;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+.font-display {
+  font-family: "Manrope", "Segoe UI", sans-serif;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  background: #07111f;
+}
+
+button, input, textarea, select {
+  font: inherit;
+}
+
+html, body, #root {
+  height: 100%;
+}

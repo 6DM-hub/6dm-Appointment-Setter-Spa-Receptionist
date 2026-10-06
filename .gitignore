@@ -1,0 +1,20 @@
+# Secrets. Use .env.example for placeholders only.
+.env
+.env.*
+!.env.example
+
+# Local environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Frontend tooling
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+.vercel

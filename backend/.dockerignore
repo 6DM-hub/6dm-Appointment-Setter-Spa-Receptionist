@@ -1,0 +1,26 @@
+# The build context is ./backend, and `railway up` uploads all of it on every
+# manual deploy. Without this, that is ~151 MB, ~149 MB of which is a
+# Windows-built .venv that the image does not use — the Dockerfile installs its
+# own dependencies from requirements.txt.
+.venv/
+venv/
+env/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets never belong in an image layer. Railway injects configuration as
+# environment variables; app/core/config.py falls back to them when no .env is
+# present, which is exactly the deployed case.
+.env
+.env.*
+!.env.example
+
+.git/
+.gitignore
+*.md
+.DS_Store

@@ -1,0 +1,338 @@
+"""Source-of-truth regressions for the AI spa receptionist.
+
+These tests pin backend enforcement: the LLM is never treated as an
+authoritative source of spa facts, availability, payment, or booking success.
+"""
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from app.services.booking_adapters.base import AvailabilityVerdict, BookingContext
+from app.services.booking_adapters.providers.square import SquareAdapter
+from app.services.booking_state import get_draft, stage
+from app.services.call_state import CallSession
+from app.services.grok_service import AppointmentIntent, build_realtime_instructions
+from app.services.spa_facts import UNKNOWN, lookup_spa_facts
+from app.services.xai_realtime import LOOKUP_SPA_FACTS_TOOL, VOICE_TOOLS
+from tests.conftest import make_spa
+
+
+def _session() -> CallSession:
+    return CallSession(
+        "call-sot",
+        "inbound",
+        "+15550000002",
+        "+15550000001",
+        tenant_id="tenant-1",
+    )
+
+
+def test_lookup_spa_facts_is_a_realtime_tool():
+    assert LOOKUP_SPA_FACTS_TOOL in VOICE_TOOLS
+    assert LOOKUP_SPA_FACTS_TOOL["name"] == "lookup_spa_facts"
+
+
+def test_realtime_prompt_requires_fact_lookup_not_memory():
+    text = build_realtime_instructions("Harbor Spa", "Persona only.")
+    assert "lookup_spa_facts" in text
+    assert "Never invent" in text
+
+
+@pytest.mark.asyncio
+async def test_1_address_comes_from_dashboard():
+    spa = make_spa(location="4100 McKinney Ave, Dallas, TX")
+    result = await lookup_spa_facts(spa, topic="location")
+    assert result["location"]["address"] == "4100 McKinney Ave, Dallas, TX"
+    assert result["location"]["source"] == "dashboard"
+    assert "Dallas" in result["message"]
+    assert "123 Main" not in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_2_missing_address_is_unknown():
+    spa = make_spa(location=None)
+    result = await lookup_spa_facts(spa, topic="location")
+    assert result["status"] == "unknown"
+    assert result["message"] == UNKNOWN
+    assert result["location"]["verified"] is False
+
+
+@pytest.mark.asyncio
+async def test_3_square_location_wins_operational_address():
+    spa = make_spa(location="Stale dashboard street")
+
+    class _Adapter:
+        provider = "square"
+
+        async def describe_location(self):
+            return {
+                "id": "loc_live",
+                "name": "Harbor Dallas",
+                "timezone": "America/Chicago",
+                "status": "ACTIVE",
+                "address": {
+                    "address_line_1": "500 Live Square Blvd",
+                    "locality": "Dallas",
+                    "administrative_district_level_1": "TX",
+                    "postal_code": "75201",
+                },
+            }
+
+    result = await lookup_spa_facts(spa, adapter=_Adapter(), topic="location")
+    assert result["location"]["source"] == "booking_provider"
+    assert result["location"]["location_id"] == "loc_live"
+    assert "500 Live Square Blvd" in result["message"]
+    assert "Stale dashboard" not in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_4_nonexistent_service_is_not_fabricated():
+    spa = make_spa(services=[{"name": "Swedish massage", "duration_minutes": 60}])
+    result = await lookup_spa_facts(spa, topic="prices", service_name="unicorn wrap")
+    assert result["status"] == "unknown"
+    assert result["message"] == UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_5_exact_unavailable_uses_same_search_alternatives_not_new_probes():
+    adapter = SquareAdapter("Harbor", {"access_token": "t", "location_id": "loc_123"})
+    start = datetime(2026, 10, 5, 15, 0, tzinfo=timezone.utc)
+    ctx = BookingContext(
+        start=start,
+        end=start + timedelta(minutes=60),
+        title="Facial",
+        customer_phone="+1555",
+        service_description="Facial",
+    )
+    later = start + timedelta(minutes=90)
+    square_rows = [
+        {
+            "start_at": later.isoformat().replace("+00:00", "Z"),
+            "location_id": "loc_123",
+            "appointment_segments": [
+                {
+                    "team_member_id": "tm_1",
+                    "service_variation_id": "sv_1",
+                    "service_variation_version": 1,
+                    "duration_minutes": 60,
+                }
+            ],
+        }
+    ]
+
+    async def _search(_ctx, _a, _b):
+        return square_rows, "sv_1", []
+
+    adapter._search_square_availabilities = _search  # type: ignore[method-assign]
+    adapter._validate_config = lambda: None  # type: ignore[method-assign]
+    adapter._location = AsyncMock(return_value={"id": "loc_123", "status": "ACTIVE"})
+    adapter._resolve_service_variation = AsyncMock(return_value={"id": "sv_1"})
+
+    verdict = await adapter.check_availability(ctx)
+    assert verdict.available is False
+    assert len(verdict.alternatives) == 1
+    assert verdict.alternatives[0]["start"].startswith("2026-10-05")
+
+
+@pytest.mark.asyncio
+async def test_6_earliest_uses_one_list_openings_call():
+    from app.services.appointment_booking_service import _stage_earliest
+
+    session = _session()
+    session.add_turn("user", "What's your earliest appointment?")
+    draft = get_draft(session)
+    draft.service_description = "Facial"
+    adapter = SimpleNamespace(
+        default_title="Spa",
+        default_duration_minutes=60,
+        provider="square",
+        booking_timezone_name=AsyncMock(return_value=None),
+        list_openings=AsyncMock(
+            return_value=[
+                {
+                    "start": "2026-10-06T14:00:00Z",
+                    "location_id": "loc_123",
+                    "team_member_id": "tm",
+                    "service_variation_id": "sv",
+                    "duration_minutes": 60,
+                }
+            ]
+        ),
+        check_availability=AsyncMock(),
+    )
+    routing = SimpleNamespace(
+        adapter=adapter,
+        scope=SimpleNamespace(),
+        spa=make_spa(timezone="UTC"),
+        capacity=1,
+        is_outbound_sales=False,
+        product="spa",
+    )
+    intent = AppointmentIntent(intent="schedule", earliest=True, confidence=1.0, service_description="Facial")
+    result = await _stage_earliest(None, session, intent, draft, routing)
+    adapter.list_openings.assert_awaited_once()
+    adapter.check_availability.assert_not_called()
+    assert "2026-10-06T14:00:00" in result.message
+
+
+def test_7_changing_time_invalidates_selected_slot():
+    session = _session()
+    draft = stage(
+        session,
+        AppointmentIntent(
+            intent="schedule",
+            confidence=1.0,
+            requested_start_iso="2026-10-05T15:00:00",
+            service_description="Facial",
+        ),
+    )
+    draft.selected_slot = {"start": "2026-10-05T15:00:00Z", "location_id": "loc_123"}
+    session.entities["booking_draft"] = draft.to_dict()
+    updated = stage(
+        session,
+        AppointmentIntent(
+            intent="schedule",
+            confidence=1.0,
+            requested_start_iso="2026-10-05T16:00:00",
+            service_description="Facial",
+        ),
+    )
+    assert updated.selected_slot is None
+    assert updated.start_iso == "2026-10-05T16:00:00"
+
+
+def test_8_changing_service_invalidates_slot():
+    session = _session()
+    draft = stage(
+        session,
+        AppointmentIntent(
+            intent="schedule",
+            confidence=1.0,
+            requested_start_iso="2026-10-05T15:00:00",
+            service_description="Facial",
+        ),
+    )
+    draft.selected_slot = {"start": "x"}
+    session.entities["booking_draft"] = draft.to_dict()
+    updated = stage(
+        session,
+        AppointmentIntent(
+            intent="schedule",
+            confidence=1.0,
+            service_description="Massage",
+        ),
+    )
+    assert updated.selected_slot is None
+    assert updated.service_description == "Massage"
+
+
+def test_9_staff_preference_is_not_silently_dropped():
+    session = _session()
+    session.add_turn("user", "I'd like to book with Sarah")
+    draft = stage(
+        session,
+        AppointmentIntent(intent="schedule", confidence=1.0, preferred_staff="Sarah"),
+    )
+    assert draft.preferred_staff == "Sarah"
+
+
+@pytest.mark.asyncio
+async def test_10_and_11_confirm_requires_provider_id():
+    from app.services.xai_realtime import XAIVoiceSession
+
+    voice = XAIVoiceSession("call-sot", _session())
+    success = voice._authoritative_tool_followup(
+        "confirm_appointment",
+        '{"status":"booked","appointment_id":"a1","external_booking_id":"sq_1"}',
+    )
+    assert success is not None
+    failure = voice._authoritative_tool_followup(
+        "confirm_appointment",
+        '{"status":"booked","appointment_id":"a1","external_booking_id":null}',
+    )
+    assert failure is None
+    error = voice._authoritative_tool_followup(
+        "confirm_appointment",
+        '{"status":"error","message":"Square failed"}',
+    )
+    assert error is None
+
+
+def test_12_reschedule_mode_does_not_clear_to_create():
+    session = _session()
+    draft = stage(session, AppointmentIntent(intent="reschedule", confidence=1.0))
+    assert draft.operation_mode == "reschedule"
+
+
+@pytest.mark.asyncio
+async def test_14_unconfigured_upsell_is_unknown():
+    spa = make_spa(upsell_rules=[])
+    result = await lookup_spa_facts(spa, topic="upsell", service_name="HydroLux5 Facial - Face Only")
+    assert result["upsell_configured"] is False
+    assert "Do not invent" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_15_missing_price_is_unknown():
+    spa = make_spa(services=[{"name": "Facial"}])
+    result = await lookup_spa_facts(spa, topic="prices", service_name="Facial")
+    assert result["status"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_16_payment_never_collects_raw_cards():
+    spa = make_spa(payment_policy={"card_required": True, "collection_mode": "none"})
+    result = await lookup_spa_facts(spa, topic="payment")
+    assert result["payment"]["collect_raw_card_on_call"] is False
+    assert "do not collect" in result["message"].lower() or "do not ask" in result["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_configured_upsell_is_returned():
+    spa = make_spa(
+        upsell_rules=[
+            {
+                "base_service": "HydroLux5 Facial - Face Only",
+                "allowed_upsells": ["Neck upgrade", "Decollete upgrade"],
+            }
+        ]
+    )
+    result = await lookup_spa_facts(spa, topic="upsell", service_name="HydroLux5 Facial - Face Only")
+    assert result["upsell_configured"] is True
+    assert "Neck upgrade" in result["message"]
+
+
+def test_17_same_name_caller_and_staff_stay_separate():
+    session = _session()
+    session.add_turn("assistant", "How can I help?")
+    session.add_turn("user", "My name is Sarah and I'd like to book with Sarah.")
+    draft = stage(
+        session,
+        AppointmentIntent(
+            intent="schedule",
+            confidence=1.0,
+            caller_name="Sarah",
+            preferred_staff="Sarah",
+        ),
+    )
+    assert draft.caller_name == "Sarah"
+    assert draft.preferred_staff == "Sarah"
+
+
+def test_guest_name_is_separate_from_caller_and_staff():
+    session = _session()
+    draft = stage(
+        session,
+        AppointmentIntent(
+            intent="schedule",
+            confidence=1.0,
+            caller_name="Sarah",
+            guest_name="Jessica",
+            preferred_staff="Riley",
+        ),
+    )
+    assert draft.caller_name == "Sarah"
+    assert draft.guest_name == "Jessica"
+    assert draft.preferred_staff == "Riley"
