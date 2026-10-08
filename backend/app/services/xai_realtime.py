@@ -94,6 +94,7 @@ from app.services.grok_service import (
     primary_caller_language,
 )
 from app.services.truth_log import truth
+from app.services.voice_config import resolve_xai_voice
 
 logger = logging.getLogger(__name__)
 
@@ -1408,7 +1409,9 @@ class XAIVoiceSession:
                 "callback number. This profile is not the name for the booking. Ask for the "
                 "caller's name unless caller_name is already stored from this call."
             )
-        requested_voice = self.session.entities.get("xai_voice") or settings.XAI_VOICE_ID
+        requested_voice = resolve_xai_voice(
+            self.session.entities.get("xai_voice") or settings.XAI_VOICE_ID
+        )
         logger.info(
             "Creating xAI realtime session call=%s voice=%s realtime_model=%s text_model=%s",
             self.call_id,
@@ -1591,6 +1594,8 @@ class XAIVoiceSession:
                 greeting = first.get("content")
         if not greeting:
             greeting = (
+                "Hi, this is Cara, the AI assistant with 6DM. Is now a good time to talk?"
+                if self.session.direction == "outbound" else
                 f"Thank you for calling {self.session.business_name}. "
                 "How may I assist you today?"
             )
@@ -1655,7 +1660,10 @@ class XAIVoiceSession:
                     "content": [
                         {
                             "type": "input_text",
-                            "text": _GREET_THEM_PROMPT,
+                            "text": (
+                                "[The callee just answered your outbound call. Introduce yourself as Cara, the AI assistant with 6DM, and ask if now is a good time.]"
+                                if self.session.direction == "outbound" else _GREET_THEM_PROMPT
+                            ),
                         }
                     ],
                 },
@@ -3221,7 +3229,9 @@ class XAIVoiceSession:
             # so a typo (or a name from another vendor's catalogue) silently
             # leaves the caller listening to the server default instead of the
             # configured persona. Log both so the mismatch is greppable.
-            requested = self.session.entities.get("xai_voice") or settings.XAI_VOICE_ID
+            requested = resolve_xai_voice(
+                self.session.entities.get("xai_voice") or settings.XAI_VOICE_ID
+            )
             server_default = (event.get("session") or {}).get("voice")
             server_model = (event.get("session") or {}).get("model") or "server-selected"
             logger.info(

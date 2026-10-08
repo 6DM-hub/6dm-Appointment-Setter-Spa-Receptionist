@@ -38,6 +38,10 @@ async def lifespan(app: FastAPI):
     logger.info(f"🚀 Starting {settings.APP_NAME} [{settings.APP_ENV}]")
     logger.info("CORS allowed origins: %s", origins)
     await init_redis()
+    app.state.voice_status = {"release": settings.VOICE_RELEASE, "ready": False, "status": "not_checked"}
+    if settings.VOICE_SETUP_ON_STARTUP:
+        from app.services.voice_setup import setup_voice
+        app.state.voice_status = await setup_voice()
 
     # Calls arriving over the SIP trunk bypass our webhooks entirely, so without
     # this reconciliation they never reach `call_logs` and never show on the

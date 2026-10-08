@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient
 from app.core.database import get_db
 from app.core.redis import get_redis
 from app.main import app
-from app.models import BookingProvider, SpaAccount, User, UserRole
+from app.models import BookingProvider, SpaAccount, User, UserRole, VoiceEngine
 
 
 class _Principal:
@@ -66,6 +66,7 @@ def make_spa(**overrides) -> SpaAccount:
     )
     spa.booking_config = overrides.pop("booking_config", {})
     spa.twiml_voice = overrides.pop("twiml_voice", None)
+    spa.voice_engine = overrides.pop("voice_engine", VoiceEngine.TWILIO_TTS)
     spa.is_active = overrides.pop("is_active", True)
     for key, value in overrides.items():
         setattr(spa, key, value)

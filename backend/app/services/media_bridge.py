@@ -31,6 +31,7 @@ from fastapi import WebSocketDisconnect
 from app.core.config import settings
 from app.services.call_state import CallSession
 from app.services.truth_log import truth
+from app.services.voice_config import resolve_xai_voice
 from app.services.xai_realtime import (
     XAI_REALTIME_MODEL,
     XAIVoiceSession,
@@ -134,8 +135,12 @@ class TwilioMediaBridge(XAIVoiceSession):
             self.session.business_name or settings.APP_NAME,
             self.session.tenant_prompt,
             self.session.timezone,
+            direction=self.session.direction,
+            call_objective=self.session.call_objective,
         )
-        requested_voice = self.session.entities.get("xai_voice") or settings.XAI_VOICE_ID
+        requested_voice = resolve_xai_voice(
+            self.session.entities.get("xai_voice") or settings.XAI_VOICE_ID
+        )
         logger.info(
             "Creating xAI realtime session call=%s voice=%s realtime_model=%s text_model=%s",
             self.call_id,
@@ -158,7 +163,7 @@ class TwilioMediaBridge(XAIVoiceSession):
                         "input": {"format": {"type": "audio/pcmu"}},
                         "output": {
                             "format": {"type": "audio/pcmu"},
-                            # Explicit normal speed keeps Carina's pacing stable.
+                            # Explicit normal speed keeps speech pacing stable.
                             "speed": 1.0,
                         },
                     },
@@ -166,11 +171,14 @@ class TwilioMediaBridge(XAIVoiceSession):
             }
         )
 
-    @staticmethod
-    def _booking_tools() -> list[dict[str, Any]]:
+    def _booking_tools(self) -> list[dict[str, Any]]:
         """Same propose/confirm split as the SIP path — one source of truth."""
         from app.services.xai_realtime import VOICE_TOOLS
 
+        if self.session.direction == "outbound":
+            return [tool for tool in VOICE_TOOLS if tool["name"] in {
+                "check_availability", "propose_appointment", "confirm_appointment",
+            }]
         return VOICE_TOOLS
 
     # ------------------------------------------------------------ Twilio side

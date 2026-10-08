@@ -90,6 +90,12 @@ async def test_session_update_requests_mulaw_both_ways(bridge):
     assert session["audio"]["output"]["format"]["type"] == "audio/pcmu"
 
 
+async def test_session_update_normalizes_legacy_voice_alias(bridge, monkeypatch):
+    monkeypatch.setattr(settings, "XAI_VOICE_ID", "xai_ara")
+    await bridge._configure()
+    assert bridge.xai_sent[0]["session"]["voice"] == "ara"
+
+
 async def test_session_update_carries_the_tenant_persona(bridge):
     """The whole point of the bridge over the console agent: each spa's own
     prompt reaches the model."""

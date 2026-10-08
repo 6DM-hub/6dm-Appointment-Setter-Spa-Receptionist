@@ -1,7 +1,7 @@
 ﻿import asyncio
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from app.core.database import check_db_connection
 from app.core.redis import redis_manager
 from app.core.config import settings
@@ -10,6 +10,12 @@ from app.services.twilio_service import twilio_service
 
 router = APIRouter(tags=["Health"])
 logger = logging.getLogger(__name__)
+
+
+@router.get("/health/voice")
+async def voice_health_check(request: Request):
+    """Cached startup check; contains no secrets and never initiates a phone call."""
+    return getattr(request.app.state, "voice_status", {"ready": False, "status": "not_checked"})
 
 @router.get("/health")
 async def health_check():

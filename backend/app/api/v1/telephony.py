@@ -506,7 +506,12 @@ async def voice_inbound(
     ).scalar_one_or_none()
     if existing_log is not None:
         logger.info("Duplicate inbound Twilio webhook ignored for call %s", CallSid)
-        return _twiml(_gather_twiml("Thank you for calling. How may I help you today?", settings.DEFAULT_TWIML_VOICE))
+        spa = await db.get(SpaAccount, existing_log.tenant_id) if existing_log.tenant_id else None
+        if spa is not None and spa.voice_engine is VoiceEngine.XAI_REALTIME:
+            return _twiml(_media_stream_twiml(CallSid))
+        session = await state.get(CallSid)
+        voice = session.voice if session else _resolve_voice(spa, None)
+        return _twiml(_gather_twiml("Thank you for calling. How may I help you today?", voice))
 
     spa, owner = await _resolve_inbound_target(db, to_number)
     voice = _resolve_voice(spa, owner)
@@ -809,6 +814,9 @@ async def voice_outbound(
         call_objective=payload.call_objective,
         user_id=str(current_user.id),
         voice=voice,
+        business_name="6DM",
+        timezone=settings.SALES_TIMEZONE,
+        entities={"voice_engine": "xai_realtime" if settings.XAI_REALTIME_ENABLED else "twilio_tts"},
     )
     await state.create(session)
 
@@ -822,6 +830,14 @@ async def voice_outbound_answer(
 ) -> Response:
     """Twilio fetches TwiML here when the callee answers the outbound call."""
     session = await state.get(CallSid)
+    if settings.XAI_REALTIME_ENABLED and session is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Outbound call session is not ready; retry the answer webhook.")
+    if session and session.entities.get("voice_engine", "xai_realtime" if settings.XAI_REALTIME_ENABLED else "twilio_tts") == "xai_realtime":
+        if not session.history:
+            session.add_turn("assistant", "Hi, this is Cara, the AI assistant with 6DM. Is now a good time to talk?")
+            await state.save(session)
+        logger.info("Outbound call %s using xAI realtime bridge voice=%s", CallSid, settings.XAI_VOICE_ID)
+        return _twiml(_media_stream_twiml(CallSid))
     voice = session.voice if session else settings.DEFAULT_TWIML_VOICE
 
     if session and session.call_objective:

@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 
 # Fields a spa_admin may not change on their own tenant. Moving your own
 # inbound number would let you hijack another spa's routing.
-TENANT_LOCKED_FIELDS = {"twilio_phone_number", "is_active"}
+TENANT_LOCKED_FIELDS = {"twilio_phone_number", "is_active", "voice_engine"}
 
 
 class GoogleCalendarSelection(BaseModel):

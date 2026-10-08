@@ -214,25 +214,19 @@ class Settings(BaseSettings):
     # Off by default: with it off nothing here runs and the <Gather> flow is
     # untouched. Requires Voice Agent API entitlement on the xAI team.
     XAI_VOICE_ENABLED: bool = False
-    # Use native xAI speech-to-speech for Twilio Media Streams. The per-spa
-    # voice_engine value can still explicitly select the legacy path when this
-    # switch is off.
+    # Outbound sales calls use the realtime bridge when this is enabled.
+    # Inbound spa routing uses SpaAccount.voice_engine.
     XAI_REALTIME_ENABLED: bool = False
+    VOICE_SETUP_ON_STARTUP: bool = False
+    VOICE_RELEASE: str = "local"
+    SALES_TIMEZONE: str = "America/Chicago"
     # Signing secret returned once when the number is registered with xAI.
     XAI_VOICE_WEBHOOK_SECRET: str = ""
-    # Deployments set this explicitly (currently "Carina"). Both the bare
-    # catalogue names and the "xai_<name>" form the server reports as its own
-    # default on `session.created` are accepted.
-    #
-    # Worth knowing when changing it: this fails silently in both directions.
-    # `session.update` accepts *any* string — including deliberate nonsense —
-    # without erroring, and `session.updated` echoes back no voice field at
-    # all, so a bad value cannot be detected from the API. GET
-    # /v1/realtime/voices, which would enumerate the valid ones, returns 403
-    # for this team. `XAIVoiceSession` therefore logs the requested value
-    # against the server default on every call, so the only way to confirm a
-    # voice is to place a call and listen.
-    XAI_VOICE_ID: str = "xai_ara"
+    # Use a documented lowercase built-in ID or an actual custom voice ID.
+    # Known legacy aliases (e.g. xai_ara) are normalized before session.update.
+    # Historical server behavior accepted unknown names without an error;
+    # session.created reports an initial default, not confirmation of our update.
+    XAI_VOICE_ID: str = "ara"
     XAI_REALTIME_URL: str = "wss://api.x.ai/v1/realtime"
     # Replay window for webhook-timestamp, per the Standard Webhooks spec.
     XAI_WEBHOOK_TOLERANCE_SECONDS: int = 300

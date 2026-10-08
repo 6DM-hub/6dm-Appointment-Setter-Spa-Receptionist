@@ -356,7 +356,7 @@ CONVERSATION STYLE:
 """
 
 
-def build_realtime_instructions(business_name: str, tenant_prompt: str | None, tz_name: str | None = None) -> str:
+def build_realtime_instructions(business_name: str, tenant_prompt: str | None, tz_name: str | None = None, *, direction: str = "inbound", call_objective: str | None = None) -> str:
     """`instructions` for an xAI realtime voice session's `session.update`.
 
     Deliberately a sibling of SPA_RECEPTIONIST_PROMPT rather than a reuse of it:
@@ -377,6 +377,26 @@ def build_realtime_instructions(business_name: str, tenant_prompt: str | None, t
 
     tz = resolve_timezone(tz_name)
     now_utc = datetime.now(timezone.utc)
+    if direction == "outbound":
+        return (
+            "You are Cara, the AI phone assistant for 6DM, making an outbound B2B call.\n"
+            "Identify yourself as an AI assistant with 6DM and ask if now is a good time. "
+            "Never thank the callee for calling or describe yourself as their spa receptionist. "
+            "Your goal is to qualify the business, answer questions using only the supplied "
+            "objective, and offer a sales presentation with Dominic. Do not invent pricing "
+            "or company facts. Respect a request to stop or end the call.\n"
+            "Your speech is generated directly by Grok. Keep replies warm, natural and short. "
+            "Ask one question at a time. Never use markdown or collect payment card details.\n"
+            f"Local timezone: {timezone_label(tz)}. Local date/time: "
+            f"{now_utc.astimezone(tz).strftime('%A, %Y-%m-%d %H:%M')}.\n"
+            "For a sales presentation, use check_availability or propose_appointment with "
+            "only the date/time the callee requests; use local ISO wall-clock time without "
+            "an offset. Never invent availability. Get their full name, read back the details, "
+            "and call confirm_appointment only after their explicit confirmation. Only say "
+            "booked when that tool reports success. The backend routes sales bookings to "
+            "the sales calendar, never to a spa calendar.\n"
+            f"CALL OBJECTIVE:\n{call_objective or 'Ask whether the business would like to learn about 6DM appointment setting.'}"
+        )
     return REALTIME_SPA_PROMPT.format(
         business_name=business_name,
         tz_name=timezone_label(tz),

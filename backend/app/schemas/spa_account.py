@@ -5,7 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
-from app.models.spa_account import BookingProvider
+from app.models.spa_account import BookingProvider, VoiceEngine
 from app.schemas.common import ORMModel
 
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
@@ -101,6 +101,7 @@ class SpaAccountBase(BaseModel):
     timezone: str = Field("America/Chicago", max_length=64)
     booking_provider: BookingProvider = BookingProvider.GOOGLE_CALENDAR
     twiml_voice: str | None = Field(None, max_length=64)
+    voice_engine: VoiceEngine = VoiceEngine.TWILIO_TTS
     description: str | None = Field(None, max_length=4000)
     public_phone: str | None = Field(None, max_length=32)
     cancellation_policy: str | None = Field(None, max_length=4000)
@@ -141,6 +142,7 @@ class SpaAccountUpdate(BaseModel):
     booking_provider: BookingProvider | None = None
     booking_config: dict[str, Any] | None = None
     twiml_voice: str | None = Field(None, max_length=64)
+    voice_engine: VoiceEngine | None = None
     is_active: bool | None = None
     description: str | None = Field(None, max_length=4000)
     public_phone: str | None = Field(None, max_length=32)
@@ -151,6 +153,13 @@ class SpaAccountUpdate(BaseModel):
     payment_policy: SpaPaymentPolicy | None = None
     notification_settings: dict[str, Any] | None = None
     booking_policies: dict[str, Any] | None = None
+
+    @field_validator("voice_engine")
+    @classmethod
+    def validate_voice_engine(cls, value: VoiceEngine | None) -> VoiceEngine:
+        if value is None:
+            raise ValueError("voice_engine cannot be null")
+        return value
 
     @field_validator("twilio_phone_number")
     @classmethod

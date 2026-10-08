@@ -16,7 +16,8 @@ httpx==0.27.2
 python-dotenv==1.0.1
 tenacity==9.0.0
 email-validator>=2.2.0
-websockets>=12.0
+# websockets.asyncio.client (used by both voice paths) requires v13+.
+websockets>=13.0
 python-jose[cryptography]>=3.3.0
 passlib==1.7.4
 bcrypt==4.0.1
