@@ -231,6 +231,10 @@ class TwilioMediaBridge(XAIVoiceSession):
                     continue
                 if generation != self._play_generation or not self._allow_audio:
                     continue
+                if kind == "mark":
+                    await self._to_twilio({"event": "mark", "streamSid": self._stream_sid,
+                                           "mark": {"name": raw.decode()}})
+                    continue
                 await self._to_twilio(
                     {
                         "event": "media",
@@ -262,6 +266,11 @@ class TwilioMediaBridge(XAIVoiceSession):
             try:
                 if kind == "clear":
                     await self._to_twilio({"event": "clear", "streamSid": self._stream_sid})
+                    continue
+                if kind == "mark":
+                    if self._stream_sid and generation == self._play_generation and self._allow_audio:
+                        await self._to_twilio({"event": "mark", "streamSid": self._stream_sid,
+                                               "mark": {"name": raw.decode()}})
                     continue
                 if (
                     self._stream_sid
@@ -398,6 +407,10 @@ class TwilioMediaBridge(XAIVoiceSession):
             return
 
         if etype in _SPEECH_STARTED_EVENTS:
+            self._caller_speaking = True
+            self._cancel_confirmation_wait()
+            self._confirmation_playback_marks = {}
+            self._card_policy_playback_revision = None
             self._start_turn()
             if getattr(self, "_protect_playback", False):
                 logger.info(
@@ -421,6 +434,9 @@ class TwilioMediaBridge(XAIVoiceSession):
 
         if etype == "response.created":
             self._allow_audio = True
+            if (getattr(self, "_card_policy_playback_revision", None) is not None
+                    and getattr(self, "_card_policy_response_id", None) is None):
+                self._card_policy_response_id = self._response_id_of(event)
             if getattr(self, "_protect_playback", False):
                 self._confirmation_response_open = True
 
@@ -449,7 +465,31 @@ class TwilioMediaBridge(XAIVoiceSession):
 
         # Everything else — transcripts, tool calls, errors — is conversation
         # handling, which the parent already implements.
+        card_policy_finished = (
+            etype == "response.done" and self._response_id_of(event)
+            and self._response_id_of(event) == getattr(self, "_card_policy_response_id", None)
+        )
         await super()._dispatch(event)
+        if etype == "response.done":
+            from app.services.booking_state import get_draft
+            draft = get_draft(self.session)
+            card_revision = getattr(self, "_card_policy_playback_revision", None)
+            if card_revision is not None and card_policy_finished and not getattr(self, "_caller_speaking", False):
+                name = f"card-policy-{card_revision}-{self._play_generation}"
+                self._confirmation_playback_marks = {name: card_revision}
+                self._play_queue.put_nowait(("mark", name.encode(), self._play_generation))
+                if self._playback_task is None:
+                    await self._drain_playback_queue()
+            elif (draft.read_back and draft.selected_slot and not draft.confirmation_authorized
+                    and self.session.booking_status == "awaiting_confirmation"
+                    and not getattr(self, "_caller_speaking", False)
+                    and getattr(self, "_confirmation_marked_revision", None) != draft.draft_revision):
+                self._confirmation_marked_revision = draft.draft_revision
+                name = f"booking-consent-{draft.draft_revision}-{self._play_generation}"
+                self._confirmation_playback_marks = {name: draft.draft_revision}
+                self._play_queue.put_nowait(("mark", name.encode(), self._play_generation))
+                if self._playback_task is None:
+                    await self._drain_playback_queue()
         if confirmation_finished and getattr(self, "_deferred_wrap_up", False):
             self._deferred_wrap_up = False
             self._awaiting_wrap_up = False
@@ -490,6 +530,19 @@ class TwilioMediaBridge(XAIVoiceSession):
                         stream_sid=self._stream_sid,
                     )
                     await self._maybe_greet_if_outbound_ready()
+            elif event == "mark":
+                name = (message.get("mark") or {}).get("name")
+                revision = getattr(self, "_confirmation_playback_marks", {}).pop(name, None)
+                if revision is not None:
+                    if name.startswith("card-policy-"):
+                        self._card_policy_playback_revision = None
+                        if (self._user_turn_count == getattr(self, "_card_policy_consent_turn", None)
+                                and not getattr(self, "_caller_speaking", False)):
+                            truth("CARD_POLICY_PLAYBACK_COMPLETE", call_sid=self.call_id, revision=revision)
+                            await self._confirm_pending_booking_from_caller(self._last_user_utterance() or "")
+                    else:
+                        truth("CONFIRMATION_QUESTION_PLAYED", call_sid=self.call_id, revision=revision)
+                        self._confirmation_played(revision)
             elif event == TWILIO_EVENT_STOP:
                 logger.info("call %s: Twilio stream stopped", self.call_id)
                 return

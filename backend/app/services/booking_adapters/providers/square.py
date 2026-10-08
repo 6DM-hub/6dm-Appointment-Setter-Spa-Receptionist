@@ -589,6 +589,15 @@ class SquareAdapter(VerticalProviderAdapter):
         variation_set = set(variation_tokens)
         combined_set = item_set | variation_set
 
+        # Square uses "Massage -" as a category prefix while spa menus may
+        # say simply "Deep Tissue". Ignore that category for specific services,
+        # keeping modifiers such as "Couples" part of the service identity.
+        if requested_set - {"massage"}:
+            requested_set.discard("massage")
+            item_set.discard("massage")
+            variation_set.discard("massage")
+            combined_set = item_set | variation_set
+
         if not requested_set:
             return False, False
 
@@ -704,6 +713,7 @@ class SquareAdapter(VerticalProviderAdapter):
             ctx.service_variation_id,
             ctx.service_variation_version,
             self._normalize(self._service_name(ctx)),
+            int((ctx.end - ctx.start).total_seconds() / 60),
         )
         cached = self._service_cache.get(cache_key)
         if cached:

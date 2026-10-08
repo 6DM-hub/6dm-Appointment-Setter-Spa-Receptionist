@@ -947,10 +947,9 @@ async def test_time_change_proposal_is_spoken_by_the_server_then_books_once(monk
     await voice._dispatch({"type": "response.done", "response": {"id": "hold-1"}})
     spoken = _texts(sent)
     assert spoken[0] == "Let me check that for you."
-    assert spoken[-1] == (
-        "11:15 AM is available for 60 minute Swedish massage. "
-        "Nothing is booked yet. Would you like me to book that?"
-    )
+    # Collect a missing name before asking permission to book. Never append a
+    # second question immediately after the booking approval question.
+    assert spoken[-1] == "Can I get your name for the appointment?"
     draft = get_draft(voice.session)
     assert "11:15:00" in (draft.start_iso or "")
     assert "11:30" not in (draft.start_iso or "")

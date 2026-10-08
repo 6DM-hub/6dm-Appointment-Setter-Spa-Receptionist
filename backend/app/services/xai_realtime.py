@@ -1208,9 +1208,6 @@ class XAIVoiceSession:
         if caller_name_required_for(draft) and not supplied_caller_name(draft):
             await self._ask_for_caller_name(again=True)
             return True
-        if self._card_policy_still_required(draft):
-            await self._explain_card_policy()
-            return True
         if not draft.read_back or not draft.is_complete or not draft.selected_slot:
             logger.warning(
                 "call %s: affirmative heard while appointment is pending but read-back/provider slot is not armed; refusing auto-confirm",
@@ -1219,6 +1216,12 @@ class XAIVoiceSession:
             return False
         if not record_pure_confirmation(self.session, caller_text):
             return False
+
+        self._cancel_confirmation_wait()
+        if self._card_policy_still_required(draft):
+            await self._cancel_active_response()
+            await self._explain_card_policy()
+            return True
 
         logger.info(
             "call %s: caller explicitly affirmed provider-checked read-back -> backend confirm",
@@ -1283,9 +1286,38 @@ class XAIVoiceSession:
             return None
         if caller_name_required_for(draft) and not supplied_caller_name(draft):
             return CALLER_NAME_QUESTION
-        if self._card_policy_still_required(draft):
-            return CARD_ON_FILE_POLICY
         return None
+
+    def _cancel_confirmation_wait(self) -> None:
+        task = getattr(self, "_confirmation_wait_task", None)
+        self._confirmation_wait_task = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    def _confirmation_played(self, revision: int) -> None:
+        """Start silence counting only after the phone playback mark returns."""
+        self._cancel_confirmation_wait()
+        draft = get_draft(self.session)
+        if (getattr(self, "_caller_speaking", False)
+                or self.session.booking_status != "awaiting_confirmation"
+                or draft.draft_revision != revision or draft.confirmation_authorized):
+            return
+
+        async def followup():
+            try:
+                await asyncio.sleep(3.0)
+                current = get_draft(self.session)
+                if (getattr(self, "_caller_speaking", False)
+                        or self.session.booking_status != "awaiting_confirmation"
+                        or current.draft_revision != revision
+                        or current.confirmation_authorized):
+                    return
+                truth("CONFIRMATION_SILENCE_FOLLOWUP", call_sid=self.call_id)
+                await self._send_force_message("Would you like me to go ahead?")
+            except asyncio.CancelledError:
+                pass
+
+        self._confirmation_wait_task = asyncio.create_task(followup())
 
     async def _ask_for_caller_name(self, *, again: bool = False) -> None:
         recover_caller_name_from_history(self.session)
@@ -1307,6 +1339,10 @@ class XAIVoiceSession:
         await self._send_force_message(CALLER_NAME_QUESTION)
 
     async def _explain_card_policy(self) -> None:
+        draft = get_draft(self.session)
+        if not (draft.confirmation_authorized
+                and self.session.entities.get("caller_confirmed_revision") == draft.draft_revision):
+            return
         self.session.entities["card_policy_explained"] = True
         if self.session.booking_status not in {"booked", "rescheduled", "conflict"}:
             self.session.booking_status = "awaiting_confirmation"
@@ -1825,6 +1861,9 @@ class XAIVoiceSession:
             BookingOutcome.BOOKED.value, BookingOutcome.RESCHEDULED.value, "booked", "rescheduled"
         }
         if not already_booked:
+            if getattr(self, "_card_policy_playback_revision", None) is not None:
+                return json.dumps({"status": "rejected", "booked": False,
+                                   "message": "Wait until the card policy finishes playing. Do not create a booking yet."})
             if caller_name_required_for(draft) and not supplied_caller_name(draft):
                 self.session.entities["awaiting_caller_name"] = True
                 self.session.booking_status = "collecting_details"
@@ -1837,6 +1876,11 @@ class XAIVoiceSession:
                     ),
                 })
             if self._card_policy_still_required(draft):
+                if not record_pure_confirmation(self.session, last):
+                    return json.dumps({
+                        "status": "rejected", "booked": False,
+                        "message": "Wait for a clear yes to the current read-back. Do not explain card collection or book from silence.",
+                    })
                 return json.dumps({
                     "status": "missing_info",
                     "booked": False,
@@ -2479,6 +2523,14 @@ class XAIVoiceSession:
         This is ideal for final booking confirmations because the calendar result,
         not the language model, is the source of truth.
         """
+        if message == CARD_ON_FILE_POLICY:
+            draft = get_draft(self.session)
+            if not (draft.confirmation_authorized and
+                    self.session.entities.get("caller_confirmed_revision") == draft.draft_revision):
+                return
+            self._card_policy_playback_revision = draft.draft_revision
+            self._card_policy_consent_turn = self._user_turn_count
+            self._card_policy_response_id = None
         if protect_playback:
             self._protect_playback = True
         if "anything else I can help you with today" in message:
@@ -2701,8 +2753,11 @@ class XAIVoiceSession:
             await self._send_force_message(HOLD_ACK_TEXT)
 
     async def _speak_availability(self, spoken: str) -> None:
-        """Speak the Square sentence, then name or card policy once it finishes."""
+        """Collect identity first; an approval question always ends the turn."""
         line = self._next_collection_line()
+        if line == CALLER_NAME_QUESTION:
+            await self._ask_for_caller_name()
+            return
         self._after_availability_line = line
         self._prompt_caller_name_after_response = line is not None
         await self._send_force_message(spoken)
@@ -3075,6 +3130,8 @@ class XAIVoiceSession:
             return
 
         if etype in _SPEECH_STARTED_EVENTS:
+            self._caller_speaking = True
+            self._cancel_confirmation_wait()
             self._start_turn()
             return
 
@@ -3090,6 +3147,8 @@ class XAIVoiceSession:
             return
 
         if etype in _CALLER_TRANSCRIPT_DONE:
+            self._caller_speaking = False
+            self._cancel_confirmation_wait()
             self._mark_timing("STT")
             text = _first_str(data, "transcript", "text")
             if text:
@@ -3398,6 +3457,7 @@ class XAIVoiceSession:
     async def _finalize(self) -> None:
         """Persist transcript, summary and status — the <Gather> flow's
         /voice/status handler does the same job for the Twilio path."""
+        self._cancel_confirmation_wait()
         self._cancel_greeting_watchdog()
         mark_call_ended(self.session)
         store = self._store()
