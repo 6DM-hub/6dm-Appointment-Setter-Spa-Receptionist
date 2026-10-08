@@ -151,6 +151,21 @@ async def setup_voice() -> dict:
             await db.commit()
             result["active_spas"] = len(spas)
             result["spas_without_numbers"] = len(spas) - len(numbers)
+            from app.services.spa_facts import payment_policy_of
+            from app.services.booking_config import decrypt_config
+            from app.services.card_entry import public_square_config
+
+            required = [spa for spa in spas if payment_policy_of(spa)["card_required"]]
+            secure = [spa for spa in required
+                      if payment_policy_of(spa)["collection_mode"] == "secure_sms_link"]
+            configured = sum(bool(public_square_config(decrypt_config(spa.booking_config)))
+                             for spa in secure)
+            result["card_collection"] = {
+                "required_spas": len(required),
+                "secure_link_spas": len(secure),
+                "configured_spas": configured,
+                "missing_secure_square_settings": len(secure) - configured,
+            }
         result["ready"] = bool(
             result["active_spas"] and result["twilio"]["configured_numbers"]
             and not result["twilio"]["unmatched_numbers"]

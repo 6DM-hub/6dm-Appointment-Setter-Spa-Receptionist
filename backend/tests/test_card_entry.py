@@ -366,6 +366,7 @@ async def test_successful_save_confirms_and_consumes_only_johns_customer():
     spa = _spa()
     contact_id = uuid.uuid4()
     appointment = _appointment(spa, contact_id)
+    appointment.external_booking_id = "square-booking-existing"
     link = _link(spa, contact_id, "CUS_JOHN")
     token = _token(spa, appointment, link)
     loaded = type("L", (), {"token": token, "appointment": appointment, "link": link, "spa": spa})()
@@ -384,6 +385,7 @@ async def test_successful_save_confirms_and_consumes_only_johns_customer():
     assert saver.calls[0]["idempotency_key"] == token.idempotency_key
     assert token.consumed_at == NOW
     assert appointment.card_status is CardStatus.CARD_CONFIRMED
+    assert appointment.status is AppointmentStatus.CONFIRMED
     again = await submit_saved_card(
         store=store,
         loaded=loaded,

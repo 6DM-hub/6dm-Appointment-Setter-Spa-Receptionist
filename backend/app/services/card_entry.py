@@ -292,6 +292,10 @@ async def submit_saved_card(
         loaded.token.consumed_at = now
         loaded.token.submission_started_at = None
         appointment.card_status = CardStatus.CARD_CONFIRMED
+        # Complete the existing provider-backed reservation even after hangup.
+        # Never create another booking or confirm one without a provider ID.
+        if appointment.external_booking_id and appointment.status == AppointmentStatus.SCHEDULED:
+            appointment.status = AppointmentStatus.CONFIRMED
         await store.persist()
         return "saved"
     if outcome == SaveCardOutcome.AMBIGUOUS:

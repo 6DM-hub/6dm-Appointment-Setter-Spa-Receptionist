@@ -42,7 +42,7 @@ def test_prebooking_policy_is_not_the_postbooking_sms_line():
     failed = booking_card_speech("pending_card", "failed")
     assert CARD_ON_FILE_POLICY not in sent
     assert "secure text link to add your card on file" in sent
-    assert "Please complete that when you receive it." in sent
+    assert "You can complete it after this call." in sent
     assert "sent you" not in failed
     assert "wasn't able to send" in failed
     for status in ("not_required", "not_supported", "unknown", "card_confirmed", "failed"):
@@ -76,7 +76,8 @@ def test_confirmation_speech_mentions_sms_only_when_it_was_sent():
         '{"status":"booked","appointment_id":"a","external_booking_id":"b",'
         '"card_status":"card_confirmed","card_sms":"not_attempted"}',
     )
-    assert "You're all set" in sent
+    assert "reserved pending your card on file" in sent
+    assert "is confirmed" not in sent
     assert "secure text link" in sent
     assert CARD_ON_FILE_POLICY not in sent
     assert "Is there anything else I can help you with today?" in sent

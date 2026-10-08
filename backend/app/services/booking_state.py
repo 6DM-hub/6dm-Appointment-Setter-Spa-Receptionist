@@ -990,7 +990,9 @@ def grounded_availability_speech(session: Any, tz: Any) -> str | None:
 
 CARD_ON_FILE_POLICY = (
     "To reserve your appointment, we’ll just need to place a card on file. "
-    "Your card won’t be charged today—it’s simply required for our 24-hour cancellation policy."
+    "Your card won’t be charged today—it’s simply required for our 24-hour cancellation policy. "
+    "If you need to add a card, I'll text you a secure link after reserving the appointment. "
+    "You can complete it after this call; please don't read card details aloud."
 )
 CARD_ON_FILE_HESITANT = (
     "The card is kept securely on file and is only charged if the appointment is "
@@ -1031,7 +1033,7 @@ def booking_card_speech(card_status: str | None, card_sms: str | None) -> str:
     if status == "pending_card" and sms == "sent":
         return (
             " I've also sent you a secure text link to add your card on file. "
-            "Please complete that when you receive it."
+            "You can complete it after this call. Your reservation is pending your card on file."
         )
     if status == "pending_card" and sms == "failed":
         return " I wasn't able to send the secure card link just now."

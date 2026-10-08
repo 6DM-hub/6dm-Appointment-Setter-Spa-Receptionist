@@ -993,13 +993,20 @@ async def _draft_window(
 
 def _draft_intent(draft: BookingDraft) -> AppointmentIntent:
     """The draft as an AppointmentIntent, for the adapter/context helpers."""
+    # Canonical menu labels may be shared by 60- and 90-minute variants.
+    # Keep the already selected duration when resolving that label on recheck.
+    service = draft.service_description
+    minutes = (draft.selected_slot or {}).get("duration_minutes") or draft.duration_minutes
+    if service and isinstance(minutes, int) and minutes > 0:
+        if not re.search(r"\b\d+\s*(?:min|minute)", service, re.IGNORECASE):
+            service = f"{service} ({minutes} min)"
     return AppointmentIntent(
         intent=draft.operation_mode if draft.operation_mode in {"schedule", "reschedule"} else "schedule",
         caller_name=draft.caller_name,
         caller_email=draft.caller_email,
         requested_start_iso=draft.start_iso,
         requested_end_iso=draft.end_iso,
-        service_description=draft.service_description,
+        service_description=service,
         preferred_staff=draft.preferred_staff,
         guest_name=draft.guest_name,
         confidence=1.0,

@@ -2550,6 +2550,9 @@ class XAIVoiceSession:
         confirmed = self.session.confirmed_datetime
 
         def finish(sentence: str) -> str:
+            if payload.get("card_status") == "pending_card":
+                sentence = sentence.replace("You're all set. ", "")
+                sentence = sentence.replace("is confirmed", "is reserved pending your card on file")
             clause = booking_card_speech(payload.get("card_status"), payload.get("card_sms"))
             question = " Is there anything else I can help you with today?"
             truth(

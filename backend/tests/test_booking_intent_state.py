@@ -833,3 +833,40 @@ async def test_propose_one_hundred_times_never_calls_create_booking(world):
         assert result.appointment is None
     assert adapter.created == []
     assert adapter.created_contexts == []
+
+
+async def test_duplicate_swedish_names_recheck_and_create_same_sixty_minute_slot(world, monkeypatch):
+    from app.services.booking_adapters import SpaBookingAdapter
+
+    spa = world["spa"]
+    spa.timezone = "America/Chicago"
+    spa.services = [
+        {"name": "Swedish Massage", "duration_minutes": 60},
+        {"name": "Swedish Massage", "duration_minutes": 90},
+    ]
+    spa.staff = [{"name": "SIX"}]
+    provider = world["adapter"]
+    provider.provider = "square"
+    adapter = SpaBookingAdapter(spa)
+    adapter.delegate = provider
+    monkeypatch.setattr(svc, "get_booking_adapter", lambda **_k: adapter)
+    session = world["session"]
+    session.timezone = "America/Chicago"
+    start = datetime(2026, 10, 9, 18, 45, tzinfo=timezone.utc)
+    intent = _wants(start, "60 minute Swedish massage")
+    intent.preferred_staff = "SIX"
+    staged = await stage_booking(world["db"], session, intent)
+    assert staged.outcome is BookingOutcome.DRAFT
+    draft = get_draft(session)
+    assert draft.service_description == "Swedish Massage"
+    offered = dict(draft.selected_slot)
+    result = await _confirm(world["db"], session)
+    assert result.outcome is BookingOutcome.BOOKED
+    assert result.appointment.external_booking_id
+    assert len(provider.created_contexts) == 1
+    final = provider.created_contexts[0]
+    assert final.start == start
+    assert final.end == start + HOUR
+    assert final.preferred_staff == "SIX"
+    for field in ("service_variation_id", "team_member_id", "location_id", "duration_minutes"):
+        assert final.selected_slot[field] == offered[field]
