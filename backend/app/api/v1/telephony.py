@@ -70,6 +70,7 @@ from app.services.call_finalization import finalize_gather_call
 from app.services.call_state import CallSession, CallStateStore
 from app.services.caller_identity import persist_caller_identity
 from app.services.grok_service import build_spa_prompt_context, grok_service
+from app.services.receptionist_identity import incoming_greeting
 from app.services.phone_numbers import normalize_phone_target
 from app.services.twilio_service import twilio_service
 from app.services.twilio_sync import repair_unscoped_call_logs, sync_calls
@@ -479,7 +480,7 @@ async def voice_browser_test(
     if spa and spa.twiml_voice:
         session.voice = spa.twiml_voice
 
-    greeting = f"Thank you for calling {spa.name}. How may I help you today?"
+    greeting = incoming_greeting(spa.name)
     session.add_turn("assistant", greeting)
     await state.create(session)
 
@@ -576,13 +577,7 @@ async def voice_inbound(
     if contact:
         session.entities["known_contact"] = {"id": str(contact.id), "name": contact.full_name}
 
-    business = spa.name if spa else None
-    if contact and contact.first_name:
-        greeting = f"Hello {contact.first_name}, thanks for calling back. How can I help you today?"
-    elif business:
-        greeting = f"Thank you for calling {business}. How can I help you today?"
-    else:
-        greeting = "Hello! Thank you for calling. How can I help you today?"
+    greeting = incoming_greeting(session.business_name)
 
     session.add_turn("assistant", greeting)
     await state.create(session)

@@ -584,7 +584,10 @@ async def test_greeting_is_spoken_on_connect(voice_session):
     assert len(sent) == 1
     item = sent[0]["item"]
     assert item["type"] == "force_message"
-    assert item["content"][0]["text"] == "Thank you for calling Healing Waters Day Spa."
+    assert item["content"][0]["text"] == (
+        "Thank you for calling Healing Waters Day Spa. "
+        "I’m Cara, your AI receptionist. May I help you reserve an appointment today?"
+    )
     assert voice_session.session.greeting_requested is True
     assert voice_session.session.greeting_sent is False
     await voice_session._dispatch({"type": "response.created", "response": {"id": "greet-1"}})

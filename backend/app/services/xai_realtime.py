@@ -95,6 +95,7 @@ from app.services.grok_service import (
 )
 from app.services.truth_log import truth
 from app.services.voice_config import resolve_xai_voice
+from app.services.receptionist_identity import incoming_greeting
 
 logger = logging.getLogger(__name__)
 
@@ -1588,7 +1589,9 @@ class XAIVoiceSession:
             )
             return
         greeting = None
-        if self.session.history:
+        if self.session.direction == "inbound":
+            greeting = incoming_greeting(self.session.business_name)
+        elif self.session.history:
             first = self.session.history[0]
             if first.get("role") == "assistant":
                 greeting = first.get("content")
@@ -1662,7 +1665,10 @@ class XAIVoiceSession:
                             "type": "input_text",
                             "text": (
                                 "[The callee just answered your outbound call. Introduce yourself as Cara, the AI assistant with 6DM, and ask if now is a good time.]"
-                                if self.session.direction == "outbound" else _GREET_THEM_PROMPT
+                                if self.session.direction == "outbound" else
+                                _GREET_THEM_PROMPT + " Speak exactly: "
+                                + incoming_greeting(self.session.business_name)
+                                + " Then stop and wait for the caller's response."
                             ),
                         }
                     ],

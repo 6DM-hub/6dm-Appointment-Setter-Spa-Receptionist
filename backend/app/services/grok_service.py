@@ -397,13 +397,14 @@ def build_realtime_instructions(business_name: str, tenant_prompt: str | None, t
             "the sales calendar, never to a spa calendar.\n"
             f"CALL OBJECTIVE:\n{call_objective or 'Ask whether the business would like to learn about 6DM appointment setting.'}"
         )
+    from app.services.receptionist_identity import RECEPTIONIST_IDENTITY_RULES
     return REALTIME_SPA_PROMPT.format(
         business_name=business_name,
         tz_name=timezone_label(tz),
         local_now=now_utc.astimezone(tz).strftime("%A, %Y-%m-%d %H:%M"),
         now_iso=now_utc.isoformat(),
         tenant_block=tenant_prompt or "",
-    ).strip()
+    ).strip() + "\n\n" + RECEPTIONIST_IDENTITY_RULES
 
 
 def build_spa_prompt_context(spa: Any, *, include_dashboard_facts: bool = True) -> str:
@@ -488,6 +489,8 @@ def build_spa_prompt_context(spa: Any, *, include_dashboard_facts: bool = True) 
             "lookup_spa_facts first and speak only that result."
         )
 
+    from app.services.receptionist_identity import RECEPTIONIST_IDENTITY_RULES
+    sections.append(RECEPTIONIST_IDENTITY_RULES)
     return "\n\n".join(section for section in sections if section)
 
 EXTRACTION_SYSTEM_PROMPT = """\
