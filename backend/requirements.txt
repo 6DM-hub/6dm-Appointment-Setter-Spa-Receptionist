@@ -35,3 +35,5 @@ tzdata>=2024.1
 # --- Tests ---
 pytest==8.3.3
 pytest-asyncio==0.24.0
+# Async SQLite adapter used only by isolated manager database regression tests.
+aiosqlite>=0.20.0,<1.0
