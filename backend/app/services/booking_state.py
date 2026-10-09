@@ -728,6 +728,9 @@ def invalidate_booking_proposal(session: Any, reason: str, *, service_changed: b
             call_sid=getattr(session, "call_sid", None),
             reason=_availability_invalidation_reason(reason),
         )
+    session.entities.pop("accepted_booking_offer", None)
+    session.entities.pop("spoken_booking_offer", None)
+    session.entities.pop("spoken_booking_choices", None)
     draft.selected_slot = None
     draft.alternative_slots = []
     draft.verified_availability = None
@@ -1068,7 +1071,7 @@ def authoritative_availability_speech(session: Any, tz: Any) -> str | None:
     if draft.start_iso and not draft.selected_slot:
         return (
             f"I don't see an opening at {requested}. "
-            "I won't guess another time."
+            "Would you like to try another day?"
         )
     return None
 

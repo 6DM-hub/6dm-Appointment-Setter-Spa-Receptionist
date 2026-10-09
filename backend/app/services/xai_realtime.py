@@ -52,6 +52,7 @@ from app.services.appointment_booking_service import (
     _prepare,
 )
 from app.services.spa_facts import lookup_spa_facts
+from app.services.booking_conversation import (remember_offer, accept_offer, offer_accepted, authorize_accepted_offer)
 from app.services.booking_state import (
     CALLER_NAME_QUESTION,
     CARD_ON_FILE_HESITANT,
@@ -1173,6 +1174,7 @@ class XAIVoiceSession:
             return False
         if not _CONFIRMATION_QUESTION_RE.search(assistant_text or ""):
             return False
+        remember_offer(self.session)
         if not draft.read_back:
             mark_read_back(self.session)
             logger.info(
@@ -1188,9 +1190,59 @@ class XAIVoiceSession:
         confirmed a booking but never called ``confirm_appointment``. Once a real
         read-back has been recorded, the state machine—not the LLM—owns the write.
         """
-        if self.session.booking_status != "awaiting_confirmation":
+        if self.session.entities.get("callback_offer_pending"):
+            if is_affirmative(caller_text):
+                self.session.entities["callback_authorized"] = True
+                result = json.loads(await self._run_request_callback(json.dumps({"reason": "Appointment booking assistance requested after repeated availability errors."})))
+                self.session.entities.pop("callback_offer_pending", None)
+                await self._send_force_message(
+                    "I've saved your callback request for the spa team to help with this appointment at their earliest availability."
+                    if result.get("status") == "stored" else "I couldn't save your callback request. Please contact the spa directly."
+                )
+                return True
+            if caller_text.strip().lower() in {"no", "no thanks", "no thank you"}:
+                self.session.entities.pop("callback_offer_pending", None)
+                await self._send_force_message("Okay. What else can I help you with?")
+                return True
             return False
         draft = get_draft(self.session)
+        if self.session.booking_status not in {"awaiting_confirmation", "collecting_details", "conflict"}:
+            return False
+        # Selecting a time we actually offered is consent, not a request to
+        # restart availability or ask a second approval question.
+        selected_now = False
+        if not offer_accepted(self.session):
+            clock = _extract_clock_time(caller_text)
+            clocks = list(_CLOCK_RE.finditer(caller_text))
+            remainder = _CLOCK_RE.sub("", caller_text).strip(" ,.! ").casefold()
+            choice_only = len(clocks) == 1 and remainder in {
+                "", "yes", "yes please", "okay", "i'll take", "i will take",
+                "let's do", "book", "please book", "works", "works for me",
+                "that works", "sounds good", "please", "is fine", "yes works for me",
+            }
+            if clock and choice_only:
+                offer = self.session.entities.get("spoken_booking_choices") or {}
+                if offer.get("revision") == draft.draft_revision:
+                    slots = offer.get("slots") or []
+                    matches = [slot for slot in slots
+                               if datetime.fromisoformat(slot["start"].replace("Z", "+00:00"))
+                               .astimezone(self._tz).time().replace(tzinfo=None) == clock]
+                    if len(matches) == 1:
+                        from app.services.booking_state import bind_verified_slot
+                        slot = matches[0]
+                        start = datetime.fromisoformat(slot["start"].replace("Z", "+00:00")).astimezone(self._tz)
+                        draft.start_iso = start.isoformat()
+                        draft.end_iso = (start + timedelta(minutes=int(slot["duration_minutes"]))).isoformat()
+                        save_draft(self.session, draft)
+                        bind_verified_slot(self.session, slot)
+                        remember_offer(self.session)
+                        accept_offer(self.session)
+                        selected_now = True
+                        self.session.booking_status = "awaiting_confirmation"
+                        draft = get_draft(self.session)
+            elif is_affirmative(caller_text):
+                accept_offer(self.session)
+        accepted = offer_accepted(self.session)
         if (
             self.session.entities.get("card_policy_explained")
             and looks_card_hesitant(caller_text)
@@ -1198,7 +1250,11 @@ class XAIVoiceSession:
         ):
             await self._send_force_message(CARD_ON_FILE_HESITANT)
             return True
-        if utterance_modifies_booking(caller_text) or not is_affirmative(caller_text):
+        if not selected_now and (utterance_modifies_booking(caller_text) or not is_affirmative(caller_text)):
+            if accepted and utterance_modifies_booking(caller_text):
+                from app.services.booking_state import consume_confirmation_authorization
+                self.session.entities.pop("accepted_booking_offer", None)
+                consume_confirmation_authorization(self.session)
             if utterance_modifies_booking(caller_text):
                 logger.info(
                     "call %s: CONFIRMATION_REJECTED reason=modification_present",
@@ -1208,13 +1264,16 @@ class XAIVoiceSession:
         if caller_name_required_for(draft) and not supplied_caller_name(draft):
             await self._ask_for_caller_name(again=True)
             return True
+        if accepted:
+            authorize_accepted_offer(self.session)
+            draft = get_draft(self.session)
         if not draft.read_back or not draft.is_complete or not draft.selected_slot:
             logger.warning(
                 "call %s: affirmative heard while appointment is pending but read-back/provider slot is not armed; refusing auto-confirm",
                 self.call_id,
             )
             return False
-        if not record_pure_confirmation(self.session, caller_text):
+        if not draft.confirmation_authorized and not record_pure_confirmation(self.session, caller_text):
             return False
 
         self._cancel_confirmation_wait()
@@ -1412,8 +1471,9 @@ class XAIVoiceSession:
             "- When the caller gives their name, pass it as caller_name on propose_appointment "
             "with the same service and time. Do not rename the Square customer and do not "
             "create a new Square customer only because the spoken name differs.\n"
-            "- When the caller explicitly agrees (for example yes, that works, book it) after "
-            "the name is stored and the details were read back, your NEXT action must be "
+            "- Selecting or accepting an offered verified slot is consent to that selection. "
+            "Preserve it while collecting a missing name; never ask for the same approval again. "
+            "Once required details are stored, explain any required secure card step and use "
             "confirm_appointment. Do not speak a success acknowledgment first.\n"
             "- Never say or imply booked, confirmed, scheduled, reserved, all set, got you down, "
             "good to go, on the calendar, or equivalent success language unless the backend has "
@@ -1820,6 +1880,26 @@ class XAIVoiceSession:
             draft.operation_mode = "reschedule"
             save_draft(self.session, draft)
 
+        current = get_draft(self.session)
+        raw_service = str(args.get("service_description") or current.service_description or "")
+        def menu_tokens(value):
+            return re.sub(r"\b(?:\d+|minute|minutes|min|massage)\b", "", value.casefold()).strip()
+        duration = re.search(r"\b(\d+)\s*(?:minute|minutes|min)\b", raw_service, re.IGNORECASE)
+        same_duration = not duration or int(duration.group(1)) == (current.selected_slot or {}).get("duration_minutes")
+        same_slot = bool(current.provider_verified and current.selected_slot
+            and self._time_key(args.get("requested_start_iso") or current.start_iso) == self._time_key(current.start_iso)
+            and menu_tokens(raw_service) == menu_tokens(current.service_description or "")
+            and same_duration
+            and (not args.get("preferred_staff") or args["preferred_staff"] == current.preferred_staff)
+            and "guest_name" not in args and not args.get("earliest")
+            and (not args.get("requested_end_iso") or self._time_key(args["requested_end_iso"]) == self._time_key(current.end_iso))
+            and not args.get("caller_name") and not args.get("caller_email")
+            and operation == current.operation_mode and not appointment_id)
+        if same_slot:
+            return json.dumps({"status": "draft", "booked": False,
+                "requires_caller_confirmation": not offer_accepted(self.session),
+                "spoken": None, "message": "The current verified appointment details are unchanged."})
+
         checks_square = bool(args.get("requested_start_iso") or args.get("earliest"))
         if checks_square:
             await self._arm_availability_hold()
@@ -1839,9 +1919,7 @@ class XAIVoiceSession:
         message = result.message
         if spoken:
             message = (
-                "The caller already heard the Square availability result. "
-                "Do not repeat it and do not offer any other time. "
-                "Ask only for a missing name, or call confirm_appointment after a pure yes."
+                "Availability was delivered. Nothing has been booked yet."
             )
         return json.dumps({
             "status": result.outcome.value,
@@ -2215,7 +2293,25 @@ class XAIVoiceSession:
             })
         return json.dumps(payload)
 
+    async def _offer_staff_callback(self) -> None:
+        if self.session.entities.get("callback_offer_pending"):
+            return
+        self.session.entities["callback_offer_pending"] = True
+        self.session.entities.pop("awaiting_caller_name", None)
+        self._response_needed_after_tool = False
+        await self._cancel_active_response()
+        stop = getattr(self, "stop_hold_tone", None)
+        if stop:
+            await stop()
+        await self._send_force_message(
+            "I'm having trouble completing this appointment. Would it be okay if I asked a service provider to call you back to help at their earliest availability?"
+        )
+
     async def _run_request_callback(self, raw_arguments: str) -> str:
+        if not self.session.entities.get("callback_authorized"):
+            return json.dumps({"status": "consent_required", "message": "Ask the caller's permission for a callback first."})
+        if self.session.entities.get("callback_saved"):
+            return json.dumps({"status": "stored", "kind": "callback"})
         from app.models.follow_up_request import FollowUpRequest
         from app.services.secure_payment import contains_sensitive_payment
         from app.services.staff_notifications import callback_request_payload, notify_staff
@@ -2241,6 +2337,8 @@ class XAIVoiceSession:
                     reason=args.get("reason"),
                     preferred_window=args.get("preferred_window"),
                 )
+                if spa is None:
+                    return json.dumps({"status": "error", "message": "The business could not be identified."})
                 if spa is not None:
                     db.add(FollowUpRequest(
                         spa_id=spa.id,
@@ -2253,6 +2351,7 @@ class XAIVoiceSession:
                         status="open",
                     ))
                     await db.commit()
+                    self.session.entities["callback_saved"] = True
                     await notify_staff(
                         spa,
                         "callback_requested",
@@ -2260,6 +2359,8 @@ class XAIVoiceSession:
                     )
         except Exception:
             logger.exception("call %s: callback request failed", self.call_id)
+            if self.session.entities.get("callback_saved"):
+                return json.dumps({"status": "stored", "kind": "callback", "notification_status": "failed"})
             return json.dumps({
                 "status": "error",
                 "message": "I could not save that callback request.",
@@ -2462,6 +2563,22 @@ class XAIVoiceSession:
         if target is None:
             return False
 
+        # Provider-returned slots remain authoritative independent of caller
+        # transcript wording.
+        draft = get_draft(self.session)
+        candidates = list(draft.alternative_slots or [])
+        candidates.extend((draft.verified_availability or {}).get("slots", []))
+        if draft.selected_slot:
+            candidates.append(draft.selected_slot)
+        for slot in candidates:
+            slot_dt = _parse_provider_iso(slot.get("start"))
+            if (
+                slot_dt is not None
+                and slot_dt.astimezone(timezone.utc)
+                == target.astimezone(timezone.utc)
+            ):
+                return True
+
         # A fresh caller turn that actually contains a time can ground one exact
         # timestamp — but only combined with a date the caller actually named,
         # in this turn or as the most recent unretracted date established
@@ -2486,20 +2603,6 @@ class XAIVoiceSession:
                 if active_date is not None and active_date == target.date():
                     return True
 
-        # Provider-returned slots remain authoritative independent of caller
-        # transcript wording.
-        draft = get_draft(self.session)
-        candidates = list(draft.alternative_slots or [])
-        if draft.selected_slot:
-            candidates.append(draft.selected_slot)
-        for slot in candidates:
-            slot_dt = _parse_provider_iso(slot.get("start"))
-            if (
-                slot_dt is not None
-                and slot_dt.astimezone(timezone.utc)
-                == target.astimezone(timezone.utc)
-            ):
-                return True
         return False
 
     def _remember_grounded_exact_time(self, requested_start_iso: str | None) -> None:
@@ -2602,6 +2705,10 @@ class XAIVoiceSession:
         if not payload.get("appointment_id") or not payload.get("external_booking_id"):
             return None
 
+        confirmation_key = str(payload["external_booking_id"]) + ":" + str(self.session.confirmed_datetime)
+        if self.session.entities.get("spoken_booking_confirmation") == confirmation_key:
+            return ""
+        self.session.entities["spoken_booking_confirmation"] = confirmation_key
         service = (self.session.selected_service or "appointment").strip()
         provider = (get_draft(self.session).preferred_staff or "").strip()
         with_provider = f" with {provider}" if provider else ""
@@ -2747,19 +2854,29 @@ class XAIVoiceSession:
         self._availability_hold_done = False
         self._availability_expect_hold = False
         self._pending_availability_speech = None
-        if not self._hold_ack_played_this_turn and self._ws is not None:
+        draft = get_draft(self.session)
+        hold_key = (draft.start_iso, draft.service_description, draft.preferred_staff)
+        if (not self._hold_ack_played_this_turn and self._ws is not None
+                and hold_key != getattr(self, "_spoken_hold_request", None)):
+            self._spoken_hold_request = hold_key
             self._hold_ack_played_this_turn = True
             self._availability_expect_hold = True
             await self._send_force_message(HOLD_ACK_TEXT)
 
     async def _speak_availability(self, spoken: str) -> None:
-        """Collect identity first; an approval question always ends the turn."""
-        line = self._next_collection_line()
-        if line == CALLER_NAME_QUESTION:
-            await self._ask_for_caller_name()
+        """Offer once; collect identity after the caller accepts the slot."""
+        draft = get_draft(self.session)
+        if offer_accepted(self.session):
+            await self._confirm_pending_booking_from_caller("yes")
             return
-        self._after_availability_line = line
-        self._prompt_caller_name_after_response = line is not None
+        remember_offer(self.session)
+        slots = ([draft.selected_slot] if draft.provider_verified and draft.selected_slot
+                 else list(draft.alternative_slots or [])[:3])
+        self.session.entities["spoken_booking_choices"] = {
+            "revision": draft.draft_revision, "slots": slots,
+        }
+        self._after_availability_line = None
+        self._prompt_caller_name_after_response = False
         await self._send_force_message(spoken)
 
     async def _deliver_authoritative_availability(self, call_ref: str | None, output: str) -> None:
@@ -2793,17 +2910,19 @@ class XAIVoiceSession:
             await asyncio.sleep(self.HOLD_ACK_DELAY_SECONDS)
         except asyncio.CancelledError:
             return
-        if self._hold_ack_played_this_turn or self._ws is None:
+        if self._ws is None:
             return
-        self._hold_ack_played_this_turn = True
-        logger.info("HOLD_ACK call=%s", self.call_id)
-        await self._send_force_message(HOLD_ACK_TEXT)
+        if not self._hold_ack_played_this_turn:
+            self._hold_ack_played_this_turn = True
+            logger.info("HOLD_ACK call=%s", self.call_id)
+            await self._send_force_message(HOLD_ACK_TEXT)
         try:
             await asyncio.sleep(self.HOLD_TONE_DELAY_SECONDS)
         except asyncio.CancelledError:
             return
         start = getattr(self, "start_hold_tone", None)
-        if start is not None:
+        if start is not None and getattr(self, "_hold_tone_started_turn", None) != self._user_turn_count:
+            self._hold_tone_started_turn = self._user_turn_count
             await start()
 
     async def _invoke_tool_with_hold(self, name: str, handler, raw_args: str) -> str:
@@ -2820,6 +2939,13 @@ class XAIVoiceSession:
             return await handler(raw_args)
         ack = asyncio.create_task(self._maybe_hold_ack())
         try:
+            if name in {CHECK_AVAILABILITY_TOOL["name"], PROPOSE_APPOINTMENT_TOOL["name"]}:
+                try:
+                    return await asyncio.wait_for(handler(raw_args), timeout=20)
+                except asyncio.TimeoutError:
+                    logger.error("AVAILABILITY_TIMEOUT call=%s tool=%s", self.call_id, name)
+                    await self._offer_staff_callback()
+                    return json.dumps({"status": "lookup_timeout", "available": False, "message": "The availability lookup did not finish. A callback permission question was delivered."})
             return await handler(raw_args)
         finally:
             ack.cancel()
@@ -2963,6 +3089,7 @@ class XAIVoiceSession:
                     }),
                     nudge=False,
                 )
+                await self._offer_staff_callback()
                 return
 
             if is_earliest and not self._caller_requested_earliest():
@@ -3080,6 +3207,9 @@ class XAIVoiceSession:
         # an exact backend-derived line rather than asking Grok to invent the
         # next turn (which has been observed to restart with "hello/welcome").
         forced_followup = self._authoritative_tool_followup(name, output)
+        if forced_followup == "":
+            await self._send_function_output(call_ref, output, nudge=False)
+            return
         if forced_followup is None and name == CONFIRM_APPOINTMENT_TOOL["name"]:
             try:
                 confirm_payload = json.loads(output)
@@ -3164,9 +3294,13 @@ class XAIVoiceSession:
                     and self.session.booking_status not in {"booked", "rescheduled"}
                 ):
                     self.session.booking_status = "awaiting_confirmation"
+                    if offer_accepted(self.session):
+                        await self._confirm_pending_booking_from_caller("yes")
+                        await self._persist_session()
+                        return
                     spoken = authoritative_availability_speech(self.session, self._tz)
                     if spoken:
-                        await self._send_force_message(spoken)
+                        await self._speak_availability(spoken)
                         self._mark_pending_booking_read_back(spoken)
                         self._after_availability_line = self._next_collection_line()
                         self._prompt_caller_name_after_response = (
@@ -3206,6 +3340,11 @@ class XAIVoiceSession:
             delta = _first_str(data, "delta", "transcript", "text")
             if delta:
                 candidate_text = self._pending_agent + delta
+                if re.search(r"\b(?:i (?:will not|won't|wont)|do not|don't) (?:give|offer|suggest) (?:any )?(?:other|alternative) times", candidate_text, re.IGNORECASE):
+                    self._pending_agent = ""
+                    await self._cancel_active_response()
+                    await self._send_force_message("What would you like to do?")
+                    return
                 if (
                     self._should_cancel_restart_greeting(event)
                     and self._looks_like_session_restart_greeting(candidate_text)

@@ -14,6 +14,7 @@ from app.services.call_state import (
 )
 from app.services.media_bridge import TwilioMediaBridge
 from app.services.xai_realtime import XAIVoiceSession
+from app.services.receptionist_identity import incoming_greeting
 from tests.test_greeting_once_per_call import _deliver_opening_audio, _greeting_payloads, _session, _voice
 from tests.test_media_bridge import _FakeTwilioWS
 
@@ -106,7 +107,9 @@ async def test_4_force_message_no_audio_runs_startup_fallback_once(monkeypatch):
     assert voice._greeting_fallback_used is True
     assert any(
         ((p.get("item") or {}).get("content") or [{}])[0].get("text")
-        == "[The caller has just connected. Greet them.]"
+        == ("[The caller has just connected. Greet them.] Speak exactly: "
+            + incoming_greeting(voice.session.business_name)
+            + " Then stop and wait for the caller's response.")
         for p in sent
     )
     await voice._dispatch({"type": "response.created", "response": {"id": "greet-fb"}})

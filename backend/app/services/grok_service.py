@@ -359,6 +359,8 @@ REQUIRED CONFIRMATION TURN RULES (override conflicting persona instructions):
 """
 
 
+BOOKING_CONVERSATION_RULES = "\nBOOKING CONVERSATION RULES (highest priority):\n- Acceptance of an offered available slot is the caller's consent to that selection. Never ask them to approve the same date/time again. Collect only missing required details, explain the secure card step after acceptance when required, and submit the booking. Acceptance never proves provider success.\n- Remember requested date, verified openings, selected slot, caller acceptance, and provider booking status. Reuse verified availability while collecting identity; silently perform the final exact-slot recheck before writing. Do not restart unless the caller changes the request, the slot becomes unavailable, or an error requires another choice.\n- Say you are checking only during an actual lookup, at most once for the same request. Do not repeat availability, filler, approval questions, or successful booking confirmations.\n- Never speak instructions, tool guidance, constraints, or internal reasoning. Do not say “I will not offer other times” or narrate rules. Tool guidance is private; speak only short customer-facing facts and questions.\n- You may offer one optional enhancement from the establishment's verified menu: a 60-minute European facial alongside a massage, a massage alongside a facial, or a brow wax when supported. Do not invent prices, claim an enhancement is popular without data, or add it without consent. A changed service or duration requires checking the complete appointment again. Never delay an accepted booking to repeat an enhancement offer.\n"
+
 def build_realtime_instructions(business_name: str, tenant_prompt: str | None, tz_name: str | None = None, *, direction: str = "inbound", call_objective: str | None = None) -> str:
     """`instructions` for an xAI realtime voice session's `session.update`.
 
@@ -407,7 +409,7 @@ def build_realtime_instructions(business_name: str, tenant_prompt: str | None, t
         local_now=now_utc.astimezone(tz).strftime("%A, %Y-%m-%d %H:%M"),
         now_iso=now_utc.isoformat(),
         tenant_block=tenant_prompt or "",
-    ).strip() + "\n\n" + RECEPTIONIST_IDENTITY_RULES
+    ).strip() + "\n\n" + RECEPTIONIST_IDENTITY_RULES + BOOKING_CONVERSATION_RULES
 
 
 def build_spa_prompt_context(spa: Any, *, include_dashboard_facts: bool = True) -> str:

@@ -949,7 +949,8 @@ async def test_time_change_proposal_is_spoken_by_the_server_then_books_once(monk
     assert spoken[0] == "Let me check that for you."
     # Collect a missing name before asking permission to book. Never append a
     # second question immediately after the booking approval question.
-    assert spoken[-1] == "Can I get your name for the appointment?"
+    assert "11:15 AM is available" in spoken[-1]
+    assert "Would you like me to book that?" in spoken[-1]
     draft = get_draft(voice.session)
     assert "11:15:00" in (draft.start_iso or "")
     assert "11:30" not in (draft.start_iso or "")

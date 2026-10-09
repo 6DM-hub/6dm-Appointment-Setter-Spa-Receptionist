@@ -2203,7 +2203,7 @@ class SquareAdapter(VerticalProviderAdapter):
         idempotency_key = (
             self._idempotency_key(
                 "booking",
-                ctx.customer_phone,
+                ctx.booking_reference or ctx.customer_phone,
                 start_at,
                 self.location_id,
                 service_ids,

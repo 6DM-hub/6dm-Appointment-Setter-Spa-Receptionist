@@ -1268,6 +1268,7 @@ async def stage_booking(
     """
     prior = get_draft(session)
     prior_alts = list(prior.alternative_slots or [])
+    prior_verified = dict(prior.verified_availability or {})
     prior_selected = dict(prior.selected_slot) if prior.selected_slot else None
     prior_service = prior.service_description
     prior_staff = prior.preferred_staff
@@ -1357,9 +1358,9 @@ async def stage_booking(
             draft.end_iso = end.isoformat()
             session.selected_duration = int((end - start).total_seconds() / 60)
 
-        taken = not verdict.available or await _has_conflict(
+        taken = not verdict.available or (not _square_verified(verdict, routing.adapter) and await _has_conflict(
             db, routing.scope, start, end, routing.capacity, exclude_intent_key=key
-        )
+        ))
         if taken:
             seeded = list(getattr(verdict, "alternatives", ()) or ())
             if seeded:
@@ -1414,6 +1415,17 @@ async def stage_booking(
         session.booking_status = "awaiting_confirmation"
         slot = _materialize_slot(start, end, verdict)
         bind_verified_slot(session, slot)
+        if (
+            not service_changed and not staff_changed and prior_verified
+            and prior_verified.get("date") == start.astimezone(resolve_timezone(session.timezone)).date().isoformat()
+            and prior_verified.get("duration_minutes") == session.selected_duration
+            and prior_verified.get("location_id") == slot.get("location_id")
+            and prior_verified.get("service_variation_id") == slot.get("service_variation_id")
+        ):
+            current = get_draft(session)
+            current.verified_availability = prior_verified
+            current.alternative_slots = prior_alts
+            save_draft(session, current)
         return BookingResult(
             BookingOutcome.DRAFT,
             message=(
@@ -1672,9 +1684,9 @@ async def confirm_booking(
             draft.end_iso = end.isoformat()
             session.selected_duration = int((end - start).total_seconds() / 60)
 
-        if not verdict.available or await _has_conflict(
+        if not verdict.available or (not _square_verified(verdict, routing.adapter) and await _has_conflict(
             db, routing.scope, start, end, routing.capacity, exclude_intent_key=key
-        ):
+        )):
             truth(
                 "AVAILABILITY_REVALIDATION",
                 call_sid=session.call_sid,
@@ -1817,7 +1829,7 @@ async def confirm_booking(
             )
 
         ctx = _context(
-            routing.adapter, session, _draft_intent(draft), start, end, str(appointment.id),
+            routing.adapter, session, _draft_intent(draft), start, end, key,
             selected_slot=draft.selected_slot,
         )
         external = await _calendar_call(
@@ -2284,3 +2296,8 @@ class AppointmentBookingService:
 
 # Singleton instance used by routers and voice handlers
 appointment_booking_service = AppointmentBookingService()
+
+
+def _square_verified(verdict, adapter) -> bool:
+    """Square owns staff capacity; aggregate local rows cannot veto its slot."""
+    return bool(getattr(adapter, "provider", None) == "square" and verdict.available and getattr(verdict, "slot", None))
