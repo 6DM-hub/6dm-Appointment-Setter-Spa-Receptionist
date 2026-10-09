@@ -102,6 +102,13 @@ export const NAV_SECTIONS: NavSection[] = [
         description: "Call log and transcripts",
       },
       {
+        label: "Ask Cara",
+        path: "/spa/cara",
+        icon: Sparkles,
+        roles: ["super_admin", "spa_admin"],
+        description: "Owner assistant and campaign approvals",
+      },
+      {
         label: "Guests",
         path: "/spa/guests",
         icon: UsersRound,

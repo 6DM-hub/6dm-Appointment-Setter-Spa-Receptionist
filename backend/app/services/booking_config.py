@@ -21,7 +21,7 @@ CONFIG_KEYS: dict[BookingProvider, tuple[str, ...]] = {
 # Public values. Missing these must not block booking. application_id is the
 # Square Web Payments application id, not a secret.
 OPTIONAL_PUBLIC_KEYS: dict[BookingProvider, tuple[str, ...]] = {
-    BookingProvider.SQUARE: ("application_id",),
+    BookingProvider.SQUARE: ("application_id", "environment"),
 }
 MASK = "••••••••"
 
@@ -55,7 +55,12 @@ def _accepted_keys(provider: BookingProvider) -> set[str]:
 
 
 def validate_config(provider: BookingProvider, config: dict[str, Any] | None) -> dict[str, Any]:
-    values = config or {}
+    values = dict(config or {})
+    if provider == BookingProvider.SQUARE and values.get("environment"):
+        environment = str(values["environment"]).strip().lower()
+        if environment not in {"production", "sandbox"}:
+            raise ValueError("Square environment must be production or sandbox")
+        values["environment"] = environment
     unknown = set(values) - _accepted_keys(provider)
     if unknown:
         raise ValueError(f"Unsupported {provider.value} booking field(s): {sorted(unknown)}")

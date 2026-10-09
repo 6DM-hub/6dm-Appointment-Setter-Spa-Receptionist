@@ -59,6 +59,7 @@ from app.services.booking_state import (
     CARD_ON_FILE_POLICY,
     authoritative_availability_speech,
     booking_card_speech,
+    bind_verified_slot,
     caller_name_required_for,
     capture_caller_name_answer,
     contains_unauthorized_availability_claim,
@@ -68,6 +69,7 @@ from app.services.booking_state import (
     looks_card_hesitant,
     looks_like_unverified_booking_success,
     mark_read_back,
+    proposal_fingerprint,
     record_pure_confirmation,
     recover_caller_name_from_history,
     save_draft,
@@ -1190,6 +1192,17 @@ class XAIVoiceSession:
         confirmed a booking but never called ``confirm_appointment``. Once a real
         read-back has been recorded, the state machine—not the LLM—owns the write.
         """
+        from app.services.enhancements import respond as enhancement_response
+        handled, line, event, resume = enhancement_response(self.session, caller_text)
+        if event:
+            await self._record_enhancement(event)
+        if handled:
+            await self._cancel_active_response()
+            if line:
+                await self._send_force_message(line)
+            if resume:
+                await self._confirm_pending_booking_from_caller("yes")
+            return True
         if self.session.entities.get("callback_offer_pending"):
             if is_affirmative(caller_text):
                 self.session.entities["callback_authorized"] = True
@@ -1314,6 +1327,9 @@ class XAIVoiceSession:
             payload = {}
         status = str(payload.get("status") or "failed")
         message = str(payload.get("message") or "")
+        if status == "upgrade_unavailable":
+            await self._send_force_message(message)
+            return True
         if "caller has not given their name" in message:
             await self._ask_for_caller_name(again=True)
             return True
@@ -1935,6 +1951,9 @@ class XAIVoiceSession:
         })
 
     async def _run_confirm_appointment(self, _raw_arguments: str = "") -> str:
+        from app.services.enhancements import pending as enhancement_pending, KEY
+        if enhancement_pending(self.session):
+            return json.dumps({"status": "awaiting_enhancement_response", "booked": False})
         """Commit the pending request. Idempotent; the only tool that writes."""
         draft = get_draft(self.session)
         last = self._last_user_utterance() or ""
@@ -1997,6 +2016,38 @@ class XAIVoiceSession:
         async with AsyncSessionLocal() as db:
             result = await confirm_booking(db, self.session)
 
+        enhancement = self.session.entities.get(KEY) or {}
+        if enhancement.get("phase") == "accepted":
+            current = get_draft(self.session)
+            matches_upgrade = (
+                proposal_fingerprint(current) == enhancement.get("upgrade_fingerprint")
+                and current.service_description == enhancement.get("target_service")
+            )
+            if matches_upgrade and result.outcome is BookingOutcome.BOOKED and result.appointment is not None and result.appointment.external_booking_id:
+                enhancement["phase"] = "booked"
+                await self._record_enhancement("booked", external_booking_id=result.appointment.external_booking_id)
+            elif matches_upgrade and result.outcome is BookingOutcome.CONFLICT:
+                # No successful provider write: offer the original, never create it automatically.
+                from app.services.booking_state import BookingDraft
+                original = BookingDraft.from_dict(enhancement["original"])
+                original.caller_name = current.caller_name
+                original.caller_email = current.caller_email
+                original.read_back = False
+                original.confirmation_authorized = False
+                save_draft(self.session, original)
+                bind_verified_slot(self.session, original.selected_slot)
+                remember_offer(self.session)
+                self.session.entities.pop("accepted_booking_offer", None)
+                enhancement["phase"] = "failed"
+                await self._record_enhancement("failed")
+                self.session.booking_status = "awaiting_confirmation"
+                return json.dumps({"status": "upgrade_unavailable", "booked": False,
+                    "message": "The upgrade is no longer available. Would you like me to continue with your original treatment?"})
+            elif not matches_upgrade:
+                enhancement["phase"] = "superseded"
+                await self._record_enhancement("superseded")
+            elif result.outcome not in {BookingOutcome.BOOKED, BookingOutcome.SKIPPED}:
+                await self._record_enhancement("failed")
         apply_booking_result(self.session, result)
         if result.appointment is not None:
             self.session.entities["active_appointment_id"] = str(result.appointment.id)
@@ -2868,6 +2919,39 @@ class XAIVoiceSession:
             self._availability_expect_hold = True
             await self._send_force_message(HOLD_ACK_TEXT)
 
+    async def _record_enhancement(self, status: str, **extra) -> None:
+        from app.services.enhancements import record
+        try:
+            async with AsyncSessionLocal() as db:
+                await record(db, self.session, status, **extra)
+        except Exception:
+            logger.warning("call %s: enhancement analytics unavailable", self.call_id)
+
+    async def _maybe_enhancement(self) -> str | None:
+        from app.services.enhancements import prepare, KEY
+        if not self.session.entities.get("smart_enhancements_enabled") or self.session.entities.get(KEY):
+            return None
+        try:
+            async with AsyncSessionLocal() as db:
+                routing = await _prepare(db, self.session)
+                line = await asyncio.wait_for(prepare(db, self.session, routing), timeout=3.0)
+                if offer_accepted(self.session) or get_draft(self.session).is_persisted:
+                    state = self.session.entities.get(KEY)
+                    if state:
+                        state["phase"] = "superseded"
+                    return None
+                if line:
+                    self.session.entities[KEY]["presented"] = True
+                    await self._record_enhancement("presented")
+                return line
+        except Exception:
+            # Optional reads cannot break the requested booking or cause silent loops.
+            state = self.session.entities.get(KEY)
+            if state:
+                state["phase"] = "skipped"
+            logger.info("call %s: enhancement skipped; original booking preserved", self.call_id)
+            return None
+
     async def _speak_availability(self, spoken: str) -> None:
         """Offer once; collect identity after the caller accepts the slot."""
         draft = get_draft(self.session)
@@ -2882,6 +2966,11 @@ class XAIVoiceSession:
         }
         self._after_availability_line = None
         self._prompt_caller_name_after_response = False
+        suggestion = await self._maybe_enhancement()
+        if suggestion:
+            # One question: retain the real original slot read-back, defer booking consent.
+            spoken = re.split(r"(?i)(?:would you like|shall I|may I|do you want)", spoken)[0].strip()
+            spoken = f"{spoken} {suggestion}"
         await self._send_force_message(spoken)
 
     async def _deliver_authoritative_availability(self, call_ref: str | None, output: str) -> None:
@@ -3013,6 +3102,10 @@ class XAIVoiceSession:
         if name in self._AVAILABILITY_PROBE_TOOLS and self._recover_availability_tool:
             self._recover_availability_tool = False
 
+        from app.services.enhancements import pending as enhancement_pending
+        if (enhancement_pending(self.session) or (self.session.entities.get("smart_enhancement") or {}).get("phase") == "checking") and name in self._AVAILABILITY_PROBE_TOOLS | {CONFIRM_APPOINTMENT_TOOL["name"]}:
+            await self._send_function_output(call_ref, json.dumps({"status": "awaiting_enhancement_response", "booked": False}), nudge=False)
+            return
         if self.session.entities.get("callback_offer_pending") and name in self._AVAILABILITY_PROBE_TOOLS | {CONFIRM_APPOINTMENT_TOOL["name"]}:
             await self._send_function_output(call_ref, json.dumps({"status": "awaiting_callback_consent", "booked": False}), nudge=False)
             return
@@ -3676,6 +3769,8 @@ class XAIVoiceSession:
                     if self.session.booking_status != "none"
                     else "no_booking",
                     "linked_appointment_id": self.session.appointment_id,
+                    "sensitive_health_request": bool(self.session.entities.get("sensitive_health_request")),
+                    "medical_workflow_enabled": False,
                 }
                 if analysis:
                     call_log.ai_summary = analysis.summary

@@ -834,6 +834,9 @@ async def _prepare(db: AsyncSession, session: CallSession) -> _Routing:
     if spa is not None:
         from app.services.spa_facts import payment_policy_of
 
+        session.entities["smart_enhancements_enabled"] = bool(
+            (getattr(spa, "enhancement_settings", None) or {}).get("enabled")
+        )
         policy = payment_policy_of(spa)
         session.entities["card_on_file_required"] = bool(
             policy.get("card_required")
@@ -868,6 +871,8 @@ async def _notify_staff_event(spa: SpaAccount | None, event: str, summary: str) 
 
 
 async def _notify_provider_error(session: CallSession, summary: str) -> None:
+    if session.call_sid.startswith("cara-test:"):
+        return
     if session.tenant_id is None:
         return
     try:
@@ -1258,7 +1263,7 @@ async def search_day_part(
 
 
 async def stage_booking(
-    db: AsyncSession, session: CallSession, intent: AppointmentIntent
+    db: AsyncSession, session: CallSession, intent: AppointmentIntent, *, test_adapter: BookingAdapter | None = None
 ) -> BookingResult:
     """Record what the caller asked for. Never writes an appointment.
 
@@ -1274,7 +1279,11 @@ async def stage_booking(
     prior_staff = prior.preferred_staff
     draft = stage(session, intent)
     try:
-        routing = await _prepare(db, session)
+        if test_adapter is None:
+            routing = await _prepare(db, session)
+        else:
+            from app.services.campaign_booking import test_routing
+            routing = await test_routing(db, session, test_adapter)
         if intent.caller_name or intent.caller_email:
             await persist_caller_identity(
                 db, session, intent.caller_name, intent.caller_email
@@ -1515,7 +1524,7 @@ async def _move_existing(
 
 
 async def confirm_booking(
-    db: AsyncSession, session: CallSession, intent: AppointmentIntent | None = None
+    db: AsyncSession, session: CallSession, intent: AppointmentIntent | None = None, *, test_adapter: BookingAdapter | None = None
 ) -> BookingResult:
     """Persist the active draft. The only path that writes an appointment.
 
@@ -1579,7 +1588,11 @@ async def confirm_booking(
             ),
         )
     try:
-        routing = await _prepare(db, session)
+        if test_adapter is None:
+            routing = await _prepare(db, session)
+        else:
+            from app.services.campaign_booking import test_routing
+            routing = await test_routing(db, session, test_adapter)
         window = await _draft_window(routing, draft)
         if window is None:
             session.booking_status = "collecting_details"

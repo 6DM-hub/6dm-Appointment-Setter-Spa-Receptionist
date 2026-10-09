@@ -1,0 +1,48 @@
+import { useEffect, useState } from "react";
+import { Panel } from "./ui/Primitives";
+import { type SpaAccount, type SpaService, type EnhancementSettings, type EnhancementReport, fetchEnhancementReport, clearEnhancementHistory, generateEnhancementPhrasing, getApiErrorMessage } from "../api/client";
+const defaults: EnhancementSettings = { enabled: false, max_suggestions: 1, personalize: true, retention_days: 90, excluded_services: [], rules: [] };
+export default function SmartEnhancements({ spa, editable, onChange, onServicesChange }: { spa: SpaAccount; editable: boolean; onChange: (value: EnhancementSettings) => void; onServicesChange: (value: SpaService[]) => void }) {
+  const config = { ...defaults, ...spa.enhancement_settings };
+  const [report, setReport] = useState<EnhancementReport | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [generating, setGenerating] = useState(false);
+  useEffect(() => {
+    setReport(null); setError(null);
+    let active = true;
+    fetchEnhancementReport(spa.id).then((value) => { if (active) setReport(value); })
+      .catch((err) => { if (active) setError(getApiErrorMessage(err, "Enhancement reporting is unavailable.")); });
+    return () => { active = false; };
+  }, [spa.id]);
+  const set = (value: Partial<EnhancementSettings>) => onChange({ ...config, ...value });
+  return <Panel title="Smart Enhancements" subtitle="One optional, verified recommendation. Save with the settings button above.">
+    <div className="space-y-4 text-sm">
+      <label className="block"><input type="checkbox" disabled={!editable} checked={config.enabled} onChange={(e) => set({ enabled: e.target.checked })} /> Enable recommendations</label>
+      <label className="block"><input type="checkbox" disabled={!editable} checked={config.personalize} onChange={(e) => set({ personalize: e.target.checked })} /> Use completed booking history for returning customers</label>
+      <label className="block">Suggestions per call <select disabled={!editable} value={config.max_suggestions} onChange={(e) => set({ max_suggestions: Number(e.target.value) })}><option value={0}>0</option><option value={1}>1</option></select></label>
+      <label className="block">Offer history retention (days) <input type="number" min={1} max={365} disabled={!editable} value={config.retention_days} onChange={(e) => set({ retention_days: Number(e.target.value) })} /></label>
+      <label className="block">Exclude services <input className="w-full rounded border p-2" disabled={!editable} value={config.excluded_services.join(", ")} onChange={(e) => set({ excluded_services: e.target.value.split(",").map((v) => v.trim()).filter(Boolean) })} /></label>
+      <p>Square fixed-price variants and catalog bundles are supported. Promotions must already have the approved price in Square. Separate add-ons, room resources, and ad hoc discounts are unavailable until the integration can verify and book them together.</p>
+      {config.rules.map((rule, index) => <div key={index} className="grid gap-2 rounded border p-3">
+        {(["base_service", "target_service"] as const).map((key) => <label key={key}>{key === "base_service" ? "Requested service" : "Compatible upgrade or catalog bundle"}<select className="w-full rounded border p-2" disabled={!editable} value={rule[key]} onChange={(e) => set({ rules: config.rules.map((r, i) => i === index ? { ...r, [key]: e.target.value } : r) })}><option value="">Select service</option>{spa.services.map((service) => <option key={service.name} value={service.name}>{service.name} ({service.duration_minutes} min)</option>)}</select></label>)}
+        <label>Priority (0–100) <input type="number" min={0} max={100} disabled={!editable} value={rule.priority} onChange={(e) => set({ rules: config.rules.map((r, i) => i === index ? { ...r, priority: Number(e.target.value) } : r) })} /></label>
+        <label><input type="checkbox" disabled={!editable} checked={rule.requires_resources} onChange={(e) => set({ rules: config.rules.map((r, i) => i === index ? { ...r, requires_resources: e.target.checked } : r) })} /> Requires additional resources (offer blocked until supported)</label>
+        <label>Approved invitation wording (one per line; use {"{service}"})<textarea className="w-full rounded border p-2" disabled={!editable} value={(rule.phrase_variants ?? []).join("\n")} placeholder="Default varied invitations" onChange={(e) => set({ rules: config.rules.map((r, i) => i === index ? { ...r, phrase_variants: e.target.value.split("\n").filter((v) => v.trim()) } : r) })} /></label>
+        <button type="button" disabled={!editable || generating} onClick={async () => { setGenerating(true); try { const phrases = await generateEnhancementPhrasing(spa.id); set({ rules: config.rules.map((r, i) => i === index ? { ...r, phrase_variants: phrases } : r) }); setError(null); } catch (err) { setError(getApiErrorMessage(err, "Grok phrasing is unavailable.")); } finally { setGenerating(false); } }}>{generating ? "Generating…" : "Generate invitations with Grok"}</button>
+        <p>Review generated wording before saving. Generation runs here; no extra language-model call is made during a customer's booking.</p>
+        <button type="button" disabled={!editable} onClick={() => set({ rules: config.rules.filter((_, i) => i !== index) })}>Remove mapping</button>
+      </div>)}
+      <button type="button" disabled={!editable} onClick={() => set({ rules: [...config.rules, { base_service: "", target_service: "", priority: 0, requires_resources: false }] })}>Add compatible mapping</button>
+      <details><summary>Square service IDs</summary><p>Copy each exact variation ID from your Square catalog. Price and duration are read from Square when checking the offer.</p>{spa.services.map((service, index) => <label className="block" key={service.name}>{service.name}<input className="w-full rounded border p-2" disabled={!editable} value={service.square_variation_id || ""} placeholder="Square variation ID" onChange={(e) => onServicesChange(spa.services.map((s, i) => i === index ? { ...s, square_variation_id: e.target.value.trim() || null, square_variation_version: null } : s))} /></label>)}</details>
+      {error && <p role="alert">{error}</p>}
+      {report && <div>
+        <p>{report.eligible} eligible · {report.presented} offered · {report.accepted} accepted · {report.declined} declined · {report.booked} booked</p>
+        <p>Acceptance rate: {report.acceptance_rate == null ? "No offers yet" : `${(report.acceptance_rate * 100).toFixed(1)}%`}</p>
+        {Object.entries(report.incremental_booking_value_minor).map(([currency, value]) => <p key={currency}>Incremental booked value: {currency} {(value / 100).toFixed(2)}</p>)}
+        <p>Realized payment revenue: unavailable; booking value is not payment revenue.</p>
+        <table className="w-full"><thead><tr><th>Requested service</th><th>Enhancement</th><th>Offered</th><th>Accepted</th><th>Declined</th><th>Booked</th></tr></thead><tbody>{report.by_service.map((row, i) => <tr key={i}><td>{row.base_service}</td><td>{row.enhancement || "No verified offer"}</td><td>{row.presented}</td><td>{row.accepted}</td><td>{row.declined}</td><td>{row.booked}</td></tr>)}</tbody></table>
+      </div>}
+      <button type="button" disabled={!editable} onClick={async () => { try { await clearEnhancementHistory(spa.id); setReport(await fetchEnhancementReport(spa.id)); setError(null); } catch (err) { setError(getApiErrorMessage(err, "Could not delete history.")); } }}>Delete offer history and counters</button>
+    </div>
+  </Panel>;
+}

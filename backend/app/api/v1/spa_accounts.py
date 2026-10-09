@@ -291,6 +291,43 @@ async def google_oauth_callback(
     return _google_redirect("connected")
 
 
+@router.get("/{spa_id}/enhancements/report")
+async def enhancement_report(spa_id: uuid.UUID, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    from datetime import datetime, timedelta, timezone
+    from sqlalchemy import delete
+    from app.models.enhancement_offer import EnhancementOffer
+    from app.services.enhancements import metrics
+    spa = await _load_visible_spa(db, spa_id, current_user)
+    days = int((spa.enhancement_settings or {}).get("retention_days", 90))
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    await db.execute(delete(EnhancementOffer).where(EnhancementOffer.tenant_id == spa_id, EnhancementOffer.created_at < cutoff))
+    await db.commit()
+    rows = list((await db.execute(select(EnhancementOffer).where(EnhancementOffer.tenant_id == spa_id, EnhancementOffer.created_at >= cutoff))).scalars())
+    return metrics(rows)
+
+@router.post("/{spa_id}/enhancements/phrasing")
+async def enhancement_phrasing(spa_id: uuid.UUID, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    from app.services.enhancement_phrasing import generate_phrasing
+    if current_user.role == UserRole.SPA_STAFF:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Owner access required.")
+    await _load_visible_spa(db, spa_id, current_user)
+    if not settings.XAI_API_KEY:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Grok text access is not configured. Default verified invitations remain available.")
+    try:
+        return {"phrases": await generate_phrasing(), "saved": False}
+    except Exception:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Grok could not produce valid invitations. Default verified invitations remain available.")
+
+@router.delete("/{spa_id}/enhancements/history", status_code=204)
+async def clear_enhancement_history(spa_id: uuid.UUID, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    from sqlalchemy import delete
+    from app.models.enhancement_offer import EnhancementOffer
+    if current_user.role == UserRole.SPA_STAFF:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Owner access required.")
+    await _load_visible_spa(db, spa_id, current_user)
+    await db.execute(delete(EnhancementOffer).where(EnhancementOffer.tenant_id == spa_id))
+    await db.commit()
+
 @router.get("/{spa_id}", response_model=SpaAccountRead)
 async def get_spa_account(
     spa_id: uuid.UUID,

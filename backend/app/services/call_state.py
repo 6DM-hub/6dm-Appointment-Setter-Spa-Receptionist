@@ -13,6 +13,8 @@ from app.core.config import settings
 from app.core.tenancy import TenantScope
 
 from app.services.truth_log import truth
+from app.services.secure_payment import redact_payment_text
+from app.services.sensitive_information import sensitive_health_request
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +73,7 @@ class CallSession:
         self.direction = direction
         self.from_number = from_number
         self.to_number = to_number
-        self.history = history or []
+        self.history = [dict(turn, content=redact_payment_text(turn.get("content", ""))) for turn in (history or [])]
         self.entities = entities or {}
         self.phase = phase or CALL_PHASE_NEW
         self.greeting_requested = bool(greeting_requested)
@@ -103,7 +105,9 @@ class CallSession:
         self.created_at = created_at or time.time()
 
     def add_turn(self, role: Role, content: str) -> None:
-        self.history.append({"role": role, "content": content})
+        if role == "user" and sensitive_health_request(content):
+            self.entities["sensitive_health_request"] = True
+        self.history.append({"role": role, "content": redact_payment_text(content)})
 
     @property
     def scope(self) -> TenantScope | None:
@@ -130,7 +134,7 @@ class CallSession:
             "direction": self.direction,
             "from_number": self.from_number,
             "to_number": self.to_number,
-            "history": self.history,
+            "history": [dict(turn, content=redact_payment_text(turn.get("content", ""))) for turn in self.history],
             "entities": self.entities,
             "phase": self.phase,
             "greeting_requested": self.greeting_requested,
@@ -167,7 +171,7 @@ class CallSession:
             if turn["role"] == "system":
                 continue
             speaker = "Agent" if turn["role"] == "assistant" else "Caller"
-            lines.append(f"{speaker}: {turn['content']}")
+            lines.append(f"{speaker}: {redact_payment_text(turn['content'])}")
         return "\n".join(lines)
 
 

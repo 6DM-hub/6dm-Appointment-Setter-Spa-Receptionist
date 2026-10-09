@@ -90,8 +90,11 @@ def test_confirmation_speech_mentions_sms_only_when_it_was_sent():
 def test_hesitant_line_is_the_exact_policy_followup():
     assert looks_card_hesitant("Do I have to put a card down?")
     assert not looks_card_hesitant("yes")
-    assert "24 hours" in CARD_ON_FILE_HESITANT
-    assert "won’t be charged today" in CARD_ON_FILE_POLICY
+    assert "24 hours" not in CARD_ON_FILE_HESITANT
+    assert "24-hour" not in CARD_ON_FILE_POLICY
+    assert "$39" not in CARD_ON_FILE_POLICY
+    assert "configured policy" in CARD_ON_FILE_HESITANT
+    assert "does not charge your card" in CARD_ON_FILE_POLICY
 
 
 def test_missing_caller_name_blocks_final_confirmation():

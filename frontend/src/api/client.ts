@@ -92,6 +92,7 @@ export interface CurrentUser {
   email: string;
   full_name: string | null;
   is_active: boolean;
+  is_business_master?: boolean;
   role: UserRole;
   tenant_id: string | null;
   twilio_phone_number: string | null;
@@ -117,6 +118,8 @@ export interface BusinessHoursWindow {
 }
 
 export interface SpaService {
+  square_variation_id?: string | null;
+  square_variation_version?: number | null;
   name: string;
   duration_minutes: number;
   price?: string | null;
@@ -152,6 +155,29 @@ export interface SpaStaffMember {
   services: string[];
 }
 
+export interface EnhancementSettings {
+  enabled: boolean;
+  max_suggestions: number;
+  personalize: boolean;
+  retention_days: number;
+  excluded_services: string[];
+  rules: { base_service: string; target_service: string; priority: number; requires_resources: boolean; phrase_variants?: string[] }[];
+}
+export interface EnhancementReport {
+  eligible: number; presented: number; accepted: number; declined: number; booked: number;
+  acceptance_rate: number | null;
+  incremental_booking_value_minor: Record<string, number>;
+  realized_revenue: null;
+  by_service: { base_service: string; enhancement: string | null; presented: number; accepted: number; declined: number; booked: number }[];
+}
+export const fetchEnhancementReport = async (id: string): Promise<EnhancementReport> =>
+  (await apiClient.get(`/api/v1/spa-accounts/${id}/enhancements/report`)).data;
+export const clearEnhancementHistory = async (id: string): Promise<void> => {
+  await apiClient.delete(`/api/v1/spa-accounts/${id}/enhancements/history`);
+};
+export const generateEnhancementPhrasing = async (id: string): Promise<string[]> =>
+  (await apiClient.post(`/api/v1/spa-accounts/${id}/enhancements/phrasing`)).data.phrases;
+
 export interface SpaAccount {
   id: string;
   name: string;
@@ -174,6 +200,7 @@ export interface SpaAccount {
   cancellation_policy: string | null;
   amenities: string[];
   packages: unknown[];
+  enhancement_settings?: EnhancementSettings;
   upsell_rules: { base_service: string; allowed_upsells: string[] }[];
   payment_policy: {
     card_required: boolean;
@@ -435,6 +462,7 @@ export const updateSpaAccount = async (
       | "cancellation_policy"
       | "amenities"
       | "packages"
+      | "enhancement_settings"
       | "upsell_rules"
       | "payment_policy"
     >
