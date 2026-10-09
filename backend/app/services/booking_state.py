@@ -1142,6 +1142,12 @@ def contains_unauthorized_availability_claim(reply: str, session: Any, tz: Any) 
     which only acts on its own narrow phrase list rather than every mention of
     money, dates, or scheduling words.
     """
+    # A negative statement about the requested slot is not an opening claim.
+    # Strip only that clause; a later positive claim still needs verification.
+    reply = re.sub(
+        r"(?:" + _CLOCK_TIME_PATTERN.pattern + r")\s+(?:isn't|isn’t|is not|wasn't|was not)\s+(?:available|open|free)",
+        "", reply or "", flags=re.IGNORECASE,
+    )
     if not reply or not _AVAILABILITY_CLAIM_MARKERS.search(reply):
         return False
     if not _CLOCK_TIME_PATTERN.search(reply):

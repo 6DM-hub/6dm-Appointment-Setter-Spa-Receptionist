@@ -1795,12 +1795,15 @@ class XAIVoiceSession:
         except json.JSONDecodeError:
             args = {}
 
+        for field in ("guest_name", "caller_name", "caller_email", "preferred_staff"):
+            if str(args.get(field) or "").strip().casefold() in {"", "none", "null", "undefined"}:
+                args.pop(field, None)
         operation = str(args.pop("operation", "") or "").lower()
         appointment_id = args.pop("appointment_id", None)
         if operation not in {"schedule", "reschedule"}:
             operation = (
                 "reschedule"
-                if _RESCHEDULE_REQUEST_RE.search(self._last_user_utterance() or "")
+                if appointment_id or get_draft(self.session).operation_mode == "reschedule" or _RESCHEDULE_REQUEST_RE.search(self._last_user_utterance() or "")
                 else "schedule"
             )
 
@@ -2299,6 +2302,8 @@ class XAIVoiceSession:
         self.session.entities["callback_offer_pending"] = True
         self.session.entities.pop("awaiting_caller_name", None)
         self._response_needed_after_tool = False
+        self._restricted_response_needed_after_tool = False
+        self._pending_forced_tool_message = None
         await self._cancel_active_response()
         stop = getattr(self, "stop_hold_tone", None)
         if stop:
@@ -3008,6 +3013,43 @@ class XAIVoiceSession:
         if name in self._AVAILABILITY_PROBE_TOOLS and self._recover_availability_tool:
             self._recover_availability_tool = False
 
+        if self.session.entities.get("callback_offer_pending") and name in self._AVAILABILITY_PROBE_TOOLS | {CONFIRM_APPOINTMENT_TOOL["name"]}:
+            await self._send_function_output(call_ref, json.dumps({"status": "awaiting_callback_consent", "booked": False}), nudge=False)
+            return
+
+        if name == PROPOSE_APPOINTMENT_TOOL["name"]:
+            try:
+                proposal = json.loads(raw_args or "{}")
+            except (TypeError, ValueError):
+                proposal = {}
+            for field in ("guest_name", "caller_name", "caller_email", "preferred_staff"):
+                if str(proposal.get(field) or "").strip().casefold() in {"", "none", "null", "undefined"}:
+                    proposal.pop(field, None)
+            raw_args = json.dumps(proposal)
+            rescheduling = (
+                proposal.get("operation") == "reschedule" or proposal.get("appointment_id")
+                or get_draft(self.session).operation_mode == "reschedule"
+                or _RESCHEDULE_REQUEST_RE.search(self._last_user_utterance() or "")
+            )
+            if rescheduling and not proposal.get("requested_start_iso") and not proposal.get("earliest"):
+                await self._send_function_output(call_ref, json.dumps({"status": "missing_new_time", "booked": False}), nudge=False)
+                self._response_needed_after_tool = False
+                self._restricted_response_needed_after_tool = False
+                self._pending_forced_tool_message = None
+                pending = get_draft(self.session)
+                pending.operation_mode = "reschedule"
+                save_draft(self.session, pending)
+                previous = self.session.entities.get("reschedule_time_question_turn")
+                if previous is None:
+                    self.session.entities["reschedule_time_question_turn"] = self._user_turn_count
+                    await self._cancel_active_response()
+                    await self._send_force_message("What day and time would you like to move your appointment to?")
+                elif previous != self._user_turn_count:
+                    await self._offer_staff_callback()
+                return
+            if rescheduling:
+                self.session.entities.pop("reschedule_time_question_turn", None)
+
         # Hard ceiling on tool round-trips within one caller turn, independent
         # of every guard above. Even if a guard were somehow bypassed, this
         # bounds the damage instead of relying on any single check being
@@ -3032,6 +3074,7 @@ class XAIVoiceSession:
                 }),
                 nudge=False,
             )
+            await self._offer_staff_callback()
             return
 
         if name in self._AVAILABILITY_PROBE_TOOLS:
