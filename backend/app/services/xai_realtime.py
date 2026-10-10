@@ -111,6 +111,21 @@ HOLD_ACK_TEXTS = (
 )
 HOLD_ACK_TEXT = HOLD_ACK_TEXTS[0]
 AVAILABILITY_CACHE_SECONDS = 3
+BOOKING_CONFIRMATION_TEXT_QUESTION = (
+    "It looks like I'm having trouble on my end. "
+    "Did you receive a confirmation text for your appointment?"
+)
+
+_CONFIRMATION_TEXT_RECEIVED_RE = re.compile(
+    r"\b(?:i\s+(?:just\s+)?(?:got|received|have)|(?:just\s+)?(?:got|received))\b"
+    r".{0,80}\b(?:confirmation(?:\s+(?:text|message))?|text(?:\s+message)?|message)\b|"
+    r"\b(?:confirmation|appointment)\s+(?:text|message)\s+(?:came|arrived|was\s+sent)\b",
+    re.IGNORECASE,
+)
+_CONFIRMATION_TEXT_NOT_RECEIVED_RE = re.compile(
+    r"\b(?:no|nope|not\s+yet|did\s+not|didn't|have\s+not|haven't|never)\b",
+    re.IGNORECASE,
+)
 
 _SESSION_RESTART_GREETING_RE = re.compile(
     r"^\s*(?:hi|hello|hey)[,!.]?\s+(?:thank you|thanks) for calling\b|"
@@ -1299,6 +1314,151 @@ class XAIVoiceSession:
             )
         return True
 
+    def _arm_confirmation_text_check(self) -> str:
+        """Persist a single recovery question after an uncertain provider write.
+
+        A Square confirmation SMS is useful evidence, but it is not proof that
+        the appointment is still active: Square can send the SMS before a later
+        compensating cancellation completes. The caller's answer therefore
+        authorizes only a read-only reconciliation, never another create.
+        """
+        draft = get_draft(self.session)
+        current = self.session.entities.get("confirmation_text_check_pending")
+        if not isinstance(current, dict) or current.get("booking_id") != draft.booking_id:
+            self.session.entities["confirmation_text_check_pending"] = {
+                "booking_id": draft.booking_id,
+                "revision": draft.draft_revision,
+                "start_iso": draft.start_iso,
+                "end_iso": draft.end_iso,
+                "asked_count": 1,
+            }
+        return BOOKING_CONFIRMATION_TEXT_QUESTION
+
+    async def _find_confirmation_text_booking(self):
+        """Find one exact active local record without creating or retrying.
+
+        Local appointment rows are committed only after the booking provider
+        returns a successful external booking ID. Tenant/contact scoping comes
+        from ``lookup_upcoming_appointments``. Exact start *and* end matching
+        prevents a confirmation for another appointment from being adopted.
+        """
+        draft = get_draft(self.session)
+        start_key = self._time_key(draft.start_iso)
+        end_key = self._time_key(draft.end_iso)
+        if not start_key or not end_key:
+            return None
+        async with AsyncSessionLocal() as db:
+            upcoming = await lookup_upcoming_appointments(db, self.session, limit=20)
+        matches = [
+            appointment
+            for appointment in upcoming
+            if getattr(appointment, "external_booking_id", None)
+            and self._time_key(appointment.start_time.isoformat()) == start_key
+            and self._time_key(appointment.end_time.isoformat()) == end_key
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    async def _confirmation_text_unverified(self, *, received: bool) -> None:
+        """Give one truthful recovery line and offer human help."""
+        self.session.entities.pop("confirmation_text_check_pending", None)
+        self.session.entities["callback_offer_pending"] = True
+        self.session.entities.pop("awaiting_caller_name", None)
+        self._response_needed_after_tool = False
+        self._restricted_response_needed_after_tool = False
+        self._pending_forced_tool_message = None
+        await self._cancel_active_response()
+        prefix = "Thank you. " if received else "Okay. "
+        await self._send_force_message(
+            prefix
+            + "I can't verify an active appointment in the booking system yet, so I won't call it confirmed. "
+            "Would it be okay if I asked a service provider to call you back to help?"
+        )
+
+    async def _handle_confirmation_text_answer(self, caller_text: str) -> bool:
+        """Resolve the SMS question before ordinary booking-confirmation logic.
+
+        This prevents a reply such as "I just got the confirmation text" from
+        being misread as a new service/time modification and repeatedly sent
+        through ``confirm_appointment``.
+        """
+        pending = self.session.entities.get("confirmation_text_check_pending")
+        explicitly_received = bool(_CONFIRMATION_TEXT_RECEIVED_RE.search(caller_text or ""))
+        if not isinstance(pending, dict):
+            if self.session.booking_status != "follow_up_required" or not explicitly_received:
+                return False
+            self._arm_confirmation_text_check()
+            pending = self.session.entities.get("confirmation_text_check_pending") or {}
+
+        if _CONFIRMATION_TEXT_NOT_RECEIVED_RE.search(caller_text or ""):
+            await self._confirmation_text_unverified(received=False)
+            return True
+
+        received = explicitly_received or is_affirmative(caller_text)
+        if received:
+            self.session.entities.pop("confirmation_text_check_pending", None)
+            await self._cancel_active_response()
+            try:
+                appointment = await self._find_confirmation_text_booking()
+            except Exception:
+                logger.exception(
+                    "call %s: confirmation-text reconciliation lookup failed",
+                    self.call_id,
+                )
+                appointment = None
+            if appointment is None:
+                await self._confirmation_text_unverified(received=True)
+                return True
+
+            draft = get_draft(self.session)
+            draft.appointment_id = str(appointment.id)
+            draft.external_booking_id = appointment.external_booking_id
+            draft.start_iso = appointment.start_time.isoformat()
+            draft.end_iso = appointment.end_time.isoformat()
+            draft.cancelled = False
+            save_draft(self.session, draft)
+            self.session.booking_status = BookingOutcome.BOOKED.value
+            self.session.appointment_id = str(appointment.id)
+            self.session.external_booking_id = appointment.external_booking_id
+            self.session.confirmed_datetime = appointment.start_time.isoformat()
+            self.session.entities["active_appointment_id"] = str(appointment.id)
+            self.session.entities.pop("booking_reconciliation_required", None)
+            self.session.entities.pop("callback_offer_pending", None)
+            card_status = getattr(getattr(appointment, "card_status", None), "value", None)
+            output = json.dumps({
+                "status": BookingOutcome.BOOKED.value,
+                "booked": True,
+                "appointment_id": str(appointment.id),
+                "external_booking_id": appointment.external_booking_id,
+                "card_status": card_status,
+                "card_sms": self.session.entities.get("card_sms"),
+                "message": "An exact active provider-backed appointment was found.",
+            })
+            spoken = self._authoritative_tool_followup(
+                CONFIRM_APPOINTMENT_TOOL["name"], output
+            )
+            truth(
+                "BOOKING_CONFIRMATION_TEXT_RECONCILED",
+                call_sid=self.call_id,
+                appointment_id=str(appointment.id),
+                external_booking_id=appointment.external_booking_id,
+            )
+            if spoken:
+                await self._send_force_message(spoken, protect_playback=True)
+            return True
+
+        asked_count = int(pending.get("asked_count") or 1)
+        if asked_count < 2:
+            pending["asked_count"] = asked_count + 1
+            self.session.entities["confirmation_text_check_pending"] = pending
+            await self._cancel_active_response()
+            await self._send_force_message(
+                "Just to make sure, did you receive an appointment confirmation text—yes or no?"
+            )
+            return True
+
+        await self._confirmation_text_unverified(received=False)
+        return True
+
     async def _confirm_pending_booking_from_caller(self, caller_text: str) -> bool:
         """Commit a provider-checked draft directly from an explicit caller yes.
 
@@ -1306,6 +1466,9 @@ class XAIVoiceSession:
         confirmed a booking but never called ``confirm_appointment``. Once a real
         read-back has been recorded, the state machine—not the LLM—owns the write.
         """
+        if await self._handle_confirmation_text_answer(caller_text):
+            return True
+
         from app.services.enhancements import respond as enhancement_response
         handled, line, event, resume = enhancement_response(self.session, caller_text)
         if event:
@@ -1450,10 +1613,10 @@ class XAIVoiceSession:
         forced = self._authoritative_tool_followup(CONFIRM_APPOINTMENT_TOOL["name"], output)
         if forced is not None:
             logger.info(
-                "call %s: backend confirmation succeeded -> authoritative force_message",
+                "call %s: backend confirmation produced authoritative force_message",
                 self.call_id,
             )
-            self._awaiting_wrap_up = True
+            self._awaiting_wrap_up = forced != BOOKING_CONFIRMATION_TEXT_QUESTION
             await self._send_force_message(forced, protect_playback=True)
             return True
 
@@ -3058,6 +3221,14 @@ class XAIVoiceSession:
                 + (alternatives + " Which time would you prefer?" if alternatives
                    else "Would you like me to check another day?")
             )
+        if (
+            status == BookingOutcome.ERROR.value
+            and self.session.entities.get("booking_reconciliation_required")
+        ):
+            # The create reached the provider path but no authoritative active
+            # booking made it back to the conversation. Ask once whether an SMS
+            # arrived, then reconcile read-only on the caller's answer.
+            return self._arm_confirmation_text_check()
         if status not in {"booked", "rescheduled"}:
             return None
         if not payload.get("appointment_id") or not payload.get("external_booking_id"):
@@ -3424,6 +3595,20 @@ class XAIVoiceSession:
         if self.session.entities.get("callback_offer_pending") and name in self._AVAILABILITY_PROBE_TOOLS | {CONFIRM_APPOINTMENT_TOOL["name"]}:
             await self._send_function_output(call_ref, json.dumps({"status": "awaiting_callback_consent", "booked": False}), nudge=False)
             return
+        if self.session.entities.get("confirmation_text_check_pending") and name in self._AVAILABILITY_PROBE_TOOLS | {CONFIRM_APPOINTMENT_TOOL["name"]}:
+            # The next caller turn must answer the recovery question. Never let
+            # a model retry the write while we are checking whether a provider
+            # confirmation may already exist.
+            await self._send_function_output(
+                call_ref,
+                json.dumps({
+                    "status": "awaiting_confirmation_text_answer",
+                    "booked": False,
+                    "message": "Wait for the caller's yes or no. Do not retry or confirm the appointment.",
+                }),
+                nudge=False,
+            )
+            return
 
         if name == PROPOSE_APPOINTMENT_TOOL["name"]:
             try:
@@ -3746,6 +3931,8 @@ class XAIVoiceSession:
                 forced_followup = CARD_LINK_PERMISSION_QUESTION
         if forced_followup is not None:
             await self._send_function_output(call_ref, output, nudge=False)
+            if forced_followup == BOOKING_CONFIRMATION_TEXT_QUESTION:
+                await self._persist_session()
             if self._active_response_id is None:
                 logger.info(
                     "call %s: authoritative %s result -> force_message confirmation",
@@ -3754,7 +3941,10 @@ class XAIVoiceSession:
                 )
                 await self._send_force_message(
                     forced_followup,
-                    protect_playback=name == CONFIRM_APPOINTMENT_TOOL["name"],
+                    protect_playback=(
+                        name == CONFIRM_APPOINTMENT_TOOL["name"]
+                        and forced_followup != BOOKING_CONFIRMATION_TEXT_QUESTION
+                    ),
                 )
             else:
                 self._pending_forced_tool_message = forced_followup

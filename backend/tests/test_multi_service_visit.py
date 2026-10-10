@@ -104,6 +104,79 @@ async def test_two_treatments_different_staff_one_atomic_write(visit):
     assert router.duration_for_service(ctx.service_description) == 150
 
 
+async def test_square_read_only_transition_time_does_not_cancel_valid_visit(visit):
+    router, _, state = visit
+    ctx = await pinned(visit)
+    original = router.delegate._request
+
+    async def request(method, path, **kwargs):
+        result = await original(method, path, **kwargs)
+        if method == 'POST' and path == '/v2/bookings':
+            result['booking']['transition_time_minutes'] = 15
+        return result
+
+    router.delegate._request = request
+    result = await router.create_booking(ctx)
+    assert result.external_id == 'visit-1'
+    router.delegate.cancel_booking.assert_not_awaited()
+
+
+@pytest.mark.parametrize('mismatch', [
+    'status', 'location', 'customer', 'start', 'duration',
+    'service', 'version', 'staff', 'intermission',
+])
+async def test_true_create_response_mismatch_is_compensated(visit, mismatch):
+    router, _, _ = visit
+    ctx = await pinned(visit)
+    original = router.delegate._request
+
+    async def request(method, path, **kwargs):
+        result = await original(method, path, **kwargs)
+        if method != 'POST' or path != '/v2/bookings':
+            return result
+        booking = result['booking']
+        # The allowed read-only field must not hide a real response mismatch.
+        booking['transition_time_minutes'] = 15
+        segment = booking['appointment_segments'][0]
+        if mismatch == 'status':
+            booking['status'] = 'PENDING'
+        elif mismatch == 'location':
+            booking['location_id'] = 'another-location'
+        elif mismatch == 'customer':
+            booking['customer_id'] = 'another-customer'
+        elif mismatch == 'start':
+            booking['start_at'] = (ctx.start + timedelta(minutes=15)).isoformat()
+        elif mismatch == 'duration':
+            segment['duration_minutes'] += 15
+        elif mismatch == 'service':
+            segment['service_variation_id'] = 'another-service'
+        elif mismatch == 'version':
+            segment['service_variation_version'] += 1
+        elif mismatch == 'staff':
+            segment['team_member_id'] = 'another-staff-member'
+        else:
+            segment['intermission_minutes'] = 15
+        return result
+
+    router.delegate._request = request
+    with pytest.raises(BookingProviderError) as caught:
+        await router.create_booking(ctx)
+    assert caught.value.code == 'VISIT_ROLLED_BACK'
+    router.delegate.cancel_booking.assert_awaited_once()
+
+
+async def test_missing_verified_resource_in_create_response_is_compensated(visit):
+    router, ctx, state = visit
+    router.spa.services[0]['resource_ids'] = ['facial-room']
+    state['resources'] = ['facial-room']
+    ctx = await pinned(visit)
+
+    with pytest.raises(BookingProviderError) as caught:
+        await router.create_booking(ctx)
+    assert caught.value.code == 'VISIT_ROLLED_BACK'
+    router.delegate.cancel_booking.assert_awaited_once()
+
+
 async def test_each_catalog_lookup_uses_its_service_duration_not_total_visit(visit):
     router, ctx, _ = visit
     observed = []

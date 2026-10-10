@@ -263,8 +263,13 @@ async def create_visit(router, ctx):
         returned_start = delegate._parse_square_datetime(record.get("start_at") or "")
     except (TypeError, ValueError):
         returned_start = None
+    # `transition_time_minutes` is a read-only Square field and may be non-zero
+    # in the CreateBooking response even though it was absent or zero in the
+    # request. It must not cause a valid accepted booking to be cancelled. The
+    # immutable caller-facing facts below remain strict: active status, exact
+    # location/customer/start, segment count, duration, service and provider.
     exact = (record.get("status") == "ACCEPTED" and record.get("location_id") == delegate.location_id
-        and record.get("customer_id") == customer_id and not record.get("transition_time_minutes")
+        and record.get("customer_id") == customer_id
         and returned_start == ctx.start and len(actual) == len(expected))
     if exact:
         try:
