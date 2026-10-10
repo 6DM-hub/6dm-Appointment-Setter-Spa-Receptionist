@@ -296,76 +296,399 @@ async def test_sms_failure_keeps_the_appointment_pending_and_drops_the_token():
         adapter=type("A", (), {"supports_save_card_on_file": True})(),
         caller_name="John Smith",
         guest_name=None,
-       ![ÛˆÚ[œË›ÝHÜšYÚ[˜[ˆÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKHÂ˜\Þ[˜ÈYˆ\ÝØ—ØÛÜœ™XÝYÙ]WÜ™\ÛÛ™\×Ý×ÝWÛ™]×Ù]WÛ›ÝÝWÛÜšYÚ[˜[
-ˆ›ÚXÙWÜÙ\ÜÚ[Û‹]˜Z[Xš[]WÜÝX‹[ÛšÙ^\]ÚŠN‚ˆÙ[ˆ\ÝÙXÝHH×B‚ˆ\Þ[˜ÈYˆØ\\™J^[ØY
-N‚ˆÙ[˜\[™
-^[ØY
-B‚ˆ[ÛšÙ^\]ÚœÙ]]Š›ÚXÙWÜÙ\ÜÚ[Û‹—ÜÙ[™‹Ø\\™JB‚ˆ]ØZ]ØØ[\—ÜØ^\Ê›ÚXÙWÜÙ\ÜÚ[Û‹“ØÝØ™\ˆ\ÝˆŠBˆ]ØZ]ØØ[\—ÜØ^\Ê›ÚXÙWÜÙ\ÜÚ[Û‹XÝX[HXZÙH]ØÝØ™\ˆ›™ˆŠBˆ]ØZ]ØØ[\—ÜØ^\Ê›ÚXÙWÜÙ\ÜÚ[Û‹ŒÈKˆŠB‚ˆÈH[Ù[ÛÜœ™XÝH›ÜÜÙ\ÈØÝØ™\ˆ›™
-Ú]H™X[[Ù[ÛÝ[ˆÈÛÛXš[™Hœ›ÛHHØ[\‰ÜÈÝÛˆ[ÜÝ™XÙ[ÛÜœ™XÝ[ÛŠH8 %]\Ý™BˆÈXØÙ\Y‚ˆ]ØZ]Ü›Ø™J›ÚXÙWÜÙ\ÜÚ[Û‹Ù[œ™\ÜLH‹˜Ø[LH‹ŒŒ‹LLL•MNŒŒŠBˆ\ÜÙ\Û\ÝÜÝ]\ÊÙ[
-HOH˜]˜Z[X›H‚ˆ\ÜÙ\]˜Z[Xš[]WÜÝXˆOHÈŒŒ‹LLL•MNŒŒ—B‚‚˜\Þ[˜ÈYˆ\ÝØ—ÝWÜÝ\\œÙYYÛÜšYÚ[˜[Ù]WÚ\×Û›×ÛÛ™Ù\—ÙÜ›Ý[™Y
-ˆ›ÚXÙWÜÙ\ÜÚ[Û‹]˜Z[Xš[]WÜÝX‹[ÛšÙ^\]ÚŠN‚ˆˆˆ”Ø[YHÛÛ™\œØ][Ûˆ\ÈX›Ý™K]H[Ù[
-Ü›Û™ÛJHšY\ÈÈÛÛXš[™BˆŒÈHˆÚ]HÕSHØÝØ™\ˆ\Ý[œÝXYÙˆHÛÜœ™XÝ[Û‹ˆ]\Ý™Bˆ™Y\ÙY›ÝÚ[[H›ÛÚÙYÛˆHÜ›Û™È^Kˆˆˆ‚ˆÙ[ˆ\ÝÙXÝHH×B‚ˆ\Þ[˜ÈYˆØ\\™J^[ØY
-N‚ˆÙ[˜\[™
-^[ØY
-B‚ˆ[ÛšÙ^\]ÚœÙ]]Š›ÚXÙWÜÙ\ÜÚ[Û‹—ÜÙ[™‹Ø\\™JB‚ˆ]ØZ]ØØ[\—ÜØ^\Ê›ÚXÙWÜÙ\ÜÚ[Û‹“ØÝØ™\ˆ\ÝˆŠBˆ]ØZ]ØØ[\—ÜØ^\Ê›ÚXÙWÜÙ\ÜÚ[Û‹XÝX[HXZÙH]ØÝØ™\ˆ›™ˆŠBˆ]ØZ]ØØ[\—ÜØ^\Ê›ÚXÙWÜÙ\ÜÚ[Û‹ŒÈKˆŠB‚ˆ]ØZ]Ü›Ø™J›ÚXÙWÜÙ\ÜÚ[Û‹Ù[œ™\ÜLH‹˜Ø[LH‹ŒŒ‹LLLUMNŒŒŠBˆ\ÜÙ\Û\ÝÜÝ]\ÊÙ[
-HOH[™Ü›Ý[™YÝ[YH‚ˆ\ÜÙ\]˜Z[Xš[]WÜÝXˆOH×B‚‚ˆÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKHÂˆÈËˆØ[\ˆØ[˜Ù[ÈH]HÝ]šYÚÈ]]\Ý›Ý™H™\Ý\œ™XÝYˆÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKHÂ˜\Þ[˜ÈYˆ\ÝØ×ØØ[˜Ù[YÙ]WÚ\×Û›ÝÜ™\Ý\œ™XÝYÙ›Ü—ØWÛ]\—Ý[YWÛÛ›WÝ\›Šˆ›ÚXÙWÜÙ\ÜÚ[Û‹]˜Z[Xš[]WÜÝX‹[ÛšÙ^\]ÚŠN‚ˆÙ[ˆ\ÝÙXÝHH×B‚ˆ\Þ[˜ÈYˆØ\\™J^[ØY
-N‚ˆÙ[˜\[™
-^[ØY
-B‚ˆ[ÛšÙ^\]ÚœÙ]]Š›ÚXÙWÜÙ\ÜÚ[Û‹—ÜÙ[™‹Ø\\™JB‚ˆ]ØZ]ØØ[\—ÜØ^\Ê›ÚXÙWÜÙ\ÜÚ[Û‹“ØÝØ™\ˆ\ÝˆŠBˆ]ØZ]ØØ[\—ÜØ^\Ê›ÚXÙWÜÙ\ÜÚ[Û‹“™]™\ˆZ[™]]KˆŠBˆ]ØZ]ØØ[\—ÜØ^\Ê›ÚXÙWÜÙ\ÜÚ[Û‹ŒÈKˆŠB‚ˆ]ØZ]Ü›Ø™J›ÚXÙWÜÙ\ÜÚ[Û‹Ù[œ™\ÜLH‹˜Ø[LH‹ŒŒ‹LLLUMNŒŒŠB‚ˆ\ÜÙ\Û\ÝÜÝ]\ÊÙ[
-HOH[™Ü›Ý[™YÝ[YH‚ˆ\ÜÙ\]˜Z[Xš[]WÜÝXˆOH×B‚‚ˆÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKHÂˆÈˆH]HY[[Û™YÛÛ™\œØ][Û˜[H
-›Ý\È\ÙˆH›ÛÚÚ[™È™\]Y\Ý
-BˆÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKHÂ˜\Þ[˜ÈYˆ\ÝÙØWØÛÛ™\œØ][Û˜[Ù]WÛY[[Û—ØØ[››ÝØ™WÙ\Ý[™ÝZ\ÚYÙœ›ÛWØWØ›ÛÚÚ[™×ÛÛ™Jˆ›ÚXÙWÜÙ\ÜÚ[Û‹]˜Z[Xš[]WÜÝX‹[ÛšÙ^\]ÚŠN‚ˆˆˆ‘ØÝ[Y[ÈH™X[Û›ÝÛˆ[Z]][Ûˆ˜]\ˆ[ˆ\ÜÙ\[™ÈH\ÚYÛˆÙBˆÛ‰ÝXÝX[H]™Nˆ›Ý[™È[ˆ\È\˜Ú]XÝ\™HYÜÈH]HY[[Û‚ˆÚ]\È\ÈH›ÛÚÚ[™È™\]Y\ÝˆœÈ\ÈØ\È[˜ÚY[[ÛX[[È‚ˆ
-K™Ëˆ›^Hš\^H\ÈØÝØ™\ˆ\ÝŠKˆH]\š\ÝXÈ\™HÛ›H™XÛÙÛš^™\Âˆ™\Ù[˜ÙHÙˆH]K[ZÙH˜\ÙKÛÈ\ÈÛÛ™\œØ][Û˜[]H\È™X]YˆHØ[YH\ÈH›ÛÚÚ[™ËZ[[Û™Kˆš^[™È\ÈÛÝ[™YY™X[[[ˆÛ\ÜÚYšXØ][ÛˆÙˆH]\˜[˜ÙK›ÝHšYÙÙ\ˆ™YÙ^8 %Ý]ÙˆØÛÜH›Ü‚ˆ\Èš^ˆ\È\Ý^\ÝÈÛÈH]\™HÚ[™ÙHÈ]™Z]š[Üˆ\ÈBˆ[X™\˜]HXÚ\Ú[Û‹›ÝHÚ[[™YÜ™\ÜÚ[Û‹ˆˆˆ‚ˆÙ[ˆ\ÝÙXÝHH×B‚ˆ\Þ[˜ÈYˆØ\\™J^[ØY
-N‚ˆÙ[˜\[™
-^[ØY
-B‚ˆ[ÛšÙ^\]ÚœÙ]]Š›ÚXÙWÜÙ\ÜÚ[Û‹—ÜÙ[™‹Ø\\™JB‚ˆ]ØZ]ØØ[\—ÜØ^\Ê›ÚXÙWÜÙ\ÜÚ[Û‹žHHØ^K^Hš\^H\ÈØÝØ™\ˆ\ÝˆŠBˆ]ØZ]ØØ[\—ÜØ^\Ê›ÚXÙWÜÙ\ÜÚ[Û‹ŒÈKˆŠB‚ˆ]ØZ]Ü›Ø™J›ÚXÙWÜÙ\ÜÚ[Û‹Ù[œ™\ÜLH‹˜Ø[LH‹ŒŒ‹LLLUMNŒŒŠB‚ˆÈÝ\œ™[ØÝ[Y[Y™Z]š[ÜŽˆHÛÛ™\œØ][Û˜[Y[[ÛˆÝ[Ü›Ý[™ÂˆÈH›Ø™KˆYˆ\ÈÚ[™Ù\Ë\]H\È\Ý[X™\˜][K‚ˆ\ÜÙ\Û\ÝÜÝ]\ÊÙ[
-HOH˜]˜Z[X›H‚‚‚™YˆÛ™^ÛØØ[
-›ÚXÙWÜÙ\ÜÚ[Û‹ÙYZÙ^Nˆ[Ý\Žˆ[Z[]Nˆ[H
-HOˆ]][YN‚ˆˆˆ”Ø[YH[HH›ÚXÙHÙ\ÜÚ[Ûˆ\Ù\Îˆ™^ÙYZÙ^H]\ÈÛØÚËÜˆ
-ÍÈYˆ\Ýˆˆˆ‚ˆ›ÝÈH›ÚXÙWÜÙ\ÜÚ[Û‹—Û›ÝÊ
-Bˆ^\ÈH
-ÙYZÙ^HH›ÝË™]J
-KÙYZÙ^J
-JH	HÂˆÝ\H]][YK˜ÛÛXš[™Jˆ›ÝË™]J
-H
-È[YY[J^\ÏY^\ÊKˆ[YJÝ\‹Z[]JKˆš[™›Ï]›ÚXÙWÜÙ\ÜÚ[Û‹—Ý‹ˆ
-BˆYˆÝ\H›ÝÎ‚ˆÝ\
-ÏH[YY[J^\ÏMÊBˆ™]\›ˆÝ\‚‚˜\Þ[˜ÈYˆ\ÝÝ\œÙ^WØ]ÍWÜ™]Üš]\×ØWÝÜ›Û™×Û[Ù[Ý[Y\Ý[\
-ˆ›ÚXÙWÜÙ\ÜÚ[Û‹]˜Z[Xš[]WÜÝX‹[ÛšÙ^\]ÚŠN‚ˆÙ[ˆ\ÝÙXÝHH×B‚ˆ\Þ[˜ÈYˆØ\\™J^[ØY
-N‚ˆÙ[˜\[™
-^[ØY
-B‚ˆ[ÛšÙ^\]ÚœÙ]]Š›ÚXÙWÜÙ\ÜÚ[Û‹—ÜÙ[™‹Ø\\™JBˆ^XÝYHÛ™^ÛØØ[
-›ÚXÙWÜÙ\ÜÚ[Û‹ËMŠKœÝ™[YJ‰VKI[KIY	R‰SN‰TÈŠB‚ˆ]ØZ]ØØ[\—ÜØ^\Ê›ÚXÙWÜÙ\ÜÚ[Û‹•\œÙ^KHŠBˆ]ØZ]Ü›Ø™J›ÚXÙWÜÙ\ÜÚ[Û‹Ù[œ™\ÜLH‹˜Ø[LH‹ŒŒŒLKLUNŒŒŠB‚ˆ\ÜÙ\Û\ÝÜÝ]\ÊÙ[
-HOH˜]˜Z[X›H‚ˆ\ÜÙ\]˜Z[Xš[]WÜÝXˆOHÙ^XÝYB‚‚˜\Þ[˜ÈYˆ\ÝÜØ]\™^WÝ[—ÍWÝ\Ù\×Ý]ÜØ]\™^Jˆ›ÚXÙWÜÙ\ÜÚ[Û‹]˜Z[Xš[]WÜÝX‹[ÛšÙ^\]ÚŠN‚ˆÙ[ˆ\ÝÙXÝHH×B‚ˆ\Þ[˜ÈYˆØ\\™J^[ØY
-N‚ˆÙ[˜\[™
-^[ØY
-B‚ˆ[ÛšÙ^\]ÚœÙ]]Š›ÚXÙWÜÙ\ÜÚ[Û‹—ÜÙ[™‹Ø\\™JBˆ^XÝYHÛ™^ÛØØ[
-›ÚXÙWÜÙ\ÜÚ[Û‹KMŠKœÝ™[YJ‰VKI[KIY	R‰SN‰TÈŠB‚ˆ]ØZ]ØØ[\—ÜØ^\Ê›ÚXÙWÜÙ\ÜÚ[Û‹”Ø]\™^HŠBˆ]ØZ]ØØ[\—ÜØ^\Ê›ÚXÙWÜÙ\ÜÚ[Û‹HŠBˆ]ØZ]Ü›Ø™J›ÚXÙWÜÙ\ÜÚ[Û‹Ù[œ™\ÜLH‹˜Ø[LH‹ŒNNNKLKLUMŽŒŒŠB‚ˆ\ÜÙ\Û\ÝÜÝ]\ÊÙ[
-HOH˜]˜Z[X›H‚ˆ\ÜÙ\]˜Z[Xš[]WÜÝXˆOHÙ^XÝYB‚‚˜\Þ[˜ÈYˆ\ÝÜØ]\™^WØY\››ÛÛ—ÜÙX\˜Ú\×ÝWÝÚ[™Ý×Û›ÝÛÛ™WÛZ[]Jˆ›ÚXÙWÜÙ\ÜÚ[Û‹]˜Z[Xš[]WÜÝX‹[ÛšÙ^\]ÚŠN‚ˆÙ[ˆ\ÝÙXÝHH×BˆÚ[™ÝÜÎˆ\ÝÝ\VÙ]][YK]][YWWHH×B‚ˆ\Þ[˜ÈYˆØ\\™J^[ØY
-N‚ˆÙ[˜\[™
-^[ØY
-B‚ˆ\Þ[˜ÈYˆ˜ZÙWÜÙX\˜Ú
-Ù‹ÜÙ\ÜÚ[Û‹Ú[[Ý\[™
-N‚ˆÚ[™ÝÜË˜\[™
+        from_number="+15552220000",
+        contact_phone=None,
+        sender=_Sender(error=RuntimeError("twilio down")),
+    )
+    assert result == "sms_failed"
+    assert store.rolled_back is True
+    assert store.tokens == []
+    assert appointment.card_status is CardStatus.PENDING_CARD
 
-Ý\[™
-JBˆ™]\›ˆ›ÛÚÚ[™Ô™\Ý[
-ˆ›ÛÚÚ[™ÓÝ]ÛÛYKÓÓ‘“PÕˆY\ÜØYÙOH“Ü[š[™ÜÈ[ˆ]\ÙˆH^NˆØ]\™^H]NŒKˆ‹ˆ
-B‚ˆ[ÛšÙ^\]ÚœÙ]]Š›ÚXÙWÜÙ\ÜÚ[Û‹—ÜÙ[™‹Ø\\™JBˆ[ÛšÙ^\]ÚœÙ]]Š˜\œÙ\šXÙ\ËžZWÜ™X[[YKœÙX\˜ÚÙ^WÜ\‹˜ZÙWÜÙX\˜Ú
-B‚ˆ›ÝÈH›ÚXÙWÜÙ\ÜÚ[Û‹—Û›ÝÊ
-Bˆ^\ÈH
-HH›ÝË™]J
-KÙYZÙ^J
-JH	HÂˆÝ\H]][YK˜ÛÛXš[™Jˆ›ÝË™]J
-H
-È[YY[J^\ÏY^\ÊK[YJL‹
-Kš[™›Ï]›ÚXÙWÜÙ\ÜÚ[Û‹—Ý‚ˆ
-Bˆ[™H]][YK˜ÛÛXš[™Jˆ›ÝË™]J
-H
-È[YY[J^\ÏY^\ÊK[YJMË
-Kš[™›Ï]›ÚXÙWÜÙ\ÜÚ[Û‹—Ý‚ˆ
-BˆYˆ[™H›ÝÎ‚ˆÝ\
-ÏH[YY[J^\ÏMÊBˆ[™
-ÏH[YY[J^\ÏMÊB‚ˆ]ØZ]ØØ[\—ÜØ^\Ê›ÚXÙWÜÙ\ÜÚ[Û‹”Ø]\™^HY\››ÛÛˆŠBˆ]ØZ]Ü›Ø™J›ÚXÙWÜÙ\ÜÚ[Û‹Ù[œ™\ÜLH‹˜Ø[LH‹ŒŒ‹LLLÕMŒŒŠB‚ˆ\ÜÙ\]˜Z[Xš[]WÜÝXˆOH×Bˆ\ÜÙ\Ú[™ÝÜÈOHÊÝ\[™
-WBˆ\ÜÙ\Û\ÝÜÝ]\ÊÙ[
-HOH™^WÜ\ÛÜ[š[™ÜÈ‚
+
+@pytest.mark.asyncio
+async def test_second_link_revokes_the_first():
+    spa = _spa()
+    contact_id = uuid.uuid4()
+    appointment = _appointment(spa, contact_id)
+    link = _link(spa, contact_id)
+    store = _Store()
+    sender = _Sender()
+    kwargs = dict(
+        store=store,
+        spa=spa,
+        appointment=appointment,
+        link=link,
+        adapter=type("A", (), {"supports_save_card_on_file": True})(),
+        caller_name="John Smith",
+        guest_name=None,
+        from_number="+15552220000",
+        contact_phone=None,
+        sender=sender,
+    )
+    await offer_secure_card_sms(**kwargs)
+    await offer_secure_card_sms(**kwargs)
+    active = [token for token in store.tokens if token.revoked_at is None]
+    assert len(active) == 1
+    assert len(store.tokens) == 2
+
+
+def test_expired_consumed_cancelled_and_cross_tenant_tokens_are_rejected():
+    spa = _spa()
+    other = _spa(name="Spa B", phone="+15553330003")
+    contact_id = uuid.uuid4()
+    appointment = _appointment(spa, contact_id)
+    link = _link(spa, contact_id)
+    token = _token(spa, appointment, link, expires=NOW - timedelta(minutes=1))
+    assert token_problem(token, appointment, link, now=NOW) == "expired"
+    token.expires_at = NOW + timedelta(hours=1)
+    token.consumed_at = NOW
+    assert token_problem(token, appointment, link, now=NOW) == "consumed"
+    token.consumed_at = None
+    appointment.status = AppointmentStatus.CANCELLED
+    assert token_problem(token, appointment, link, now=NOW) == "cancelled"
+    appointment.status = AppointmentStatus.SCHEDULED
+    token.tenant_id = other.id
+    assert token_problem(token, appointment, link, now=NOW) == "tenant"
+
+
+def test_a_second_claim_while_one_is_in_flight_is_busy():
+    spa = _spa()
+    contact_id = uuid.uuid4()
+    appointment = _appointment(spa, contact_id)
+    token = _token(spa, appointment, _link(spa, contact_id))
+    assert claim_submission(token, NOW) == "claimed"
+    assert claim_submission(token, NOW + timedelta(seconds=5)) == "busy"
+
+
+@pytest.mark.asyncio
+async def test_successful_save_confirms_and_consumes_only_johns_customer():
+    spa = _spa()
+    contact_id = uuid.uuid4()
+    appointment = _appointment(spa, contact_id)
+    appointment.external_booking_id = "square-booking-existing"
+    link = _link(spa, contact_id, "CUS_JOHN")
+    token = _token(spa, appointment, link)
+    loaded = type("L", (), {"token": token, "appointment": appointment, "link": link, "spa": spa})()
+    saver = _Saver(SaveCardResult(outcome=SaveCardOutcome.SAVED))
+    store = _Store()
+    outcome = await submit_saved_card(
+        store=store,
+        loaded=loaded,
+        source_id="cnon:card-nonce",
+        verification_token="verf:store",
+        adapter=saver,
+        now=NOW,
+    )
+    assert outcome == "saved"
+    assert saver.calls[0]["external_customer_id"] == "CUS_JOHN"
+    assert saver.calls[0]["idempotency_key"] == token.idempotency_key
+    assert token.consumed_at == NOW
+    assert appointment.card_status is CardStatus.CARD_CONFIRMED
+    assert appointment.status is AppointmentStatus.CONFIRMED
+    again = await submit_saved_card(
+        store=store,
+        loaded=loaded,
+        source_id="cnon:card-nonce",
+        verification_token=None,
+        adapter=saver,
+        now=NOW,
+    )
+    assert again == "already_on_file"
+    assert len(saver.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_rejected_save_fails_the_card_status_and_keeps_the_booking():
+    spa = _spa()
+    contact_id = uuid.uuid4()
+    appointment = _appointment(spa, contact_id)
+    link = _link(spa, contact_id)
+    token = _token(spa, appointment, link)
+    original_key = token.idempotency_key
+    loaded = type("L", (), {"token": token, "appointment": appointment, "link": link, "spa": spa})()
+    saver = _Saver(SaveCardResult(outcome=SaveCardOutcome.REJECTED, error_code="CARD_DECLINED"))
+    outcome = await submit_saved_card(
+        store=_Store(),
+        loaded=loaded,
+        source_id="cnon:card-nonce",
+        verification_token=None,
+        adapter=saver,
+        now=NOW,
+    )
+    assert outcome == "rejected"
+    assert appointment.status is AppointmentStatus.SCHEDULED
+    assert appointment.card_status is CardStatus.FAILED
+    assert token.consumed_at is None
+    assert token.idempotency_key != original_key
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_save_stays_pending_and_reuses_the_idempotency_key():
+    spa = _spa()
+    contact_id = uuid.uuid4()
+    appointment = _appointment(spa, contact_id)
+    token = _token(spa, appointment, _link(spa, contact_id))
+    key = token.idempotency_key
+    loaded = type("L", (), {"token": token, "appointment": appointment, "link": _link(spa, contact_id), "spa": spa})()
+    loaded.link = _link(spa, contact_id)
+    token.external_customer_link_id = loaded.link.id
+    outcome = await submit_saved_card(
+        store=_Store(),
+        loaded=loaded,
+        source_id="cnon:card-nonce",
+        verification_token=None,
+        adapter=_Saver(SaveCardResult(outcome=SaveCardOutcome.AMBIGUOUS)),
+        now=NOW,
+    )
+    assert outcome == "ambiguous"
+    assert appointment.card_status is CardStatus.PENDING_CARD
+    assert token.idempotency_key == key
+    assert token.consumed_at is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_appointment_cannot_save():
+    spa = _spa()
+    contact_id = uuid.uuid4()
+    appointment = _appointment(spa, contact_id, life=AppointmentStatus.CANCELLED)
+    link = _link(spa, contact_id)
+    token = _token(spa, appointment, link)
+    loaded = type("L", (), {"token": token, "appointment": appointment, "link": link, "spa": spa})()
+    saver = _Saver(SaveCardResult(outcome=SaveCardOutcome.SAVED))
+    outcome = await submit_saved_card(
+        store=_Store(),
+        loaded=loaded,
+        source_id="cnon:card-nonce",
+        verification_token=None,
+        adapter=saver,
+        now=NOW,
+    )
+    assert outcome == "unavailable"
+    assert saver.calls == []
+    assert appointment.card_status is CardStatus.PENDING_CARD
+
+
+@pytest.mark.asyncio
+async def test_in_flight_duplicate_does_not_save_twice():
+    spa = _spa()
+    contact_id = uuid.uuid4()
+    appointment = _appointment(spa, contact_id)
+    link = _link(spa, contact_id)
+    token = _token(spa, appointment, link)
+    loaded = type("L", (), {"token": token, "appointment": appointment, "link": link, "spa": spa})()
+
+    class _Busy(_Store):
+        async def claim(self, token, now):
+            return "busy"
+
+    saver = _Saver(SaveCardResult(outcome=SaveCardOutcome.SAVED))
+    outcome = await submit_saved_card(
+        store=_Busy(),
+        loaded=loaded,
+        source_id="cnon:card-nonce",
+        verification_token=None,
+        adapter=saver,
+        now=NOW,
+    )
+    assert outcome == "busy"
+    assert saver.calls == []
+
+
+def test_session_includes_known_billing_contact_only():
+    spa = _spa()
+    other = _spa(name="Spa B", phone="+15553330003")
+    contact_id = uuid.uuid4()
+    appointment = _appointment(spa, contact_id)
+    link = _link(spa, contact_id)
+    contact = type(
+        "C",
+        (),
+        {
+            "tenant_id": spa.id,
+            "first_name": "John",
+            "last_name": "Smith",
+            "email": "john@example.com",
+            "phone_number": "+15552220000",
+        },
+    )()
+    loaded = type(
+        "L",
+        (),
+        {"token": _token(spa, appointment, link), "appointment": appointment, "link": link, "spa": spa, "contact": contact},
+    )()
+    payload = session_payload(loaded)
+    assert payload["billing_contact"] == {
+        "givenName": "John",
+        "familyName": "Smith",
+        "email": "john@example.com",
+        "phone": "+15552220000",
+    }
+    assert "CUS_JOHN" not in str(payload)
+    assert "secret-token" not in str(payload)
+    contact.tenant_id = other.id
+    assert "billing_contact" not in session_payload(loaded)
+
+
+def test_session_payload_has_no_secrets():
+    spa = _spa()
+    contact_id = uuid.uuid4()
+    appointment = _appointment(spa, contact_id)
+    link = _link(spa, contact_id)
+    loaded = type("L", (), {"token": _token(spa, appointment, link), "appointment": appointment, "link": link, "spa": spa})()
+    payload = session_payload(loaded)
+    blob = str(payload)
+    assert payload["application_id"] == "sq0idp-public"
+    assert payload["location_id"] == "LOC_A"
+    assert "secret-token" not in blob
+    assert "CUS_JOHN" not in blob
+    assert "tenant_id" not in payload
+
+
+class _Cards:
+    def __init__(self, response=None, error=None, fail_times=0) -> None:
+        self.response = response or {"card": {"id": "ccof:1", "customer_id": "CUS_JOHN"}}
+        self.error = error
+        self.fail_times = fail_times
+        self.calls = []
+
+    async def __call__(self, method, path, *, json=None, params=None):
+        self.calls.append((method, path, json or {}))
+        if path == "/v2/payments" or (json or {}).get("amount_money"):
+            raise AssertionError("Phase 3 must not take a payment")
+        if self.fail_times:
+            self.fail_times -= 1
+            raise self.error or BookingProviderError("timeout", retryable=True)
+        if self.error and not self.fail_times:
+            raise self.error
+        return self.response
+
+
+def _square(spa, transport):
+    adapter = SquareAdapter("Spa A", {"access_token": "secret-token", "location_id": "LOC_A"})
+    adapter._request = transport
+    return adapter
+
+
+@pytest.mark.asyncio
+async def test_square_save_posts_cards_for_the_bound_customer_only():
+    spa = _spa()
+    transport = _Cards()
+    result = await _square(spa, transport).save_card_on_file(
+        external_customer_id="CUS_JOHN",
+        source_id="cnon:card-nonce",
+        idempotency_key="idem-1",
+        verification_token="verf:1",
+    )
+    assert result.outcome is SaveCardOutcome.SAVED
+    method, path, payload = transport.calls[0]
+    assert method == "POST"
+    assert path == "/v2/cards"
+    assert payload["card"]["customer_id"] == "CUS_JOHN"
+    assert payload["source_id"] == "cnon:card-nonce"
+    assert "amount_money" not in payload
+
+
+@pytest.mark.asyncio
+async def test_square_rejection_does_not_call_payments():
+    transport = _Cards(error=BookingProviderError("declined", code="CARD_DECLINED"))
+    result = await _square(_spa(), transport).save_card_on_file(
+        external_customer_id="CUS_JOHN",
+        source_id="cnon:card-nonce",
+        idempotency_key="idem-1",
+    )
+    assert result.outcome is SaveCardOutcome.REJECTED
+    assert all(call[1] != "/v2/payments" for call in transport.calls)
+
+
+@pytest.mark.asyncio
+async def test_square_timeout_retries_the_same_key_then_stays_ambiguous():
+    transport = _Cards(fail_times=2, error=BookingProviderError("timeout", retryable=True))
+    result = await _square(_spa(), transport).save_card_on_file(
+        external_customer_id="CUS_JOHN",
+        source_id="cnon:card-nonce",
+        idempotency_key="idem-keep",
+    )
+    assert result.outcome is SaveCardOutcome.AMBIGUOUS
+    assert [call[2]["idempotency_key"] for call in transport.calls] == ["idem-keep", "idem-keep"]
+
+
+@pytest.mark.asyncio
+async def test_raw_card_number_never_reaches_square():
+    transport = _Cards()
+    result = await _square(_spa(), transport).save_card_on_file(
+        external_customer_id="CUS_JOHN",
+        source_id="4242424242424242",
+        idempotency_key="idem-1",
+    )
+    assert result.outcome is SaveCardOutcome.REJECTED
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_customer_mismatch_is_not_confirmed():
+    transport = _Cards(response={"card": {"id": "ccof:1", "customer_id": "CUS_OTHER"}})
+    result = await _square(_spa(), transport).save_card_on_file(
+        external_customer_id="CUS_JOHN",
+        source_id="cnon:card-nonce",
+        idempotency_key="idem-1",
+    )
+    assert result.outcome is SaveCardOutcome.REJECTED
+    assert result.error_code == "CUSTOMER_MISMATCH"
+
+
+def test_phase_3_source_does_not_charge():
+    from app.services import card_entry as card_entry_module
+    from app.api.v1 import card_entry as card_entry_api
+
+    blob = "\n".join(
+        inspect.getsource(item)
+        for item in (SquareAdapter, card_entry_module, card_entry_api)
+    )
+    assert "/v2/payments" not in blob
+    assert "CreatePayment" not in blob
+    assert "card.tokenize(verificationDetails)" in CARD_PAGE_HTML
+    assert 'intent: "STORE"' in CARD_PAGE_HTML
+    assert "customerInitiated: true" in CARD_PAGE_HTML
+    assert "sellerKeyedIn: false" in CARD_PAGE_HTML
+    assert "verifyBuyer" not in CARD_PAGE_HTML
+    assert "CHARGE_AND_STORE" not in CARD_PAGE_HTML
+    assert "CHARGE" not in CARD_PAGE_HTML
+    assert "currencyCode" not in CARD_PAGE_HTML
+    assert "amount:" not in CARD_PAGE_HTML
+    assert "CreatePayment" not in CARD_PAGE_HTML
+    assert "/v2/payments" not in CARD_PAGE_HTML
+    assert "no-referrer" in CARD_PAGE_HTML
+    assert "No charge is being made now." in CARD_PAGE_HTML
+
+
+def test_invalid_token_is_a_generic_rejection():
+    from app.core.database import get_db
+
+    async def _db():
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = None
+        session = MagicMock()
+        session.execute = AsyncMock(return_value=result)
+        yield session
+
+    app.dependency_overrides[get_db] = _db
+    try:
+        client = TestClient(app)
+        response = client.post("/api/v1/card-entry/session", json={"token": "not-a-real-token-value-at-all"})
+        assert response.status_code == 404
+        assert response.json()["detail"] == "This secure link is invalid or has expired."
+        assert "tenant" not in response.json()["detail"].lower()
+        assert response.headers["referrer-policy"] == "no-referrer"
+        assert response.headers["cache-control"] == "no-store"
+        page = client.get("/card")
+        assert page.status_code == 200
+        assert "access_token" not in page.text
+        assert "sq0idp" not in page.text
+        assert page.headers["referrer-policy"] == "no-referrer"
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_ttl_is_centralized():
+    assert settings.CARD_ENTRY_TOKEN_TTL_SECONDS == 3600

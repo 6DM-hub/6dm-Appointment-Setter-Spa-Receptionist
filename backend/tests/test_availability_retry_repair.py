@@ -193,31 +193,37 @@ async def test_missing_service_day_query_asks_once_and_resumes_after_clarificati
     assert output["status"] == "missing_info"
     assert output["spoken"] == "Which service would you like, and for how many minutes?"
     v._arm_availability_hold.assert_not_awaited()
-    v._pending_caller = "A 60 minute Swedish mÙ™™\—ØXØÙ\Y
-›ÚXÙKœÙ\ÜÚ[ÛŠBˆ\ÜÙ\›İÙ]Ù˜Y
-›ÚXÙKœÙ\ÜÚ[ÛŠK˜ÛÛ™š\›X][Û—Ø]]Üš^™Yˆ\ÜÙ\›ÚXÙKœÜÚÙ[ˆOH×B‚‚]\İ›X\šË˜\Ş[˜Ú[Â˜\Ş[˜ÈYˆ\İÜ™\ÜYÚ[œİXİ[Û—ÛXZ×Ú\×ØØ[˜Ù[Y
+    v._pending_caller = "A 60 minute Swedish massage"
+    v._flush_caller_turn()
+    assert v._spoken_day_part_window()[1] == end
+    assert not v._availability_recent
 
-N‚ˆ›ÚXÙHH[™[™×İ›ÚXÙJ
-Bˆ]ØZ]›ÚXÙK—Ù\Ü]Ú
-È\Hˆœ™\ÜÛœÙK˜]Y[×İ˜[œØÜš\™[H‹ˆ™[Hˆ’HÛÛ‰İÚ]™H[Hİ\ˆ[Y\È›Üˆ\È\Ú[Y[ˆŸJBˆ\ÜÙ\•Ú]Ûİ[[İHZÙHÈÏÈˆ[ˆİŠ›ÚXÙKœÜÚÙ[ŠBˆ\ÜÙ\›İ\ˆ[Y\Èˆ›İ[ˆİŠ›ÚXÙKœÜÚÙ[ŠB‚‚™Yˆ\İÜ›İšY\—ÜİXØÙ\Ü×ØÛÛ™š\›X][Û—Ú\×Û›İÜÜÚÙ[—İÚXÙJ
-N‚ˆ›ÚXÙHH[™[™×İ›ÚXÙJ
-Bˆ^[ØYHœÛÛ‹™[\ÊÈœİ]\Èˆ˜›ÛÚÙY‹˜\Ú[Y[ÚYˆ›ØØ[]\İ‹ˆ™^\›˜[Ø›ÛÚÚ[™×ÚYˆœ›İšY\‹]\İŸJBˆ\ÜÙ\›ÚXÙK—Ø]]Üš]]]™WİÛÛÙ›Ûİİ\
-˜ÛÛ™š\›WØ\Ú[Y[‹^[ØY
-Bˆ\ÜÙ\›ÚXÙK—Ø]]Üš]]]™WİÛÛÙ›Ûİİ\
-˜ÛÛ™š\›WØ\Ú[Y[‹^[ØY
-HOHˆ‚‚‚]\İ›X\šË˜\Ş[˜Ú[Â˜\Ş[˜ÈYˆ\İÙ\XØ]WÜ›ÜÜØ[Ü™]\Ù\×İ™\šYšYYÜ™\İ[
-[ÛšÙ^\]Ú
-N‚ˆ›ÚXÙHH[™[™×İ›ÚXÙJ
-Bˆ›ÚXÙK—İˆH›Û™R[™›Ê[Y\šXØKĞÚXØYÛÈŠBˆ\Ş[˜ÈYˆ™Z™Xİ
 
-˜\™ÜÊN‚ˆ˜Z\ÙH\ÜÙ\[Û‘\œ›ÜŠšY[]HÛÛXİ[Ûˆ]\İ›İ™\İ\]˜Z[Xš[]HŠBˆ[ÛšÙ^\]ÚœÙ]]Š˜\œÙ\šXÙ\ËZWÜ™X[[YKœİYÙWØ›ÛÚÚ[™È‹™Z™Xİ
-Bˆİ]]HœÛÛ‹›ØYÊ]ØZ]›ÚXÙK—Ü[—Ü›ÜÜÙWØ\Ú[Y[
-œÛÛ‹™[\ÊÂˆœ™\]Y\İYÜİ\Ú\ÛÈˆÙ]Ù˜Y
-›ÚXÙKœÙ\ÜÚ[ÛŠKœİ\Ú\ÛËˆœÙ\šXÙWÙ\ØÜš\[ÛˆˆLZ[]HY\\ÜİYH‹›Ü\˜][ÛˆˆœØÚY[HŸJJJBˆ\ÜÙ\İ]]Èœİ]\È—HOH™˜Y‚ˆ\ÜÙ\İ]]ÈœÜÚÙ[ˆ—H\È›Û™B‚‚]\İ›X\šË˜\Ş[˜Ú[Â˜\Ş[˜ÈYˆ\İÜÜ]X\™WÛ™]×Ú[[Ø]›ÚY×ØØ[˜Ù[YÜ™\^WØ[™Ü™]WÚÙ^WÚ\×ÜİX›J
-N‚ˆY\\ˆHÜÜ]X\™WØY\\ŠXZÙWÜÜJ›ÛÚÚ[™×Ü›İšY\P›ÛÚÚ[™Ô›İšY\‹”ÔUPT‘Kˆ›ÛÚÚ[™×ØÛÛ™šYÏ^È˜XØÙ\Ü×İÚÙ[ˆˆ\İ‹›ØØ][Û—ÚYˆ›Ø×ÌLŒÈŸJJBˆ˜[œÜÜHÑ˜ZÙTÜ]X\™U˜[œÜÜ
+async def test_repeated_day_search_runs_provider_once_per_caller_turn(monkeypatch):
+    v = voice()
+    v._persist_session = AsyncMock()
+    v._send_function_output = AsyncMock()
+    v._deliver_authoritative_availability = AsyncMock()
+    v._arm_availability_hold = AsyncMock()
+    lookup = AsyncMock(return_value=booking.BookingResult(booking.BookingOutcome.CONFLICT, message="No openings"))
+    monkeypatch.setattr(realtime, "search_day_part", lookup)
+    start = datetime.now(v._tz)
+    end = start + timedelta(hours=1)
+    args = {"service_description": "60 minute Swedish massage"}
+    await v._offer_spoken_window("query-1", (start, end), args)
+    await v._offer_spoken_window("query-2", (start, end), args)
+    assert lookup.await_count == 1
+    assert v._deliver_authoritative_availability.await_count == 1
+    v._pending_caller = "Please check availability again today"
+    v._flush_caller_turn()
+    await v._offer_spoken_window("query-3", (start, end), args)
+    assert lookup.await_count == 2
 
-Bˆ˜[œÜÜ˜Ø][Ù×Ú][\ÈHŞÈš][WÙ]HˆÈ›˜[YHˆ‘Y\\ÜİYHX\ÜØYÙH‹˜\šX][ÛœÈˆÂˆÈšYˆ˜\ŒH‹™\œÚ[Ûˆˆš][Wİ˜\šX][Û—Ù]HˆÈ›˜[YHˆ”™Yİ[\ˆŸ_W__WBˆ˜[œÜÜ˜]˜Z[Xš[]Y\ÈHŞÈœİ\Ø]ˆŒŒ‹LKLNNŒŒˆ‹›ØØ][Û—ÚYˆ›Ø×ÌLŒÈ‹ˆ˜\Ú[Y[ÜÙYÛY[ÈˆŞÈX[WÛY[X™\—ÚYˆœİY™ˆ‹œÙ\šXÙWİ˜\šX][Û—ÚYˆ˜\ŒH‹ˆœÙ\šXÙWİ˜\šX][Û—İ™\œÚ[Ûˆˆ™\˜][Û—ÛZ[]\ÈˆŒW_WBˆ˜[œÜÜ˜İ\İÛY\œÈHŞÈšYˆ˜İ\İÌHŸWBˆY\\‹—Ü™\]Y\İH˜[œÜÜˆ›Üˆ™Y™\™[˜ÙH[ˆÈ›ÛZ[[‹›™]ËZ[[‹›™]ËZ[[—N‚ˆ]ØZ]Y\\‹˜Ü™X]WØ›ÛÚÚ[™ÊØİ
-›ÛÚÚ[™×Ü™Y™\™[˜ÙO\™Y™\™[˜ÙJJBˆÙ^\ÈHÚ][VÈšY[\İ[˜ŞWÚÙ^H—H›Üˆ][H[ˆ˜[œÜÜ˜Ø[×İÊ‹İŒ‹Ø›ÛÚÚ[™ÜÈŠWBˆ\ÜÙ\Ù^\ÖÌHOHÙ^\ÖÌWBˆ\ÜÙ\Ù^\ÖÌWHOHÙ^\ÖÌ—B‚‚™Yˆ\İÜ›Û\Üš[Üš]^™\×ØXØÙ\[˜ÙWØ[™İ™\šYšYYÛÜ[Û˜[Ù[š[˜Ù[Y[Ê
-N‚ˆ›Û\HZ[Ü™X[[YWÚ[œİXİ[ÛœÊ•\İÜH‹[Ø^\È\ÚÈ›ÜˆÛÛ™š\›X][ÛˆÚXÙHŠBˆ\ÜÙ\›Û\š[™^
-“ÓÒÒS‘ÈÓÓ•‘T”ĞUSÓˆ•STÈŠHˆ›Û\š[™^
-[Ø^\È\ÚÈŠBˆ\ÜÙ\“™]™\ˆ\ÚÈ[HÈ\›İ™HHØ[YH]Kİ[YHYØZ[ˆˆ[ˆ›Û\ˆ\ÜÙ\™\šYšYYY[Hˆ[ˆ›Û\ˆ\ÜÙ\‘È›İ[™[šXÙ\Èˆ[ˆ›Û\
+
+@pytest.mark.parametrize("failure", [RuntimeError("provider unavailable"), "no_id"])
+async def test_booking_failure_never_sets_booked_state(world, failure):
+    world["adapter"].create_booking_failure = failure
+    result = await _confirm(world["db"], world["session"], _wants(SEPT_22))
+    assert result.outcome == booking.BookingOutcome.ERROR
+    assert world["session"].booking_status != "booked"
+    assert not world["store"].live

@@ -401,7 +401,291 @@ def _extract_day_part(utterance: str) -> tuple[dt_time, dt_time] | None:
 
 # How many of the most recent caller turns count as "still establishing the
 # date" for a later turn that names only a time. Kept short deliberately: a
-# date mentioned many turns ago in an unrelated part of the conversation is treatment."},
+# date mentioned many turns ago in an unrelated part of the conversation is
+# not the caller confirming that date now.
+_RECENT_DATE_CONTEXT_TURNS = 4
+# Prefix distinguishing an xAI voice call from a Twilio CallSid in the shared
+# `call_logs.twilio_call_sid` column. 4 + 36 chars fits the String(64) column,
+# so this needs no migration.
+XAI_SID_PREFIX = "xai:"
+XAI_REALTIME_MODEL = "grok-voice-latest"
+
+
+def build_xai_realtime_url(*, call_id: str | None = None) -> str:
+    """Build a realtime URL that always pins the current recommended voice model.
+
+    `XAI_REALTIME_URL` may already contain query parameters, so preserve them
+    instead of blindly appending another `?`.  Explicit model selection avoids
+    drifting onto whatever server default happens to be active.
+    """
+    parts = urlsplit(settings.XAI_REALTIME_URL)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["model"] = query.get("model") or XAI_REALTIME_MODEL
+    if call_id is not None:
+        query["call_id"] = call_id
+    return urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
+    )
+
+
+def xai_call_sid(call_id: str) -> str:
+    return f"{XAI_SID_PREFIX}{call_id}"
+
+
+PROPOSE_APPOINTMENT_TOOL: dict[str, Any] = {
+    "type": "function",
+    "name": "propose_appointment",
+    "description": (
+        "Record what the caller is asking for and check whether the slot is free. "
+        "This NEVER books anything. Call it every time the caller names or changes "
+        "a date, time or service — including when they change their mind. There is "
+        "only one pending request per call, so a change replaces the previous one "
+        "rather than adding a second appointment. After calling this, the backend "
+        "speaks the Square result. If caller_name is not already stored from this "
+        "call, the backend asks for the caller's name before any booking "
+        "confirmation. A known profile or a Square customer matched by phone is "
+        "not that name. Pass caller_name once the caller says it, and do not ask "
+        "again when it is already stored.\n\n"
+        "NEVER invent or guess a date/time to 'try' it. A weekday is the next "
+        "upcoming one — do not ask if they mean the coming Saturday. "
+        "'Thursday at 4pm' is complete: set requested_start_iso to that local "
+        "time. 'Saturday afternoon' is also complete: call this tool; the "
+        "backend searches that part of the day. If the caller has not stated "
+        "a day or a time at all, either ask them, or — if they asked for the "
+        "earliest/soonest/next opening — set earliest=true and leave "
+        "requested_start_iso unset; the backend runs one real forward search "
+        "and returns up to three actual openings. Calling this again with a "
+        "different self-chosen time because the last one didn't work is not "
+        "allowed and will be refused."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "caller_name": {"type": "string", "description": "Caller's full name."},
+            "caller_email": {"type": "string", "description": "Caller's email, if given."},
+            "requested_start_iso": {
+                "type": "string",
+                "description": (
+                    "Requested start as THIS BUSINESS'S LOCAL wall-clock time in "
+                    "ISO8601 with NO timezone suffix and NO 'Z' — e.g. "
+                    "2026-09-04T14:00:00 for 2pm local time. Never convert this to "
+                    "UTC yourself and never append 'Z'; the backend localizes it. "
+                    "ONLY set this to a time the caller actually said, or one of the "
+                    "authoritative options already offered to them. Leave unset "
+                    "when earliest=true."
+                ),
+            },
+            "requested_end_iso": {
+                "type": "string",
+                "description": (
+                    "Requested end as THIS BUSINESS'S LOCAL wall-clock time, same "
+                    "format as requested_start_iso (no 'Z', no offset). Omit to use "
+                    "the service's duration."
+                ),
+            },
+            "requested_services": {"type": "array", "items": {"type": "string"}, "description": "All treatments requested for this visit. Include each requested duration; never drop a service."},
+            "service_description": {
+                "type": "string",
+                "description": "Service requested, e.g. '60 minute deep tissue massage'.",
+            },
+            "preferred_staff": {
+                "type": "string",
+                "description": (
+                    "Name of the specific staff member the caller asked for, e.g. "
+                    "'Sarah'. Leave this out entirely if the caller said 'anyone', "
+                    "'whoever's free', or didn't mention a preference — never guess "
+                    "a name."
+                ),
+            },
+            "operation": {
+                "type": "string",
+                "enum": ["schedule", "reschedule"],
+                "description": (
+                    "Use reschedule when the caller is moving an existing appointment; "
+                    "otherwise use schedule. A reschedule never creates a second appointment."
+                ),
+            },
+            "appointment_id": {
+                "type": "string",
+                "description": (
+                    "For reschedule only: an appointment_id previously returned by the "
+                    "backend lookup/offered choices. Never invent an ID."
+                ),
+            },
+            "earliest": {
+                "type": "boolean",
+                "description": (
+                    "True ONLY when the caller asked for the earliest/soonest/next "
+                    "available opening and named no specific date or time "
+                    "themselves. When true, leave requested_start_iso unset — the "
+                    "backend performs the actual forward search."
+                ),
+            },
+            "guest_name": {
+                "type": "string",
+                "description": (
+                    "Name of the person the appointment is FOR when the caller is "
+                    "booking for someone else. Leave empty if the appointment is "
+                    "for the caller. Never copy preferred_staff here."
+                ),
+            },
+        },
+        "required": [],
+    },
+}
+
+CONFIRM_APPOINTMENT_TOOL: dict[str, Any] = {
+    "type": "function",
+    "name": "confirm_appointment",
+    "description": (
+        "Actually book the pending request, after the caller has explicitly agreed "
+        "to the exact date and time you read back to them. Takes no date: it always "
+        "commits the latest pending request, so it cannot book a time the caller has "
+        "already changed. Safe to call more than once — repeat calls return the same "
+        "appointment instead of creating another. If the caller changed their mind "
+        "after a booking was made, this moves that booking rather than adding one. "
+        "IMPORTANT: after the caller says yes/book it/that works, call this tool immediately "
+        "BEFORE speaking any acknowledgment or success wording. Do not call this until "
+        "caller_name is stored. The backend speaks the final confirmation only after "
+        "the provider returns a real external booking ID, and it mentions a secure "
+        "card text only when that text was actually sent."
+    ),
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+LOOKUP_APPOINTMENTS_TOOL: dict[str, Any] = {
+    "type": "function",
+    "name": "lookup_appointments",
+    "description": (
+        "Read-only lookup of this caller's upcoming appointments. Use this for questions "
+        "like 'when is my next appointment?' and before selecting among multiple appointments "
+        "for cancellation or rescheduling. This never books, moves, or cancels anything."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "purpose": {
+                "type": "string",
+                "enum": ["lookup", "cancel", "reschedule"],
+                "description": "Why the appointments are being listed.",
+            }
+        },
+        "required": [],
+    },
+}
+
+CANCEL_APPOINTMENT_TOOL: dict[str, Any] = {
+    "type": "function",
+    "name": "cancel_appointment",
+    "description": (
+        "Cancel this caller's appointment. If several upcoming appointments exist, first "
+        "read back the backend-provided choices and then pass the appointment_id for the "
+        "one the caller selected. Never invent an appointment_id."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "appointment_id": {
+                "type": "string",
+                "description": "One of the appointment IDs previously offered by the backend.",
+            }
+        },
+        "required": [],
+    },
+}
+
+NEW_APPOINTMENT_TOOL: dict[str, Any] = {
+    "type": "function",
+    "name": "start_new_appointment",
+    "description": (
+        "Start a SECOND, separate appointment. Only call this when the caller "
+        "explicitly says they want an additional appointment as well as the one "
+        "already arranged. Never call it because they changed the date or time of "
+        "the appointment already being discussed — use propose_appointment for that."
+    ),
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+MANAGE_APPOINTMENT_TOOL: dict[str, Any] = {
+    "type": "function",
+    "name": "manage_appointment",
+    "description": (
+        "Commit a booking, reschedule or cancellation the caller has explicitly "
+        "agreed to. Prefer propose_appointment followed by confirm_appointment; "
+        "this remains for a single-step confirmed action. Repeat calls resolve to "
+        "the same appointment rather than creating another."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "intent": {
+                "type": "string",
+                "enum": ["schedule", "reschedule", "cancel"],
+                "description": "What the caller wants to do.",
+            },
+            "caller_name": {"type": "string", "description": "Caller's full name."},
+            "caller_email": {"type": "string", "description": "Caller's email, if given."},
+            "requested_start_iso": {
+                "type": "string",
+                "description": (
+                    "Requested start as THIS BUSINESS'S LOCAL wall-clock time in "
+                    "ISO8601 with NO timezone suffix and NO 'Z' — e.g. "
+                    "2026-09-04T14:00:00 for 2pm local time. Never convert this to "
+                    "UTC yourself and never append 'Z'; the backend localizes it."
+                ),
+            },
+            "requested_end_iso": {
+                "type": "string",
+                "description": (
+                    "Requested end as THIS BUSINESS'S LOCAL wall-clock time, same "
+                    "format as requested_start_iso (no 'Z', no offset). Omit to use "
+                    "the service's duration."
+                ),
+            },
+            "requested_services": {"type": "array", "items": {"type": "string"}, "description": "All treatments requested for this visit. Include each requested duration; never drop a service."},
+            "service_description": {
+                "type": "string",
+                "description": "Service requested, e.g. '60 minute deep tissue massage'.",
+            },
+            "preferred_staff": {
+                "type": "string",
+                "description": (
+                    "Name of the specific staff member the caller asked for. Leave "
+                    "this out if they have no preference."
+                ),
+            },
+        },
+        "required": ["intent"],
+    },
+}
+
+CHECK_AVAILABILITY_TOOL: dict[str, Any] = {
+    "type": "function",
+    "name": "check_availability",
+    "description": (
+        "Check one EXACT spa slot the caller actually stated, or one of the "
+        "options already offered to them. This never books or reserves it. "
+        "NEVER call this with a date/time you invented yourself to see if it "
+        "happens to be free — that is not allowed and will be refused. For "
+        "'earliest/soonest opening' requests use propose_appointment with "
+        "earliest=true instead; it runs the real forward search."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "requested_start_iso": {
+                "type": "string",
+                "description": (
+                    "This business's LOCAL wall-clock time, ISO8601, no 'Z', no "
+                    "offset — e.g. 2026-09-04T14:00:00 for 2pm local time. Must be "
+                    "a time the caller said, or one of the options already offered."
+                ),
+            },
+            "requested_end_iso": {
+                "type": "string",
+                "description": "Same local, no-offset format as requested_start_iso.",
+            },
+            "requested_services": {"type": "array", "items": {"type": "string"}, "description": "Every service in this visit, including durations requested by the caller. Never drop a treatment."},
             "service_description": {"type": "string"},
             "preferred_staff": {
                 "type": "string",

@@ -141,601 +141,350 @@ async def test_rejected_probe_does_not_repeat_without_a_new_caller_turn(
 
     # The response closes; the deferred continuation is speech-only.
     await voice_session._dispatch({"type": "response.done", "response": {"id": "resp-1"}})
-  or str(int(time.time()))
-    sig = signature if signature is not None else _sign(body, webhook_id, ts)
-    return _FakeRequest(
-        body,
-        {"webhook-id": webhook_id, "webhook-timestamp": ts, "webhook-signature": sig},
+    creates = _creates(sent)
+    assert len(creates) == 1
+    assert creates[0]["response"]["tool_choice"] == "none"
+
+    # The model tries the exact same probe again anyway, in a new response,
+    # with no new caller turn in between. It must still be refused, and no
+    # further continuation may be issued for this repeat.
+    await voice_session._dispatch({"type": "response.created", "response": {"id": "resp-2"}})
+    await voice_session._dispatch(
+        _call_done_event(response_id="resp-2", call_id="call-2", start_iso="2026-10-01T15:00:00")
     )
+    await voice_session._dispatch({"type": "response.done", "response": {"id": "resp-2"}})
 
-
-@pytest.fixture
-def signing_secret(monkeypatch):
-    monkeypatch.setattr(settings, "XAI_VOICE_WEBHOOK_SECRET", SECRET)
-    monkeypatch.setattr(settings, "APP_ENV", "development")
-    return SECRET
-
-
-async def test_valid_signature_is_accepted(signing_secret):
-    body = json.dumps({"type": "realtime.call.incoming"}).encode()
-    await verify_xai_voice_signature(_request(body))
-
-
-async def test_tampered_body_is_rejected(signing_secret):
-    body = json.dumps({"type": "realtime.call.incoming"}).encode()
-    request = _request(body)
-    request._body = body + b" "  # signature no longer covers the payload
-    with pytest.raises(HTTPException) as exc:
-        await verify_xai_voice_signature(request)
-    assert exc.value.status_code == 403
-
-
-async def test_wrong_secret_is_rejected(signing_secret):
-    body = b"{}"
-    other = "whsec_" + base64.b64encode(b"a-different-key").decode()
-    with pytest.raises(HTTPException) as exc:
-        await verify_xai_voice_signature(
-            _request(body, signature=_sign(body, "msg_123", str(int(time.time())), other))
-        )
-    assert exc.value.status_code == 403
-
-
-async def test_stale_timestamp_is_rejected(signing_secret):
-    """Replay protection: a captured delivery must not be replayable later."""
-    body = b"{}"
-    old = str(int(time.time()) - settings.XAI_WEBHOOK_TOLERANCE_SECONDS - 60)
-    with pytest.raises(HTTPException) as exc:
-        await verify_xai_voice_signature(_request(body, timestamp=old))
-    assert exc.value.status_code == 403
-
-
-async def test_missing_headers_are_rejected(signing_secret):
-    with pytest.raises(HTTPException) as exc:
-        await verify_xai_voice_signature(_FakeRequest(b"{}", {}))
-    assert exc.value.status_code == 403
-
-
-async def test_malformed_timestamp_is_rejected(signing_secret):
-    with pytest.raises(HTTPException) as exc:
-        await verify_xai_voice_signature(_request(b"{}", timestamp="not-a-number"))
-    assert exc.value.status_code == 403
-
-
-async def test_signature_accepted_during_secret_rotation(signing_secret):
-    """xAI sends several `v1,<sig>` pairs while a secret is rotating; matching
-    any one of them is a valid delivery."""
-    body = b"{}"
-    ts = str(int(time.time()))
-    good = _sign(body, "msg_123", ts)
-    stale = _sign(body, "msg_123", ts, "whsec_" + base64.b64encode(b"old-key").decode())
-    await verify_xai_voice_signature(_request(body, signature=f"{stale} {good}", timestamp=ts))
-
-
-async def test_production_refuses_to_run_unsigned(monkeypatch):
-    """An unsigned webhook would let anyone start a billable voice session."""
-    monkeypatch.setattr(settings, "XAI_VOICE_WEBHOOK_SECRET", "")
-    monkeypatch.setattr(settings, "APP_ENV", "production")
-    with pytest.raises(HTTPException) as exc:
-        await verify_xai_voice_signature(_FakeRequest(b"{}", {}))
-    assert exc.value.status_code == 500
+    assert availability_stub == [], "the provider must never be reached by this probe"
+    assert _outputs(sent)[1]["status"] == "duplicate_probe"
+    assert len(_creates(sent)) == 1, "no further autonomous continuation for a repeated rejection"
 
 
 # --------------------------------------------------------------------------- #
-# Prompt construction
+# Test 2 — verified availability is spoken authoritatively once
 # --------------------------------------------------------------------------- #
-def test_realtime_instructions_carry_tenant_block_and_tool_contract():
-    text = build_realtime_instructions("Healing Waters Day Spa", "SERVICE MENU:\n- Facial 60 minutes")
-    assert "Healing Waters Day Spa" in text
-    assert "SERVICE MENU:" in text
-    # The two-step contract has to be spelled out, or the model books on
-    # hearing a date and every change of mind becomes another appointment.
-    assert "propose_appointment" in text
-    assert "confirm_appointment" in text
-    # Without this the model would announce bookings it never made.
-    assert "booked=true" in text
-    # A change of mind must be understood as an edit, not a second booking.
-    assert "REPLACES the previous pending request" in text
-    assert "Greet the caller only at the beginning of the call" in text
-
-
-def test_realtime_instructions_survive_missing_tenant_prompt():
-    text = build_realtime_instructions("6DM", None)
-    assert "6DM" in text
-    assert "{tenant_block}" not in text
-
-
-# --------------------------------------------------------------------------- #
-# Transcript accumulation
-# --------------------------------------------------------------------------- #
-def _session() -> CallSession:
-    session = CallSession(
-        call_sid="call-1",
-        direction="inbound",
-        from_number="+14155550100",
-        to_number="+18058878345",
-        business_name="Healing Waters Day Spa",
-        tenant_id=str(uuid.uuid4()),
-    )
-    session.add_turn("assistant", "Thank you for calling Healing Waters Day Spa.")
-    return session
-
-
-@pytest.fixture
-def voice_session(monkeypatch):
-    voice = XAIVoiceSession("call-1", _session())
-
-    async def _noop() -> None:
-        return None
-
-    monkeypatch.setattr(voice, "_persist_session", _noop)
-    return voice
-
-
-async def test_cumulative_caller_transcripts_yield_one_turn(voice_session):
-    """The transcription events are cumulative. Appending each partial would
-    write 'I' / 'I would' / 'I would like...' as three separate caller turns."""
-    for partial in ("I", "I would", "I would like a facial"):
-        await voice_session._dispatch(
-            {
-                "type": "conversation.item.input_audio_transcription.updated",
-                "data": {"transcript": partial},
-            }
-        )
-    await voice_session._dispatch(
-        {
-            "type": "conversation.item.input_audio_transcription.completed",
-            "data": {"transcript": "I would like a facial"},
-        }
-    )
-    user_turns = [t for t in voice_session.session.history if t["role"] == "user"]
-    assert user_turns == [{"role": "user", "content": "I would like a facial"}]
-
-
-async def test_agent_reply_closes_an_unflushed_caller_turn(voice_session):
-    """If no `.completed` arrives, the agent starting to speak still marks the
-    turn boundary — otherwise the caller's words never reach the transcript."""
-    await voice_session._dispatch(
-        {
-            "type": "conversation.item.input_audio_transcription.updated",
-            "data": {"transcript": "do you have anything tomorrow"},
-        }
-    )
-    await voice_session._dispatch(
-        {
-            "type": "response.output_audio_transcript.done",
-            "data": {"transcript": "We do, at two o'clock."},
-        }
-    )
-    roles = [t["role"] for t in voice_session.session.history]
-    contents = [t["content"] for t in voice_session.session.history]
-    assert roles == ["assistant", "user", "assistant"]
-    assert contents[1] == "do you have anything tomorrow"
-    assert contents[2] == "We do, at two o'clock."
-
-
-async def test_transcript_text_renders_both_speakers(voice_session):
-    await voice_session._dispatch(
-        {
-            "type": "conversation.item.input_audio_transcription.completed",
-            "data": {"transcript": "Hi there"},
-        }
-    )
-    transcript = voice_session.session.transcript_text
-    assert "Caller: Hi there" in transcript
-    assert "Agent: Thank you for calling Healing Waters Day Spa." in transcript
-
-
-async def test_repeated_completed_event_does_not_duplicate_a_turn(voice_session):
-    for _ in range(2):
-        await voice_session._dispatch(
-            {
-                "type": "conversation.item.input_audio_transcription.completed",
-                "data": {"transcript": "Hello"},
-            }
-        )
-    assert [t["content"] for t in voice_session.session.history].count("Hello") == 1
-
-
-async def test_unknown_events_are_ignored_without_raising(voice_session):
-    await voice_session._dispatch({"type": "some.future.event", "data": {"x": 1}})
-    await voice_session._dispatch({})
-    assert len(voice_session.session.history) == 1
-
-
-def test_first_str_finds_nested_values():
-    assert _first_str({"a": {"b": {"transcript": "found"}}}, "transcript") == "found"
-    assert _first_str({"transcript": "  "}, "transcript") is None
-    assert _first_str("not-a-dict", "transcript") is None
-
-
-# --------------------------------------------------------------------------- #
-# Booking tool bridge
-# --------------------------------------------------------------------------- #
-class _FakeSessionCtx:
-    async def __aenter__(self):
-        return object()
-
-    async def __aexit__(self, *exc):
-        return False
-
-
-@pytest.fixture
-def booking_stub(monkeypatch):
-    """Swap the booking engine for a recorder; the engine itself is covered by
-    tests/test_booking_adapters.py."""
-    from app.services import xai_realtime
-
-    calls: list = []
-
-    class _Result:
-        def __init__(self):
-            from app.services.appointment_booking_service import BookingOutcome
-
-            self.outcome = BookingOutcome.BOOKED
-            self.appointment = None
-            self.message = "Appointment successfully booked. Confirm it to the caller."
-
-        def to_system_message(self) -> str:
-            return f"[SYSTEM: {self.message}]"
-
-    async def _fake_attempt(db, session, intent):
-        calls.append(intent)
-        return _Result()
-
-    monkeypatch.setattr(xai_realtime, "AsyncSessionLocal", _FakeSessionCtx)
-    monkeypatch.setattr(xai_realtime, "attempt_booking", _fake_attempt)
-    return calls
-
-
-async def test_tool_call_reaches_the_booking_engine(voice_session, booking_stub):
-    output = await voice_session._run_manage_appointment(
-        json.dumps(
-            {
-                "intent": "schedule",
-                "caller_name": "Dana Reed",
-                "requested_start_iso": "2026-09-04T14:00:00Z",
-                "service_description": "60 minute deep tissue massage",
-            }
-        )
-    )
-    payload = json.loads(output)
-    assert payload["booked"] is False
-    assert payload["status"] == "rejected"
-    assert booking_stub == []
-
-
-async def test_availability_tool_does_not_call_booking_engine(voice_session, monkeypatch):
-    from app.services import xai_realtime
-
-    checked = []
-
-    async def check(_db, session, intent):
-        checked.append((session, intent))
-        from app.services.appointment_booking_service import AvailabilityResult
-        return AvailabilityResult(True, "That slot is available.")
-
-    monkeypatch.setattr(xai_realtime, "check_availability_only", check)
-    output = await voice_session._run_check_availability(
-        json.dumps({"requested_start_iso": "2026-09-04T14:00:00Z"})
-    )
-
-    assert json.loads(output)["available"] is True
-    assert len(checked) == 1
-    assert voice_session.session.appointment_id is None
-    assert voice_session.session.booking_status == "awaiting_selection"
-
-
-async def test_confirmation_claim_is_cancelled_without_booked_state(voice_session):
-    sent = []
-
-    async def capture(payload):
-        sent.append(payload)
-
-    voice_session._send = capture
-    await voice_session._dispatch({"type": "response.created", "response": {"id": "resp-1"}})
-    await voice_session._dispatch(
-        {"type": "response.output_audio_transcript.delta", "data": {"delta": "Your appointment is confirmed."}}
-    )
-
-    assert any(payload["type"] == "response.cancel" for payload in sent)
-    assert "could not complete" in voice_session._pending_agent.lower()
-    assert voice_session._pending_forced_tool_message is not None
-
-
-async def test_already_booked_conflict_speech_is_not_cancelled(voice_session):
-    """After Square says the slot is taken, the agent must be allowed to say so.
-
-    Live failure: bare 'booked'/'confirmed' cancelled TTS mid-sentence, which
-    sounded like crackle and then silence."""
-    sent = []
-
-    async def capture(payload):
-        sent.append(payload)
-
-    voice_session._send = capture
-    voice_session.session.booking_status = "conflict"
-    await voice_session._dispatch({"type": "response.created", "response": {"id": "resp-1"}})
-    await voice_session._dispatch(
-        {
-            "type": "response.output_audio_transcript.delta",
-            "data": {"delta": "That time is already booked. I can check another opening."},
-        }
-    )
-
-    assert not any(payload.get("type") == "response.cancel" for payload in sent)
-    assert "already booked" in voice_session._pending_agent.lower()
-
-
-def test_call_session_booking_state_round_trips():
-    session = CallSession(
-        "call-state", "inbound", "+15550001", "+15550002",
-        booking_status="booked", appointment_id="appointment-1",
-        confirmed_datetime="2026-09-04T14:00:00+00:00",
-    )
-
-    restored = CallSession.from_dict(session.to_dict())
-
-    assert restored.booking_status == "booked"
-    assert restored.appointment_id == "appointment-1"
-
-
-def test_several_minutes_of_english_caller_speech_defaults_to_english():
-    session = CallSession("language", "inbound", "+1", "+2")
-    session.add_turn("user", "I would like to book a massage for tomorrow, please.")
-
-    assert primary_caller_language(session, "Not detected") == "English"
-
-
-def test_successful_booking_state_requires_persisted_appointment():
-    session = CallSession("booking-state", "inbound", "+1", "+2")
-    appointment = type("Appointment", (), {
-        "id": uuid.uuid4(),
-        "start_time": datetime(2026, 9, 4, 16, tzinfo=timezone.utc),
-        "external_booking_id": "external-1",
-    })()
-
-    apply_booking_result(session, BookingResult(BookingOutcome.BOOKED, appointment=appointment))
-
-    assert session.booking_status == "booked"
-    assert session.appointment_id == str(appointment.id)
-    assert session.external_booking_id == "external-1"
-
-
-def test_booked_without_appointment_cannot_enable_confirmation():
-    session = CallSession("bad-booking-state", "inbound", "+1", "+2")
-
-    apply_booking_result(session, BookingResult(BookingOutcome.BOOKED))
-
-    assert session.booking_status == "failed"
-    assert session.appointment_id is None
-
-
-def test_twilio_reply_cannot_confirm_without_persisted_booking():
-    session = CallSession("reply", "inbound", "+1", "+2")
-
-    reply = _authoritative_reply(session, "Perfect, your appointment is confirmed.")
-
-    assert "could not complete" in reply.lower()
-
-
-def test_twilio_reply_allows_already_booked_conflict_language():
-    session = CallSession("reply-conflict", "inbound", "+1", "+2")
-    session.booking_status = "conflict"
-    reply = _authoritative_reply(
-        session, "That time is already booked. Would you like a later opening?"
-    )
-    assert "already booked" in reply.lower()
-
-
-async def test_booking_outcome_is_recorded_in_the_transcript(voice_session, booking_stub):
-    output = await voice_session._run_manage_appointment(json.dumps({"intent": "schedule"}))
-    payload = json.loads(output)
-    assert payload["booked"] is False
-    assert booking_stub == []
-    system_turns = [t for t in voice_session.session.history if t["role"] == "system"]
-    assert system_turns == []
-
-
-async def test_malformed_tool_arguments_ask_the_caller_to_restate(voice_session, booking_stub):
-    """A bad tool payload must not drop the call — the agent should recover by
-    asking again."""
-    output = await voice_session._run_manage_appointment("{not json")
-    payload = json.loads(output)
-    assert payload["booked"] is False
-    assert booking_stub == []
-
-
-async def test_invalid_intent_value_is_reported_not_raised(voice_session, booking_stub):
-    output = await voice_session._run_manage_appointment(json.dumps({"nonsense": True}))
-    assert output
-    assert booking_stub == []
-
-
-async def test_function_call_event_returns_output_and_requests_speech(voice_session, booking_stub):
-    """After a tool result the model needs an explicit `response.create`, or the
-    caller hears nothing following the booking."""
-    sent: list = []
-
-    async def _capture(payload):
-        sent.append(payload)
-
-    voice_session._send = _capture
-
-    await voice_session._dispatch(
-        {
-            "type": "response.function_call_arguments.done",
-            "data": {
-                "name": "manage_appointment",
-                "call_id": "fc_1",
-                "arguments": json.dumps({"intent": "schedule"}),
-            },
-        }
-    )
-
-    assert [p["type"] for p in sent] == ["conversation.item.create", "response.create"]
-    item = sent[0]["item"]
-    assert item["type"] == "function_call_output"
-    assert item["call_id"] == "fc_1"
-    payload = json.loads(item["output"])
-    assert payload["booked"] is False
-
-
-async def test_unknown_tool_is_refused_without_touching_the_booking_engine(
-    voice_session, booking_stub
+async def test_successful_probe_gets_one_authoritative_spoken_result(
+    voice_session, availability_stub, monkeypatch
 ):
-    sent: list = []
+    sent: list[dict] = []
 
-    async def _capture(payload):
+    async def capture(payload):
         sent.append(payload)
 
-    voice_session._send = _capture
+    monkeypatch.setattr(voice_session, "_send", capture)
 
+    await _caller_says(voice_session, "Book HydroLux5 Face Only for October 1st at 3 PM.")
+    await voice_session._dispatch({"type": "response.created", "response": {"id": "resp-1"}})
     await voice_session._dispatch(
-        {
-            "type": "response.function_call_arguments.done",
-            "data": {"name": "drop_database", "call_id": "fc_2", "arguments": "{}"},
-        }
+        _call_done_event(response_id="resp-1", call_id="call-1", start_iso="2026-10-01T15:00:00")
     )
-    assert booking_stub == []
-    assert "not available" in sent[0]["item"]["output"]
+    await voice_session._dispatch({"type": "response.done", "response": {"id": "resp-1"}})
 
-
-def test_tool_schema_matches_the_appointment_intent_fields():
-    """The tool's arguments are fed straight into AppointmentIntent, so a field
-    that does not exist there would fail validation on every booking."""
-    from app.services.grok_service import AppointmentIntent
-
-    allowed = set(AppointmentIntent.model_fields)
-    exposed = set(MANAGE_APPOINTMENT_TOOL["parameters"]["properties"])
-    assert exposed <= allowed
+    assert availability_stub == ["2026-10-01T15:00:00"]
+    assert _outputs(sent)[0]["status"] == "available"
+    assert _creates(sent) == []
+    assert len(_force_messages(sent)) == 1
 
 
 # --------------------------------------------------------------------------- #
-# Greeting
+# Test 3 — duplicate rejected probe within one turn is blocked
 # --------------------------------------------------------------------------- #
-async def test_greeting_is_spoken_on_connect(voice_session):
-    """The reported fault was silence until the caller said "hello"; the agent
-    does not open on its own, so we must push the greeting ourselves."""
-    sent: list = []
+async def test_duplicate_rejected_probe_in_one_turn_is_blocked_even_with_an_offset(
+    voice_session, availability_stub, monkeypatch
+):
+    """The second attempt uses an explicit UTC offset for the same
+    business-local instant — must still normalize to the same signature."""
+    sent: list[dict] = []
 
-    async def _capture(payload):
+    async def capture(payload):
         sent.append(payload)
 
-    voice_session._send = _capture
-    await voice_session._greet()
+    monkeypatch.setattr(voice_session, "_send", capture)
 
-    assert len(sent) == 1
-    item = sent[0]["item"]
-    assert item["type"] == "force_message"
-    assert item["content"][0]["text"] == (
-        "Thank you for calling Healing Waters Day Spa. "
-        "I’m Cara, your AI receptionist. May I help you reserve an appointment today?"
-    )
-    assert voice_session.session.greeting_requested is True
-    assert voice_session.session.greeting_sent is False
-    await voice_session._dispatch({"type": "response.created", "response": {"id": "greet-1"}})
+    await _caller_says(voice_session, "Do you have anything?")
+    await voice_session._dispatch({"type": "response.created", "response": {"id": "resp-1"}})
     await voice_session._dispatch(
-        {
-            "type": "response.output_audio.delta",
-            "response": {"id": "greet-1"},
-            "delta": "AA==",
-        }
+        _call_done_event(response_id="resp-1", call_id="call-1", start_iso="2026-10-01T15:00:00")
     )
-    assert voice_session.session.greeting_sent is True
-    await voice_session._greet()
-    assert len(sent) == 1, "a second _greet() on the same CallSid must be a no-op"
+    assert _outputs(sent)[0]["status"] == "ungrounded_time"
+
+    await voice_session._dispatch(
+        _call_done_event(
+            response_id="resp-1", call_id="call-2", start_iso="2026-10-01T15:00:00+00:00"
+        )
+    )
+    assert availability_stub == []
+    assert _outputs(sent)[1]["status"] == "duplicate_probe"
 
 
-async def test_greeting_falls_back_to_model_when_opening_force_message_errors(voice_session):
-    sent: list = []
+# --------------------------------------------------------------------------- #
+# Test 4 — a genuinely new caller turn resets the block
+# --------------------------------------------------------------------------- #
+async def test_new_caller_turn_with_real_information_unblocks_the_previously_rejected_time(
+    voice_session, availability_stub, monkeypatch
+):
+    sent: list[dict] = []
 
-    async def _capture(payload):
+    async def capture(payload):
         sent.append(payload)
 
-    voice_session._send = _capture
-    voice_session.session.greeting_sent = False
-    await voice_session._dispatch({"type": "error", "data": {"message": "unknown item type"}})
+    monkeypatch.setattr(voice_session, "_send", capture)
 
-    assert [p["type"] for p in sent] == ["conversation.item.create", "response.create"]
-    assert sent[0]["item"]["type"] == "message"
-    assert voice_session.session.greeting_sent is False
-    await voice_session._dispatch({"type": "response.created", "response": {"id": "greet-fb"}})
+    await _caller_says(voice_session, "I'd like to book something.")
+    await voice_session._dispatch({"type": "response.created", "response": {"id": "resp-1"}})
     await voice_session._dispatch(
-        {
-            "type": "response.output_audio.delta",
-            "response": {"id": "greet-fb"},
-            "delta": "AA==",
-        }
+        _call_done_event(response_id="resp-1", call_id="call-1", start_iso="2026-10-01T15:00:00")
     )
-    assert voice_session.session.greeting_sent is True
+    assert _outputs(sent)[0]["status"] == "ungrounded_time"
+    await voice_session._dispatch({"type": "response.done", "response": {"id": "resp-1"}})
+
+    # The caller now actually states the date and time.
+    await _caller_says(voice_session, "October 1st at 3 PM, please.")
+    await voice_session._dispatch({"type": "response.created", "response": {"id": "resp-2"}})
+    await voice_session._dispatch(
+        _call_done_event(response_id="resp-2", call_id="call-2", start_iso="2026-10-01T15:00:00")
+    )
+
+    assert availability_stub == ["2026-10-01T15:00:00"]
+    assert _outputs(sent)[1]["status"] == "available"
 
 
-async def test_untyped_error_frame_is_recognised(voice_session):
-    """Observed on a live socket: xAI can send a bare {"error": "..."} frame
-    with no `type` field. Treating it as unhandled would hide real failures."""
-    sent: list = []
+# --------------------------------------------------------------------------- #
+# Test 5 — date established earlier, "3 PM" alone later: grounded only when
+# the date was actually established
+# --------------------------------------------------------------------------- #
+async def test_date_established_earlier_then_time_only_turn_is_grounded(
+    voice_session, availability_stub, monkeypatch
+):
+    """This is the exact reported scenario: the caller said "October first"
+    earlier, then just "Uh, 3 P M." (STT's spelled-out rendering). Both
+    pieces are real caller state, so the combination is valid."""
+    sent: list[dict] = []
 
-    async def _capture(payload):
+    async def capture(payload):
         sent.append(payload)
 
-    voice_session._send = _capture
-    await voice_session._greet()
-    await voice_session._dispatch({"type": "response.created", "response": {"id": "greet-1"}})
+    monkeypatch.setattr(voice_session, "_send", capture)
+
+    await _caller_says(voice_session, "I'd like to book HydroLux5 Face Only for October 1st.")
+    await _caller_says(voice_session, "Uh, 3 P M.")
+    await voice_session._dispatch({"type": "response.created", "response": {"id": "resp-1"}})
     await voice_session._dispatch(
-        {
-            "type": "response.output_audio.delta",
-            "response": {"id": "greet-1"},
-            "delta": "AA==",
-        }
+        _call_done_event(response_id="resp-1", call_id="call-1", start_iso="2026-10-01T15:00:00")
     )
-    sent.clear()
-    voice_session._user_turn_count = 2
 
-    await voice_session._dispatch({"error": "call_id not found or no longer valid"})
+    assert _outputs(sent)[0]["status"] == "available"
+    assert availability_stub == ["2026-10-01T15:00:00"]
 
-    assert sent == []
+
+async def test_time_only_turn_with_no_date_ever_established_is_rejected(
+    voice_session, availability_stub, monkeypatch
+):
+    """Same "3 P M." turn, but no date was ever named — must not invent one."""
+    sent: list[dict] = []
+
+    async def capture(payload):
+        sent.append(payload)
+
+    monkeypatch.setattr(voice_session, "_send", capture)
+
+    await _caller_says(voice_session, "I'd like to book HydroLux5 Face Only.")
+    await _caller_says(voice_session, "Uh, 3 P M.")
+    await voice_session._dispatch({"type": "response.created", "response": {"id": "resp-1"}})
+    await voice_session._dispatch(
+        _call_done_event(response_id="resp-1", call_id="call-1", start_iso="2026-10-01T15:00:00")
+    )
+
+    assert _outputs(sent)[0]["status"] == "ungrounded_time"
+    assert availability_stub == []
+
+
+# --------------------------------------------------------------------------- #
+# Test 6 — earliest=true mismatched against an explicit "3 PM" ask
+# --------------------------------------------------------------------------- #
+async def test_earliest_after_explicit_time_request_is_rejected_without_looping(
+    voice_session, availability_stub, monkeypatch
+):
+    sent: list[dict] = []
+
+    async def capture(payload):
+        sent.append(payload)
+
+    monkeypatch.setattr(voice_session, "_send", capture)
+
+    await _caller_says(voice_session, "I want 3 PM today, specifically.")
+    await voice_session._dispatch({"type": "response.created", "response": {"id": "resp-1"}})
+    await voice_session._dispatch(
+        _call_done_event(response_id="resp-1", call_id="call-1", start_iso="", earliest=True)
+    )
+    assert availability_stub == []
+    assert _outputs(sent)[0]["status"] == "ungrounded_earliest"
+    await voice_session._dispatch({"type": "response.done", "response": {"id": "resp-1"}})
+    creates = _creates(sent)
+    assert len(creates) == 1
+    assert creates[0]["response"]["tool_choice"] == "none"
+
+    # Retried in a new response with no new caller turn: blocked outright.
+    await voice_session._dispatch({"type": "response.created", "response": {"id": "resp-2"}})
+    await voice_session._dispatch(
+        _call_done_event(response_id="resp-2", call_id="call-2", start_iso="", earliest=True)
+    )
+    assert availability_stub == []
+    assert _outputs(sent)[1]["status"] == "duplicate_probe"
+    assert len(_creates(sent)) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Test 8 — tool result and response.done arriving close together produce
+# exactly one authoritative result and no autonomous continuation
+# --------------------------------------------------------------------------- #
+async def test_tool_result_and_response_done_race_yields_one_authoritative_result(
+    voice_session, availability_stub, monkeypatch
+):
+    sent: list[dict] = []
+
+    async def capture(payload):
+        sent.append(payload)
+
+    monkeypatch.setattr(voice_session, "_send", capture)
+
+    await _caller_says(voice_session, "Book HydroLux5 Face Only for October 1st at 3 PM.")
+    await voice_session._dispatch({"type": "response.created", "response": {"id": "resp-1"}})
+    # Tool result and response.done arrive back-to-back, as they would if
+    # xAI closed the response immediately after emitting the function call.
+    await voice_session._dispatch(
+        _call_done_event(response_id="resp-1", call_id="call-1", start_iso="2026-10-01T15:00:00")
+    )
+    await voice_session._dispatch({"type": "response.done", "response": {"id": "resp-1"}})
+
+    assert _creates(sent) == []
+    assert len(_force_messages(sent)) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Correctness must not depend on xAI actually honoring tool_choice: "none".
+# These simulate the model ignoring it outright.
+# --------------------------------------------------------------------------- #
+async def test_model_ignoring_tool_choice_and_repeating_the_same_probe_is_still_blocked(
+    voice_session, availability_stub, monkeypatch
+):
+    """Full 7-step scenario: probe rejected, restricted continuation issued,
+    model calls the SAME tool again anyway (as if it ignored tool_choice),
+    duplicate-signature protection blocks it, no further response.create is
+    produced, exactly one real execution ever happens (zero, here, since
+    the very first attempt is itself the rejected one), and the call stays
+    alive (no exception) throughout."""
+    sent: list[dict] = []
+
+    async def capture(payload):
+        sent.append(payload)
+
+    monkeypatch.setattr(voice_session, "_send", capture)
+
+    await _caller_says(voice_session, "I'd like to book something.")
+    await voice_session._dispatch({"type": "response.created", "response": {"id": "resp-1"}})
+    await voice_session._dispatch(
+        _call_done_event(response_id="resp-1", call_id="call-1", start_iso="2026-10-01T15:00:00")
+    )
+    assert _outputs(sent)[0]["status"] == "ungrounded_time"
+    await voice_session._dispatch({"type": "response.done", "response": {"id": "resp-1"}})
+    assert len(_creates(sent)) == 1  # the restricted continuation
+
+    # The model ignores tool_choice: "none" and calls the tool again in the
+    # SAME new response, with the SAME arguments.
+    await voice_session._dispatch({"type": "response.created", "response": {"id": "resp-2"}})
+    await voice_session._dispatch(
+        _call_done_event(response_id="resp-2", call_id="call-2", start_iso="2026-10-01T15:00:00")
+    )
+    await voice_session._dispatch({"type": "response.done", "response": {"id": "resp-2"}})
+
+    assert availability_stub == [], "one real provider execution: zero, since nothing was ever grounded"
+    assert _outputs(sent)[1]["status"] == "duplicate_probe"
+    assert len(_creates(sent)) == 1, "no additional response.create for the blocked repeat"
+    # The call is still usable: a genuinely new turn works normally.
+    await _caller_says(voice_session, "October 1st at 3 PM, then.")
+    await voice_session._dispatch({"type": "response.created", "response": {"id": "resp-3"}})
+    await voice_session._dispatch(
+        _call_done_event(response_id="resp-3", call_id="call-3", start_iso="2026-10-01T15:00:00")
+    )
+    assert _outputs(sent)[2]["status"] == "available"
+
+
+async def test_model_varying_arguments_each_time_is_eventually_stopped_by_the_chain_depth_cap(
+    voice_session, availability_stub, monkeypatch
+):
+    """If the model ignores tool_choice AND varies its guess each time (so
+    the duplicate-signature check never matches), the hard per-turn depth
+    cap is the backstop that eventually terminates the chain."""
+    sent: list[dict] = []
+
+    async def capture(payload):
+        sent.append(payload)
+
+    monkeypatch.setattr(voice_session, "_send", capture)
+
+    await _caller_says(voice_session, "I'd like to book something.")
+    hours = [10, 11, 12, 13, 14, 15, 16, 17]
+    for i, hour in enumerate(hours):
+        await voice_session._dispatch({"type": "response.created", "response": {"id": f"resp-{i}"}})
+        await voice_session._dispatch(
+            _call_done_event(
+                response_id=f"resp-{i}", call_id=f"call-{i}",
+                start_iso=f"2026-10-01T{hour:02d}:00:00",
+            )
+        )
+        await voice_session._dispatch({"type": "response.done", "response": {"id": f"resp-{i}"}})
+
+    assert availability_stub == [], "not one of these ever-changing guesses was grounded"
+    statuses = [o["status"] for o in _outputs(sent)]
+    assert "ungrounded_time" in statuses
+    assert "tool_chain_limit" in statuses, "the depth cap must eventually trigger"
+    # The cap transfers the call into a single callback-consent state. Later
+    # stale tool calls cannot reach the provider or restart the search loop.
+    limit_index = statuses.index("tool_chain_limit")
     assert all(
-        (p.get("item") or {}).get("content", [{}])[0].get("text") != "[The caller has just connected. Greet them.]"
-        for p in sent
+        s in {"tool_chain_limit", "awaiting_callback_consent", "cancelled"}
+        for s in statuses[limit_index:]
     )
+    assert len(_force_messages(sent)) == 1
 
 
-async def test_midcall_error_does_not_retrigger_greeting(voice_session):
-    sent: list = []
+# --------------------------------------------------------------------------- #
+# response.create must be single-owner: one still-open response that saw
+# BOTH a successful and a rejected tool result must not leave a stale,
+# independently-tracked flag that fires again on some LATER, unrelated
+# response.done.
+# --------------------------------------------------------------------------- #
+async def test_mixed_success_and_rejection_in_one_response_leaves_no_stale_continuation(
+    voice_session, availability_stub, monkeypatch
+):
+    sent: list[dict] = []
 
-    async def _capture(payload):
+    async def capture(payload):
         sent.append(payload)
 
-    voice_session._send = _capture
-    await voice_session._greet()
-    await voice_session._dispatch({"type": "response.created", "response": {"id": "greet-1"}})
+    monkeypatch.setattr(voice_session, "_send", capture)
+
+    await _caller_says(voice_session, "Book HydroLux5 Face Only for October 1st at 3 PM.")
+    await voice_session._dispatch({"type": "response.created", "response": {"id": "resp-mixed"}})
+    # A successful probe first cancels the model response and speaks a
+    # backend-authored, provider-verified result...
     await voice_session._dispatch(
-        {
-            "type": "response.output_audio.delta",
-            "response": {"id": "greet-1"},
-            "delta": "AA==",
-        }
+        _call_done_event(response_id="resp-mixed", call_id="call-1", start_iso="2026-10-01T15:00:00")
     )
-    sent.clear()
-    voice_session._user_turn_count = 3
-    voice_session.session.greeting_sent = True
+    # ...so any second tool call already queued for that response is stale.
+    await voice_session._dispatch(
+        _call_done_event(response_id="resp-mixed", call_id="call-2", start_iso="2026-10-05T09:00:00")
+    )
+    assert _outputs(sent)[0]["status"] == "available"
+    assert _outputs(sent)[1]["status"] == "cancelled"
 
-    await voice_session._dispatch({"type": "error", "data": {"message": "boom"}})
+    await voice_session._dispatch({"type": "response.done", "response": {"id": "resp-mixed"}})
+    assert _creates(sent) == []
+    assert len(_force_messages(sent)) == 1
 
-    assert sent == []
-    assert "[The caller has just connected. Greet them.]" not in json.dumps(sent)
+    # A completely unrelated LATER response, with no tool calls at all,
+    # must not have its close trigger a leftover continuation.
+    await voice_session._dispatch({"type": "response.created", "response": {"id": "resp-unrelated"}})
+    await voice_session._dispatch({"type": "response.done", "response": {"id": "resp-unrelated"}})
 
-
-async def test_greeting_fallback_happens_at_most_once(voice_session):
-    sent: list = []
-
-    async def _capture(payload):
-        sent.append(payload)
-
-    voice_session._send = _capture
-    voice_session.session.greeting_sent = False
-
-    for _ in range(3):
-        await voice_session._dispatch({"type": "error", "data": {"message": "boom"}})
-
-    assert [p["type"] for p in sent] == ["conversation.item.create", "response.create"]
+    assert _creates(sent) == [], "no stale continuation fired on an unrelated response.done"
