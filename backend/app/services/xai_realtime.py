@@ -1064,7 +1064,11 @@ class XAIVoiceSession:
         # the time again, while still blocking a different model-invented time.
         #
         # The set is cleared when the caller states a new time of day.
-        self._grounded_exact_times: set[str] = set()
+        self._grounded_exact_times: set[str] = {
+            str(value)
+            for value in self.session.entities.get("caller_grounded_exact_times", [])
+            if str(value).strip()
+        }
         self._grounding_rejections: dict[tuple, int] = {}
         # Guard-rail rejections (ungrounded time/earliest, per-response cap)
         # must not autonomously re-trigger the same probe forever. These two
@@ -1206,6 +1210,7 @@ class XAIVoiceSession:
             return
         self.session.add_turn("user", text)
         self._remember_caller_service_durations(text)
+        self._remember_caller_requested_date(text)
         # A genuinely new caller turn is what can ground the NEXT exact-time
         # availability probe — see `_is_time_grounded`.
         self._user_turn_count += 1
@@ -1242,6 +1247,7 @@ class XAIVoiceSession:
                     len(self._grounded_exact_times),
                 )
             self._grounded_exact_times.clear()
+            self.session.entities.pop("caller_grounded_exact_times", None)
             # Preserve caller evidence BEFORE a tool runs. Staff/name answers
             # may arrive between the time selection and the first lookup.
             # This permits a search; it grants neither availability nor consent.
@@ -1280,6 +1286,37 @@ class XAIVoiceSession:
         if mentions:
             self.session.entities["caller_grounded_service_durations"] = mentions
 
+    def _remember_caller_requested_date(self, utterance: str) -> None:
+        """Persist the caller's active booking date until they replace it.
+
+        Consultation and service clarification can legitimately take more than
+        four turns.  A date must not disappear merely because those questions
+        pushed its transcript turn out of the short recent-history window.
+        This stores caller evidence only; model-generated tool arguments never
+        write this value.
+        """
+        text = utterance or ""
+        today = self._now().date()
+        resolved = _extract_explicit_date(text, today)
+        weekday = _extract_weekday_date(text, today)
+        if resolved is not None:
+            self.session.entities["caller_grounded_requested_date"] = {
+                "date": resolved.isoformat(),
+                "source": "weekday" if weekday == resolved else "explicit",
+            }
+            return
+        if _DATE_CANCEL_RE.search(text) or _DATE_MENTION_RE.search(text):
+            # A retraction or an unresolved date correction must not revive the
+            # older date.  Keep a tombstone so the history fallback cannot
+            # resurrect it while we wait for a new caller-provided date.
+            self._clear_caller_requested_date()
+
+    def _clear_caller_requested_date(self) -> None:
+        self.session.entities["caller_grounded_requested_date"] = {
+            "date": None,
+            "source": "cleared",
+        }
+
     def _apply_caller_service_durations(self, args: dict[str, Any]) -> None:
         services = args.get("requested_services")
         mentions = self.session.entities.get("caller_grounded_service_durations") or []
@@ -1304,6 +1341,88 @@ class XAIVoiceSession:
                 service = f"{int(best['minutes'])} minute {clean}"
             corrected.append(service)
         args["requested_services"] = corrected
+
+    def _coalesce_service_arguments(self, args: dict[str, Any]) -> None:
+        """Keep the most specific version of a single requested service.
+
+        The realtime model sometimes emits both ``requested_services`` and
+        ``service_description`` but drops the duration from the list item.  The
+        old adapter always joined the list back over the description, turning
+        "60 minute Swedish Massage" into the ambiguous "Swedish Massage".
+        Prefer a matching duration-qualified description (or the active draft)
+        while still treating a genuinely different service as a new request.
+        """
+        raw_services = args.get("requested_services")
+        if not isinstance(raw_services, list) or not raw_services:
+            description = str(args.get("service_description") or "").strip()
+            if not description:
+                return
+            raw_services = [description]
+        services = [str(value).strip() for value in raw_services if str(value).strip()]
+        if not services:
+            return
+        joined = " + ".join(services)
+        if len(services) == 1 and not re.search(
+            r"\b\d{2,3}\s*(?:minutes?|mins?)\b", joined, re.IGNORECASE
+        ):
+            candidates = [
+                str(args.get("service_description") or "").strip(),
+                str(get_draft(self.session).service_description or "").strip(),
+            ]
+            consultation = self.session.entities.get("consultation_state") or {}
+            consultation_kind = str(consultation.get("kind") or "").strip().casefold()
+            joined_words = self._service_words(joined)
+            same_modality = (
+                consultation_kind == "massage" and "massage" in joined_words
+            ) or (
+                consultation_kind == "facial" and "facial" in joined_words
+            )
+            if same_modality:
+                selected = str(consultation.get("selected_service") or "").strip()
+                recommended = str(consultation.get("recommended_service") or "").strip()
+                consultation_matches = [
+                    value for value in (selected, recommended)
+                    if value and (
+                        self._service_words(value) == joined_words
+                        or joined_words in ({"massage"}, {"facial"})
+                    )
+                ]
+                candidates.extend(consultation_matches)
+                try:
+                    minutes = int(consultation.get("selected_duration_minutes") or 0)
+                except (TypeError, ValueError):
+                    minutes = 0
+                if minutes > 0 and consultation_matches:
+                    # The consultation tool records standalone answers such as
+                    # "60" here.  Keep that caller selection tied to the same
+                    # modality instead of letting a later availability call
+                    # collapse back to an ambiguous menu family.
+                    candidates.extend(
+                        f"{minutes} minute {value}"
+                        for value in (*consultation_matches, joined)
+                        if value and not re.search(
+                            r"\b\d{2,3}\s*(?:minutes?|mins?)\b", value, re.IGNORECASE
+                        )
+                    )
+            for candidate in candidates:
+                if not candidate or not re.search(
+                    r"\b\d{2,3}\s*(?:minutes?|mins?)\b", candidate, re.IGNORECASE
+                ):
+                    continue
+                candidate_words = self._service_words(candidate)
+                if (
+                    candidate_words != joined_words
+                    and not (
+                        joined_words in ({"massage"}, {"facial"})
+                        and consultation_kind in candidate_words
+                    )
+                ):
+                    continue
+                services = [candidate]
+                joined = candidate
+                break
+        args["requested_services"] = services
+        args["service_description"] = joined
 
     def _flush_agent_turn(self) -> None:
         """Commit the accumulated agent utterance as one history turn.
@@ -2233,6 +2352,7 @@ class XAIVoiceSession:
             # appointment from being silently adopted and moved when the caller
             # asks for another service in the same call.
             start_new_intent(self.session)
+            self._grounded_exact_times.clear()
             self.session.booking_status = "collecting_details"
             self._awaiting_wrap_up = False
             current_before_proposal = get_draft(self.session)
@@ -2591,6 +2711,7 @@ class XAIVoiceSession:
             self._availability_recent.clear()
             self._rejected_probe_signatures_this_turn.clear()
             self._grounded_exact_times.clear()
+            self.session.entities.pop("caller_grounded_exact_times", None)
             self._tool_chain_depth_this_turn = 0
             self.session.entities.pop("callback_offer_pending", None)
             self.session.entities.pop("requested_availability_window", None)
@@ -2637,6 +2758,9 @@ class XAIVoiceSession:
     async def _run_start_new_appointment(self, _raw_arguments: str = "") -> str:
         """Open a second, explicitly requested booking intent."""
         start_new_intent(self.session)
+        self._grounded_exact_times.clear()
+        self._clear_caller_requested_date()
+        self.session.entities.pop("caller_grounded_service_durations", None)
         self.session.booking_status = "collecting_details"
         await self._persist_session()
         logger.info("call %s: caller requested a separate second appointment", self.call_id)
@@ -2929,15 +3053,25 @@ class XAIVoiceSession:
                         )
                     selected = consultation.get("selected_service") or {}
                     recommended = consultation.get("service") or {}
+                    selected_service_name = selected.get("name")
+                    if (
+                        not selected_service_name
+                        and same_consultation
+                        and not str(args.get("selected_service_name") or "").strip()
+                    ):
+                        selected_service_name = prior_consultation.get("selected_service")
+                    selected_duration = args.get("selected_duration_minutes")
+                    if selected_duration is None and same_consultation:
+                        selected_duration = prior_consultation.get(
+                            "selected_duration_minutes"
+                        )
                     self.session.entities["consultation_state"] = {
                         "kind": consultation_kind,
                         "answered_fields": sorted(answered),
                         "category": consultation.get("category"),
                         "recommended_service": recommended.get("name"),
-                        "selected_service": selected.get("name"),
-                        "selected_duration_minutes": args.get(
-                            "selected_duration_minutes"
-                        ),
+                        "selected_service": selected_service_name,
+                        "selected_duration_minutes": selected_duration,
                         "duration_choices": [
                             item.get("minutes")
                             for item in (consultation.get("durations") or {}).get(
@@ -3090,6 +3224,15 @@ class XAIVoiceSession:
         parsed, or if nothing recent enough establishes one at all — see
         `_RECENT_DATE_CONTEXT_TURNS`.
         """
+        remembered = self.session.entities.get("caller_grounded_requested_date")
+        if isinstance(remembered, dict):
+            if remembered.get("source") == "cleared":
+                return None
+            try:
+                return date.fromisoformat(str(remembered.get("date") or ""))
+            except ValueError:
+                self.session.entities.pop("caller_grounded_requested_date", None)
+
         today = self._now().date()
         recent = self._recent_user_utterances(_RECENT_DATE_CONTEXT_TURNS + 1)
         for utterance in recent[1:]:  # [0] is the current turn itself
@@ -3119,6 +3262,12 @@ class XAIVoiceSession:
 
     def _prior_date_is_weekday(self) -> bool:
         """True when the date still in play came from a weekday name, not a calendar date."""
+        remembered = self.session.entities.get("caller_grounded_requested_date")
+        if isinstance(remembered, dict):
+            if remembered.get("source") == "cleared":
+                return False
+            if remembered.get("date"):
+                return remembered.get("source") == "weekday"
         today = self._now().date()
         recent = self._recent_user_utterances(_RECENT_DATE_CONTEXT_TURNS + 1)
         for utterance in recent[1:]:
@@ -3308,6 +3457,9 @@ class XAIVoiceSession:
                 requested_start_iso,
             )
         self._grounded_exact_times.add(key)
+        self.session.entities["caller_grounded_exact_times"] = sorted(
+            self._grounded_exact_times
+        )
 
     async def _send_force_message(self, message: str, *, protect_playback: bool = False) -> None:
         """Speak an authoritative backend result verbatim without another model turn.
@@ -3416,6 +3568,9 @@ class XAIVoiceSession:
 
         self._booking_completed_turn = self._user_turn_count
         self.session.entities.pop("caller_grounded_service_durations", None)
+        self._clear_caller_requested_date()
+        self._grounded_exact_times.clear()
+        self.session.entities.pop("caller_grounded_exact_times", None)
 
         confirmation_key = str(payload["external_booking_id"]) + ":" + str(self.session.confirmed_datetime)
         if self.session.entities.get("spoken_booking_confirmation") == confirmation_key:
@@ -3887,9 +4042,9 @@ class XAIVoiceSession:
             except (TypeError, ValueError):
                 parsed_args = {}
             self._apply_caller_service_durations(parsed_args)
+            self._coalesce_service_arguments(parsed_args)
             cancelled = self._cancelled_slot_reference()
             if parsed_args.get("requested_services"):
-                parsed_args["service_description"] = " + ".join(parsed_args["requested_services"])
                 raw_args = json.dumps(parsed_args)
             if cancelled:
                 parsed_args.setdefault("requested_start_iso", cancelled["start_iso"])

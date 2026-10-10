@@ -638,12 +638,46 @@ def start_new_intent(session: Any) -> BookingDraft:
     session.appointment_id = None
     session.external_booking_id = None
     session.confirmed_datetime = None
+    # These compatibility fields mirror the *active* draft.  Leaving them
+    # populated makes a separate second appointment appear to inherit the
+    # service and time from the appointment that just completed, even though
+    # the new BookingDraft itself is empty.
+    session.requested_datetime = None
+    session.selected_service = None
+    session.selected_duration = None
     session.entities.pop("active_appointment_id", None)
     session.entities.pop("caller_confirmed_revision", None)
     session.entities.pop("caller_confirmed_fingerprint", None)
     session.entities.pop("card_policy_explained", None)
     session.entities.pop("card_link_consent_pending_revision", None)
     session.entities.pop("card_link_consent_authorized_revision", None)
+    # Consultation and caller-grounding state belongs to one booking intent.
+    # Clear it here, at the shared state transition, so every path that starts
+    # another appointment (including automatic post-booking routing) gets the
+    # same clean slate.  The persisted appointment itself remains untouched in
+    # the database; only pointers and transient state for the active draft are
+    # reset.
+    for key in (
+        "consultation_state",
+        "consultation_addon_names",
+        "caller_grounded_service_durations",
+        "caller_grounded_exact_times",
+        "requested_availability_window",
+        "smart_enhancement",
+        "enhancement_base_time_accepted",
+        "accepted_booking_offer",
+        "spoken_booking_offer",
+        "spoken_booking_choices",
+    ):
+        session.entities.pop(key, None)
+    # Use an explicit tombstone rather than deleting this key.  The realtime
+    # date resolver may still have the prior appointment's words in transcript
+    # history; absence would let it fall back to that old turn and resurrect
+    # the previous date for the new appointment.
+    session.entities["caller_grounded_requested_date"] = {
+        "date": None,
+        "source": "cleared",
+    }
     return draft
 
 

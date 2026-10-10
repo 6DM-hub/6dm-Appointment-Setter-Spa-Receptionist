@@ -474,6 +474,88 @@ async def test_explicit_second_appointment_is_allowed(world):
     assert len(keys) == 2, "each appointment carries its own idempotency key"
 
 
+async def test_new_intent_clears_request_memory_without_touching_saved_booking(world):
+    """A second appointment starts blank while the first remains persisted."""
+    db, session = world["db"], world["session"]
+
+    result = await _confirm(db, session, _wants(SEPT_20))
+    assert result.outcome is BookingOutcome.BOOKED
+    saved = world["store"].live[0]
+    saved_id = saved.id
+    saved_external_id = saved.external_booking_id
+    previous_booking_id = get_draft(session).booking_id
+
+    # These are all scoped to the appointment that just completed.  In
+    # particular, consultation memory must not silently select the same
+    # service or duration for a genuinely separate second appointment.
+    session.entities.update(
+        {
+            "consultation_state": {
+                "kind": "massage",
+                "selected_service": "Deep Tissue Massage",
+                "selected_duration_minutes": 60,
+            },
+            "consultation_addon_names": ["Hot Stones"],
+            "caller_grounded_requested_date": {
+                "date": "2026-09-20",
+                "source": "explicit",
+            },
+            "caller_grounded_service_durations": [
+                {"minutes": 60, "words": ["deep", "tissue", "massage"]}
+            ],
+            "requested_availability_window": [
+                "2026-09-20T12:00:00+00:00",
+                "2026-09-20T17:00:00+00:00",
+            ],
+            "smart_enhancement": {"phase": "offered"},
+            "enhancement_base_time_accepted": "old-fingerprint",
+            "accepted_booking_offer": {"revision": 1},
+            "spoken_booking_offer": {"revision": 1},
+            "spoken_booking_choices": {"revision": 1, "slots": []},
+            "booking_provider": "internal",
+        }
+    )
+    assert session.requested_datetime
+    assert session.selected_service
+    assert session.selected_duration
+
+    fresh = start_new_intent(session)
+
+    assert fresh.booking_id != previous_booking_id
+    assert fresh.service_description is None
+    assert fresh.start_iso is None
+    assert session.appointment_id is None
+    assert session.external_booking_id is None
+    assert session.confirmed_datetime is None
+    assert session.requested_datetime is None
+    assert session.selected_service is None
+    assert session.selected_duration is None
+    for key in (
+        "consultation_state",
+        "consultation_addon_names",
+        "caller_grounded_service_durations",
+        "requested_availability_window",
+        "smart_enhancement",
+        "enhancement_base_time_accepted",
+        "accepted_booking_offer",
+        "spoken_booking_offer",
+        "spoken_booking_choices",
+    ):
+        assert key not in session.entities
+    assert session.entities["caller_grounded_requested_date"] == {
+        "date": None,
+        "source": "cleared",
+    }
+    assert session.entities["booking_provider"] == "internal"
+
+    # Clearing the active-call pointers must not cancel or mutate the already
+    # successful provider-backed appointment.
+    assert len(world["store"].live) == 1
+    assert world["store"].live[0].id == saved_id
+    assert world["store"].live[0].external_booking_id == saved_external_id
+    assert world["adapter"].cancelled == []
+
+
 async def test_intent_keys_are_not_derived_from_the_requested_time(world):
     """Two callers may legitimately hold the same slot where capacity allows,
     so the key must identify the conversation, not the clock."""
