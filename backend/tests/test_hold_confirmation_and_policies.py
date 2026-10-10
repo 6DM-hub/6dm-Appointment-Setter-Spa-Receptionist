@@ -16,7 +16,7 @@ from app.services.secure_payment import (
 )
 from app.services.spa_facts import configured_vip, policy_statement
 from app.services.staff_notifications import callback_request_payload, notification_plan, notify_staff
-from app.services.xai_realtime import HOLD_ACK_TEXT, XAIVoiceSession, _caller_is_finished
+from app.services.xai_realtime import HOLD_ACK_TEXT, HOLD_ACK_TEXTS, XAIVoiceSession, _caller_is_finished
 from app.services.call_state import CallSession
 from app.services.booking_state import get_draft, save_draft
 
@@ -80,6 +80,41 @@ def test_slow_lookup_acks_then_starts_one_hold():
     asyncio.run(run())
     assert spoken == [HOLD_ACK_TEXT]
     assert started == [1]
+
+
+def test_lookup_status_rotates_without_thinking_filler():
+    voice = XAIVoiceSession("CAhold", _session())
+    voice.HOLD_ACK_DELAY_SECONDS = 0
+    voice.HOLD_TONE_DELAY_SECONDS = 0
+    voice._ws = object()
+    spoken = []
+
+    async def speak(message, **_kwargs):
+        spoken.append(message)
+
+    voice._send_force_message = speak
+
+    async def run():
+        for _ in range(3):
+            voice._hold_ack_played_this_turn = False
+            await voice._maybe_hold_ack()
+
+    asyncio.run(run())
+    assert spoken == list(HOLD_ACK_TEXTS)
+    assert all("hmm" not in line.lower() for line in spoken)
+
+
+def test_arming_availability_does_not_speak_before_five_second_timer():
+    voice = XAIVoiceSession("CAhold", _session())
+    voice._ws = object()
+    spoken = []
+
+    async def speak(message, **_kwargs):
+        spoken.append(message)
+
+    voice._send_force_message = speak
+    asyncio.run(voice._arm_availability_hold())
+    assert spoken == []
 
 
 def test_failed_and_cancelled_tool_stops_hold():

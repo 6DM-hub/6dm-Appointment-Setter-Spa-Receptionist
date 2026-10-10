@@ -641,6 +641,9 @@ def start_new_intent(session: Any) -> BookingDraft:
     session.entities.pop("active_appointment_id", None)
     session.entities.pop("caller_confirmed_revision", None)
     session.entities.pop("caller_confirmed_fingerprint", None)
+    session.entities.pop("card_policy_explained", None)
+    session.entities.pop("card_link_consent_pending_revision", None)
+    session.entities.pop("card_link_consent_authorized_revision", None)
     return draft
 
 
@@ -694,6 +697,9 @@ def bind_verified_slot(session: Any, slot: dict[str, Any] | None) -> BookingDraf
     draft.confirmation_authorized = False
     session.entities.pop("caller_confirmed_revision", None)
     session.entities.pop("caller_confirmed_fingerprint", None)
+    session.entities.pop("card_policy_explained", None)
+    session.entities.pop("card_link_consent_pending_revision", None)
+    session.entities.pop("card_link_consent_authorized_revision", None)
     save_draft(session, draft)
     return draft
 
@@ -815,6 +821,14 @@ def confirmation_block_reason(session: Any) -> str | None:
     ):
         truth("CARD_POLICY_REQUIRED", call_sid=getattr(session, "call_sid", None))
         return "card_policy_not_explained"
+    if (
+        caller_name_required_for(draft)
+        and session.entities.get("card_on_file_required")
+        and session.entities.get("card_link_consent_authorized_revision")
+        != draft.draft_revision
+    ):
+        truth("CARD_LINK_CONSENT_REQUIRED", call_sid=getattr(session, "call_sid", None))
+        return "card_link_consent_missing"
     if status != "awaiting_confirmation":
         return "not_awaiting_confirmation"
     if not draft.start_iso or not draft.service_description:
@@ -992,12 +1006,16 @@ def grounded_availability_speech(session: Any, tz: Any) -> str | None:
     return f"I have {_join_spoken_times(labels)}."
 
 
+CARD_LINK_PERMISSION_QUESTION = "Are you okay with me sending you a secure link for this?"
+
+
 CARD_ON_FILE_POLICY = (
     "To reserve your appointment, we’ll just need to place a card on file. "
     "This secure card collection step does not charge your card. "
     "Any cancellation or deposit terms depend on this business's configured policy. "
-    "If you need to add a card, I'll text you a secure link after reserving the appointment. "
-    "You can complete it after this call; please don't read card details aloud."
+    "If you need to add a card, I can text you a secure link after reserving the appointment. "
+    "You can complete it after this call; please don't read card details aloud. "
+    + CARD_LINK_PERMISSION_QUESTION
 )
 CARD_ON_FILE_HESITANT = (
     "The card is kept securely on file. Any applicable fees or deposits depend on "

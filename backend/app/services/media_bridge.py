@@ -551,7 +551,8 @@ class TwilioMediaBridge(XAIVoiceSession):
                         if (self._user_turn_count == getattr(self, "_card_policy_consent_turn", None)
                                 and not getattr(self, "_caller_speaking", False)):
                             truth("CARD_POLICY_PLAYBACK_COMPLETE", call_sid=self.call_id, revision=revision)
-                            await self._confirm_pending_booking_from_caller(self._last_user_utterance() or "")
+                            self.session.entities["card_link_consent_pending_revision"] = revision
+                            await self._persist_session()
                     else:
                         truth("CONFIRMATION_QUESTION_PLAYED", call_sid=self.call_id, revision=revision)
                         self._confirmation_played(revision)

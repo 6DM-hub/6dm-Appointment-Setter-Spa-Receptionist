@@ -10,6 +10,7 @@ from tests.test_confirmation_pause import pending_voice
 from tests.test_square_timezone_and_staff import _ctx, _square_adapter, _FakeSquareTransport
 from tests.conftest import make_spa
 from app.models import BookingProvider
+from app.services.appointment_booking_service import BookingOutcome, BookingResult
 
 
 @pytest.mark.asyncio
@@ -107,6 +108,33 @@ async def test_duplicate_proposal_reuses_verified_result(monkeypatch):
         "service_description": "90 minute Deep Tissue", "operation": "schedule"})))
     assert output["status"] == "draft"
     assert output["spoken"] is None
+
+
+@pytest.mark.asyncio
+async def test_later_schedule_request_after_success_starts_separate_intent(monkeypatch):
+    voice = pending_voice()
+    old = get_draft(voice.session)
+    old.appointment_id = "local-old"
+    old.external_booking_id = "square-old"
+    save_draft(voice.session, old)
+    voice.session.appointment_id = "local-old"
+    voice.session.external_booking_id = "square-old"
+    voice.session.booking_status = "booked"
+    voice._booking_completed_turn = 3
+    voice._user_turn_count = 4
+    voice.session.add_turn("user", "I also want a facial and massage on Wednesday morning")
+
+    async def staged(_db, session, _intent):
+        assert not get_draft(session).is_persisted
+        return BookingResult(BookingOutcome.MISSING_INFO, message="Need a time.")
+
+    monkeypatch.setattr("app.services.xai_realtime.stage_booking", staged)
+    await voice._run_propose_appointment(json.dumps({
+        "requested_services": ["60 minute European Facial", "90 minute Deep Tissue Massage"],
+        "requested_start_iso": "2026-10-14T09:00:00",
+    }))
+    assert get_draft(voice.session).appointment_id is None
+    assert get_draft(voice.session).booking_id != old.booking_id
 
 
 @pytest.mark.asyncio

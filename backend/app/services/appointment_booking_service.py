@@ -1629,16 +1629,21 @@ async def confirm_booking(
     block = confirmation_block_reason(session)
     if block:
         truth("CONFIRMATION_REJECTED", reason=block, revision=draft.draft_revision)
-        if block == "card_policy_not_explained":
+        if block in {"card_policy_not_explained", "card_link_consent_missing"}:
             if session.booking_status not in {"booked", "rescheduled", "conflict"}:
                 session.booking_status = "awaiting_confirmation"
-            from app.services.booking_state import CARD_ON_FILE_POLICY
+            from app.services.booking_state import CARD_LINK_PERMISSION_QUESTION, CARD_ON_FILE_POLICY
 
             return BookingResult(
                 BookingOutcome.MISSING_INFO,
                 message=(
                     "Cannot book yet. Say this to the caller before booking, "
-                    f"and do not paraphrase it: {CARD_ON_FILE_POLICY}"
+                    "and do not paraphrase it: "
+                    + (
+                        CARD_ON_FILE_POLICY
+                        if block == "card_policy_not_explained"
+                        else CARD_LINK_PERMISSION_QUESTION
+                    )
                 ),
             )
         session.booking_status = (

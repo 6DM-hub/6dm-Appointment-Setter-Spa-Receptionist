@@ -57,6 +57,7 @@ from app.services.booking_conversation import (remember_offer, accept_offer, off
 from app.services.booking_state import (
     CALLER_NAME_QUESTION,
     CARD_ON_FILE_HESITANT,
+    CARD_LINK_PERMISSION_QUESTION,
     CARD_ON_FILE_POLICY,
     authoritative_availability_speech,
     booking_card_speech,
@@ -103,7 +104,12 @@ from app.services.receptionist_identity import incoming_greeting
 
 logger = logging.getLogger(__name__)
 
-HOLD_ACK_TEXT = "Hmm. Let me check that for you."
+HOLD_ACK_TEXTS = (
+    "I'm still looking into those available times for you.",
+    "I'm still checking the schedule for those openings.",
+    "I'm checking a little further for the best available times.",
+)
+HOLD_ACK_TEXT = HOLD_ACK_TEXTS[0]
 AVAILABILITY_CACHE_SECONDS = 3
 
 _SESSION_RESTART_GREETING_RE = re.compile(
@@ -183,8 +189,9 @@ _EARLIEST_REQUEST_RE = re.compile(
 )
 
 _RESCHEDULE_REQUEST_RE = re.compile(
-    r"\b(reschedule|move|change)\b.{0,40}\b(appointment|booking|it|that)\b|"
-    r"\b(appointment|booking)\b.{0,40}\b(reschedule|move|change)\b",
+    r"\b(reschedule|move|change|switch)\b.{0,40}\b(appointment|booking|it|that)\b|"
+    r"\b(appointment|booking)\b.{0,40}\b(reschedule|move|change|switch)\b|"
+    r"\b(?:make|move|switch)\s+(?:it|that)\b",
     re.IGNORECASE,
 )
 
@@ -896,7 +903,7 @@ class XAIVoiceSession:
     #: confirm), low enough that a rejection loop cannot run away even if
     #: every other guard were somehow bypassed. Resets on each new turn.
     MAX_TOOL_CHAIN_DEPTH_PER_TURN = 6
-    HOLD_ACK_DELAY_SECONDS = 1.5
+    HOLD_ACK_DELAY_SECONDS = 5.0
     HOLD_TONE_DELAY_SECONDS = 1.2
     GREETING_WATCHDOG_SECONDS = 2.5
 
@@ -989,6 +996,8 @@ class XAIVoiceSession:
         self._restricted_response_needed_after_tool = False
         self._inflight_tools: set[asyncio.Task] = set()
         self._hold_ack_played_this_turn = False
+        self._hold_ack_index = 0
+        self._booking_completed_turn: int | None = None
 
         self._availability_recent: dict[str, tuple[float, str]] = {}
         self._availability_lookup_open = False
@@ -1264,6 +1273,31 @@ class XAIVoiceSession:
         draft = get_draft(self.session)
         if self.session.booking_status not in {"awaiting_confirmation", "collecting_details", "conflict"}:
             return False
+        pending_card_revision = self.session.entities.get("card_link_consent_pending_revision")
+        if pending_card_revision is not None:
+            if pending_card_revision != draft.draft_revision:
+                self.session.entities.pop("card_link_consent_pending_revision", None)
+            elif utterance_modifies_booking(caller_text):
+                return False
+            elif is_affirmative(caller_text):
+                self.session.entities.pop("card_link_consent_pending_revision", None)
+                self.session.entities["card_link_consent_authorized_revision"] = draft.draft_revision
+                truth(
+                    "CARD_LINK_CONSENT_ACCEPTED",
+                    call_sid=self.call_id,
+                    revision=draft.draft_revision,
+                )
+            elif caller_text.strip().casefold() in {"no", "no thanks", "no thank you", "not now"}:
+                await self._cancel_active_response()
+                await self._send_force_message(
+                    "Okay. I won't send the link, and the appointment has not been reserved."
+                )
+                return True
+            elif looks_card_hesitant(caller_text):
+                await self._send_force_message(CARD_ON_FILE_HESITANT)
+                return True
+            else:
+                return False
         # Selecting a time we actually offered is consent, not a request to
         # restart availability or ask a second approval question.
         selected_now = False
@@ -1393,7 +1427,8 @@ class XAIVoiceSession:
         return bool(
             caller_name_required_for(draft)
             and self.session.entities.get("card_on_file_required")
-            and not self.session.entities.get("card_policy_explained")
+            and self.session.entities.get("card_link_consent_authorized_revision")
+            != draft.draft_revision
         )
 
     def _next_collection_line(self) -> str | None:
@@ -1461,11 +1496,14 @@ class XAIVoiceSession:
         if not (draft.confirmation_authorized
                 and self.session.entities.get("caller_confirmed_revision") == draft.draft_revision):
             return
+        already_explained = bool(self.session.entities.get("card_policy_explained"))
         self.session.entities["card_policy_explained"] = True
         if self.session.booking_status not in {"booked", "rescheduled", "conflict"}:
             self.session.booking_status = "awaiting_confirmation"
         truth("CARD_POLICY_SPOKEN", call_sid=self.call_id)
-        await self._send_force_message(CARD_ON_FILE_POLICY)
+        await self._send_force_message(
+            CARD_LINK_PERMISSION_QUESTION if already_explained else CARD_ON_FILE_POLICY
+        )
 
     async def _speak_collection_line(self, line: str) -> None:
         if line == CALLER_NAME_QUESTION:
@@ -1866,6 +1904,28 @@ class XAIVoiceSession:
                 else "schedule"
             )
 
+        current_before_proposal = get_draft(self.session)
+        if (
+            operation == "schedule"
+            and current_before_proposal.is_persisted
+            and self.session.booking_status in {"booked", "rescheduled"}
+            and self._booking_completed_turn is not None
+            and self._user_turn_count > self._booking_completed_turn
+        ):
+            # Once one booking has succeeded, a later ordinary schedule request
+            # is a separate appointment. Explicit change/move language above is
+            # still routed through the reschedule path. This prevents the first
+            # appointment from being silently adopted and moved when the caller
+            # asks for another service in the same call.
+            start_new_intent(self.session)
+            self.session.booking_status = "collecting_details"
+            self._awaiting_wrap_up = False
+            current_before_proposal = get_draft(self.session)
+            logger.info(
+                "call %s: opening a new booking intent after prior provider success",
+                self.call_id,
+            )
+
         try:
             intent = AppointmentIntent(confidence=1.0, intent=operation, **args)
         except Exception:
@@ -2024,12 +2084,17 @@ class XAIVoiceSession:
                         "status": "rejected", "booked": False,
                         "message": "Wait for a clear yes to the current read-back. Do not explain card collection or book from silence.",
                     })
+                line = (
+                    CARD_LINK_PERMISSION_QUESTION
+                    if self.session.entities.get("card_policy_explained")
+                    else CARD_ON_FILE_POLICY
+                )
                 return json.dumps({
                     "status": "missing_info",
                     "booked": False,
                     "message": (
                         "Cannot book yet. Say this to the caller before booking, "
-                        f"and do not paraphrase it: {CARD_ON_FILE_POLICY}"
+                        f"and do not paraphrase it: {line}"
                     ),
                 })
             if utterance_modifies_booking(last):
@@ -2855,6 +2920,9 @@ class XAIVoiceSession:
             self._card_policy_playback_revision = draft.draft_revision
             self._card_policy_consent_turn = self._user_turn_count
             self._card_policy_response_id = None
+        elif message == CARD_LINK_PERMISSION_QUESTION:
+            draft = get_draft(self.session)
+            self.session.entities["card_link_consent_pending_revision"] = draft.draft_revision
         if protect_playback:
             self._protect_playback = True
         if "anything else I can help you with today" in message:
@@ -2922,54 +2990,12 @@ class XAIVoiceSession:
         if tool_name != CONFIRM_APPOINTMENT_TOOL["name"]:
             return None
         if status == "conflict":
-            alternatives = grounded_availability_speech(self.session, self._tz)
-            return (
-                "It looks like that time was just taken, but I can check the next closest openings for you. "
-                + (alternatives + " Which time would you prefer?" if alternatives
-                   else "Would you like me to check another day?")
-            )
-        if status not in {"booked", "rescheduled"}:
-            return None
-        if not payload.get("appointment_id") or not payload.get("external_booking_id"):
-            return None
-
-        confirmation_key = str(payload["external_booking_id"]) + ":" + str(self.session.confirmed_datetime)
-        if self.session.entities.get("spoken_booking_confirmation") == confirmation_key:
-            return ""
-        self.session.entities["spoken_booking_confirmation"] = confirmation_key
-        service = (self.session.selected_service or "appointment").strip()
-        provider = (get_draft(self.session).preferred_staff or "").strip()
-        with_provider = f" with {provider}" if provider else ""
-        confirmed = self.session.confirmed_datetime
-
-        def finish(sentence: str) -> str:
-            slot = get_draft(self.session).selected_slot or {}
-            if slot.get("visit_segments"):
-                itinerary = []
-                for item in slot["visit_segments"]:
-                    begins = datetime.fromisoformat(item["start"]).astimezone(self._tz).strftime("%I:%M %p").lstrip("0")
-                    ends = datetime.fromisoformat(item["end"]).astimezone(self._tz).strftime("%I:%M %p").lstrip("0")
-                    staff = f" with {item['provider_name']}" if item.get("provider_name") else ""
-                    itinerary.append(f"{item['service_name']} from {begins} to {ends}{staff}")
-                sentence = sentence.replace("Is there anything else I can help you with today?", "")
-                sentence += " Your visit includes " + "; then ".join(itinerary) + f". Total visit time is {slot['duration_minutes']} minutes. Is there anything else I can help you with today?"
-            if payload.get("card_status") == "pending_card":
-                sentence = sentence.replace("You're all set. ", "")
-                sentence = sentence.replace("is confirmed", "is reserved pending your card on file")
-            clause = booking_card_speech(payload.get("card_status"), payload.get("card_sms"))
-            question = " Is there anything else I can help you with today?"
+            alternatives = else I can help you with today?", "")
+                sentence += " Your visit includes " + "; then ".join(itinerary) + f". Total visit time is {slot['duration_minutes']} minutes. Is there anstion = " Is there anything else I can help you with today?"
             truth(
                 "BOOKING_CONFIRMATION_SPOKEN",
                 call_sid=self.call_id,
-                card_status=payload.get("card_status") or "none",
-                card_sms=payload.get("card_sms") or "not_attempted",
-            )
-            if sentence.endswith(question):
-                return sentence[: -len(question)] + clause + question
-            return sentence + clause
-
-        if not confirmed:
-            # Still avoid an invented greeting even if the local display time is
+                card_sy time is
             # unexpectedly unavailable; provider IDs prove the write succeeded.
             verb = "confirmed" if status == "booked" else "rescheduled"
             return finish(
@@ -2987,23 +3013,13 @@ class XAIVoiceSession:
             if spoken_time.endswith(":00 AM") or spoken_time.endswith(":00 PM"):
                 spoken_time = spoken_time.replace(":00 ", " ")
         except (TypeError, ValueError):
-            verb = "confirmed" if status == "booked" else "rescheduled"
-            return finish(
-                f"You're all set. Your {service} appointment{with_provider} is {verb}. "
-                "Is there anything else I can help you with today?"
+            verb = "confirmed" if status == "book you with today?"
             )
 
         self._awaiting_wrap_up = True
         if status == "rescheduled":
             return finish(
-                f"You're all set. Your {service} appointment{with_provider} has been moved to "
-                f"{day} at {spoken_time}. "
-                "Is there anything else I can help you with today?"
-            )
-        return finish(
-            f"You're all set. Your {service} appointment{with_provider} is confirmed for "
-            f"{day} at {spoken_time}. "
-            "Is there anything else I can help you with today?"
+                f"You're all set. Your {service} appth today?"
         )
 
     async def _send_function_output(
@@ -3012,65 +3028,12 @@ class XAIVoiceSession:
         output: str,
         *,
         cache: bool = True,
-        nudge: bool = True,
-        restrict_continuation: bool = False,
-    ) -> None:
-        """Send one `function_call_output`, optionally caching it for replay
-        on a duplicate `call_id` and nudging the model to continue.
-
-        The nudge is skipped whenever a response is still open — see the
-        comment at the bottom of `_handle_function_call`.
-
-        `restrict_continuation` marks this as a guard-rail REJECTION (ungrounded
-        time/earliest, per-response cap, duplicate probe, chain-depth limit):
-        the model still needs to say something to the caller, but the
-        continuation this triggers must not be free to call a tool again —
-        that is exactly the autonomous retry loop this exists to prevent. The
-        continuation is sent with `tool_choice: "none"` so it can only speak.
-        """
-        if cache and call_ref:
-            self._call_id_outputs[call_ref] = output
-        await self._send(
-            {
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "function_call_output",
-                    "call_id": call_ref,
-                    "output": output,
-                },
-            }
-        )
-        if not nudge:
-            return
-
-        response_create: dict[str, Any] = {"type": "response.create"}
-        if restrict_continuation:
-            response_create["response"] = {"tool_choice": "none"}
-
-        if self._active_response_id is None:
-            self._log_tool_continuation(
-                "issued",
-                reason="restricted_followup" if restrict_continuation else "tool_result_complete",
-            )
-            await self._send(response_create)
-        else:
-            # The function call belongs to the response that is still open.
-            # Starting another response now would overlap/stack responses,
-            # so defer exactly one continuation until response.done.
-            if restrict_continuation:
-                self._restricted_response_needed_after_tool = True
-            else:
-                self._response_needed_after_tool = True
-            self._log_tool_continuation(
-                "deferred",
-                reason="restricted_followup" if restrict_continuation else "tool_result_complete",
+        nudge: bool omplete",
                 active_response_id=self._active_response_id,
             )
 
     def _log_tool_continuation(self, decision: str, **fields: Any) -> None:
-        """Structured log line for every response.create decision this
-        module makes, so a runaway tool-continuation chain is diagnosable
-        from logs alone: `TOOL_CONTINUATION <decision> call=... turn=... ...`.
+        """Structured log.. ...`.
         """
         parts = " ".join(f"{key}={value}" for key, value in fields.items())
         logger.info(
@@ -3082,26 +3045,11 @@ class XAIVoiceSession:
             parts,
         )
 
-    async def _arm_availability_hold(self) -> None:
-        """Mute the in-flight model response and speak the hold line immediately."""
+    async def _arm_availae provider is still working after five seconds.
+        """
         self._availability_lookup_open = True
         self._availability_speech_interrupted = False
-        self._availability_model_response_id = self._active_response_id
-        self._muted_availability_response_id = self._active_response_id
-        self._availability_hold_response_id = None
-        self._availability_hold_done = False
-        self._availability_expect_hold = False
-        self._pending_availability_speech = None
-        draft = get_draft(self.session)
-        hold_key = (draft.start_iso, draft.service_description, draft.preferred_staff)
-        if (not self._hold_ack_played_this_turn and self._ws is not None
-                and hold_key != getattr(self, "_spoken_hold_request", None)):
-            self._spoken_hold_request = hold_key
-            self._hold_ack_played_this_turn = True
-            self._availability_expect_hold = True
-            await self._send_force_message(HOLD_ACK_TEXT)
-
-    async def _record_enhancement(self, status: str, **extra) -> None:
+        self._availability_me:
         from app.services.enhancements import record
         try:
             async with AsyncSessionLocal() as db:
@@ -3181,7 +3129,7 @@ class XAIVoiceSession:
                 await self._speak_availability(str(spoken))
 
     async def _maybe_hold_ack(self) -> None:
-        """Speak once if a provider lookup is still running, then a soft tone."""
+        """After five seconds, speak one varied status line, then a soft tone."""
         try:
             await asyncio.sleep(self.HOLD_ACK_DELAY_SECONDS)
         except asyncio.CancelledError:
@@ -3190,8 +3138,12 @@ class XAIVoiceSession:
             return
         if not self._hold_ack_played_this_turn:
             self._hold_ack_played_this_turn = True
-            logger.info("HOLD_ACK call=%s", self.call_id)
-            await self._send_force_message(HOLD_ACK_TEXT)
+            message = HOLD_ACK_TEXTS[self._hold_ack_index % len(HOLD_ACK_TEXTS)]
+            self._hold_ack_index += 1
+            if self._availability_lookup_open:
+                self._availability_expect_hold = True
+            logger.info("HOLD_ACK call=%s variant=%d", self.call_id, self._hold_ack_index)
+            await self._send_force_message(message)
         try:
             await asyncio.sleep(self.HOLD_TONE_DELAY_SECONDS)
         except asyncio.CancelledError:
@@ -3608,6 +3560,8 @@ class XAIVoiceSession:
             elif CARD_ON_FILE_POLICY in confirm_message:
                 forced_followup = CARD_ON_FILE_POLICY
                 self.session.entities["card_policy_explained"] = True
+            elif CARD_LINK_PERMISSION_QUESTION in confirm_message:
+                forced_followup = CARD_LINK_PERMISSION_QUESTION
         if forced_followup is not None:
             await self._send_function_output(call_ref, output, nudge=False)
             if self._active_response_id is None:

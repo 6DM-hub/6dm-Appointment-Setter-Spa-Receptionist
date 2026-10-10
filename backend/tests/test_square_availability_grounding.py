@@ -33,7 +33,7 @@ from app.services.business_hours import resolve_timezone
 from app.services.call_state import CallSession
 from app.services.grok_service import AppointmentIntent
 from app.services.media_bridge import TwilioMediaBridge, mulaw_silence
-from app.services.xai_realtime import XAIVoiceSession, cached_availability_output
+from app.services.xai_realtime import HOLD_ACK_TEXT, XAIVoiceSession, cached_availability_output
 
 
 TZ = resolve_timezone("America/Chicago")
@@ -700,6 +700,7 @@ async def test_hold_phrase_is_audible_before_square_and_result_follows(monkeypat
     voice._ws = object()
     voice._active_response_id = "model-1"
     voice._persist_session = _async_none
+    voice.HOLD_ACK_DELAY_SECONDS = 0
     release = asyncio.Event()
     started = asyncio.Event()
 
@@ -717,15 +718,16 @@ async def test_hold_phrase_is_audible_before_square_and_result_follows(monkeypat
         "arguments": '{"requested_start_iso":"2026-10-02T15:00:00","service_description":"Swedish"}',
     }))
     await asyncio.wait_for(started.wait(), timeout=2)
-    assert order == ["Hmm. Let me check that for you."]
+    await asyncio.sleep(0.01)
+    assert order == [HOLD_ACK_TEXT]
     assert voice._muted_availability_response_id == "model-1"
     await voice._dispatch({"type": "response.created", "response": {"id": "hold-1"}})
     release.set()
     await task
-    assert order == ["Hmm. Let me check that for you."]
+    assert order == [HOLD_ACK_TEXT]
     assert voice._pending_availability_speech and "3 PM" in voice._pending_availability_speech
     await voice._dispatch({"type": "response.done", "response": {"id": "hold-1"}})
-    assert order[0] == "Hmm. Let me check that for you."
+    assert order[0] == HOLD_ACK_TEXT
     assert "3 PM is available" in order[-1]
 
 
@@ -923,6 +925,7 @@ def _texts(sent: list[dict]) -> list[str]:
 async def test_time_change_proposal_is_spoken_by_the_server_then_books_once(monkeypatch):
     calendar = _ElevenCalendar(eleven_fifteen_available=True)
     voice, sent = _voice_for_proposal(monkeypatch, calendar)
+    voice.HOLD_ACK_DELAY_SECONDS = 0
     await stage_booking(
         _FakeDB(),
         voice.session,
@@ -939,14 +942,15 @@ async def test_time_change_proposal_is_spoken_by_the_server_then_books_once(monk
     calendar.block_next = True
     task = await _propose(voice, "2026-10-03T11:15:00")
     await asyncio.wait_for(calendar.started.wait(), timeout=2)
-    assert _texts(sent) == ["Hmm. Let me check that for you."]
+    await asyncio.sleep(0.01)
+    assert _texts(sent) == [HOLD_ACK_TEXT]
     await voice._dispatch({"type": "response.created", "response": {"id": "hold-1"}})
     calendar.release.set()
     await task
     assert not any(item.get("type") == "response.create" for item in sent)
     await voice._dispatch({"type": "response.done", "response": {"id": "hold-1"}})
     spoken = _texts(sent)
-    assert spoken[0] == "Hmm. Let me check that for you."
+    assert spoken[0] == HOLD_ACK_TEXT
     # Collect a missing name before asking permission to book. Never append a
     # second question immediately after the booking approval question.
     assert "11:15 AM is available" in spoken[-1]

@@ -160,6 +160,9 @@ async def test_booking_waits_for_yes_and_card_playback_before_create():
     assert socket.sent[-1]["mark"]["name"].startswith("card-policy-")
     socket.inbound = [{"event": "mark", "mark": socket.sent[-1]["mark"]}]
     await voice._pump_twilio_to_xai()
+    assert writes == []
+    assert voice.session.entities["card_link_consent_pending_revision"] == 0
+    assert await voice._confirm_pending_booking_from_caller("yes")
     assert len(writes) == 1
 
 

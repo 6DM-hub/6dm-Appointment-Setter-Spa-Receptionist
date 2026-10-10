@@ -7,6 +7,7 @@ import pytest
 
 from app.services.appointment_booking_service import BookingOutcome, confirm_booking
 from app.services.booking_state import (
+    CARD_LINK_PERMISSION_QUESTION,
     CARD_ON_FILE_HESITANT,
     CARD_ON_FILE_POLICY,
     CALLER_NAME_QUESTION,
@@ -209,7 +210,17 @@ def test_card_policy_blocks_confirmation_until_it_has_been_spoken():
     save_draft(session, draft)
     assert confirmation_block_reason(session) == "card_policy_not_explained"
     session.entities["card_policy_explained"] = True
-    assert confirmation_block_reason(session) != "card_policy_not_explained"
+    assert confirmation_block_reason(session) == "card_link_consent_missing"
+    session.entities["card_link_consent_authorized_revision"] = draft.draft_revision
+    assert confirmation_block_reason(session) != "card_link_consent_missing"
+
+
+def test_card_policy_asks_permission_after_the_safety_warning():
+    warning = "please don't read card details aloud"
+    assert warning in CARD_ON_FILE_POLICY
+    assert CARD_ON_FILE_POLICY.index(warning) < CARD_ON_FILE_POLICY.index(
+        CARD_LINK_PERMISSION_QUESTION
+    )
 
 
 @pytest.mark.asyncio
