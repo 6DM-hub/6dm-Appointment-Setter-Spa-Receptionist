@@ -388,13 +388,9 @@ async def test_barge_in_clears_over_a_second_of_queued_audio_and_drops_late_stra
     bridge._playback_task = asyncio.create_task(bridge._playback_worker())
     try:
         # 60 frames * 20ms = 1.2s queued for the response about to be cut off.
-        await bridge._dispatch(
-            {
-                "type": "response.output_audio.delta",
-                "response_id": "resp-old",
-                "delta": mulaw_silence(60),
-            }
-        )
+        # Seed genuinely queued audio without giving the faster worker its
+        # deliberate dispatch yield before we simulate the interruption.
+        bridge._enqueue_audio(mulaw_silence(60))
         assert bridge._play_queue.qsize() > 0
 
         await bridge._dispatch({"type": "input_audio_buffer.speech_started"})
@@ -434,7 +430,22 @@ async def test_barge_in_clears_over_a_second_of_queued_audio_and_drops_late_stra
         "only the new response's audio may have reached Twilio"
     )
     assert bridge.twilio.sent[0] == {"event": "clear", "streamSid": "MZ1234567890"}
-    assert bridge.xai_sent == [{"type": "response.cancel"}]
+    # Server VAD already cancelled generation; the bridge only clears playback.
+    assert bridge.xai_sent == []
+
+
+async def test_buffered_audio_dispatch_yields_to_playback_writer(bridge):
+    bridge._playback_task = asyncio.create_task(bridge._playback_worker())
+    try:
+        for _ in range(20):
+            await bridge._dispatch({"type": "response.output_audio.delta", "delta": mulaw_silence(1)})
+        assert bridge._play_queue.qsize() < 20
+        await bridge._play_queue.join()
+        assert len([m for m in bridge.twilio.sent if m.get("event") == "media"]) == 20
+    finally:
+        bridge._playback_task.cancel()
+        await asyncio.gather(bridge._playback_task, return_exceptions=True)
+        bridge._playback_task = None
 
 
 async def test_confirmation_audio_is_not_dropped_after_stale_clear(bridge):

@@ -649,6 +649,7 @@ def proposal_fingerprint(draft: BookingDraft) -> str:
     slot = draft.selected_slot or {}
     payload = {
         "service": (draft.service_description or "").strip().casefold(),
+        "visit_segments": slot.get("visit_segments") or [],
         "variation_id": str(slot.get("service_variation_id") or ""),
         "variation_version": str(slot.get("service_variation_version") or ""),
         "start": str(slot.get("start") or draft.start_iso or ""),
@@ -993,13 +994,14 @@ def grounded_availability_speech(session: Any, tz: Any) -> str | None:
 
 CARD_ON_FILE_POLICY = (
     "To reserve your appointment, we’ll just need to place a card on file. "
-    "Your card won’t be charged today—it’s simply required for our 24-hour cancellation policy. "
+    "This secure card collection step does not charge your card. "
+    "Any cancellation or deposit terms depend on this business's configured policy. "
     "If you need to add a card, I'll text you a secure link after reserving the appointment. "
     "You can complete it after this call; please don't read card details aloud."
 )
 CARD_ON_FILE_HESITANT = (
-    "The card is kept securely on file and is only charged if the appointment is "
-    "canceled or rescheduled with less than 24 hours’ notice, or in the event of a no-show."
+    "The card is kept securely on file. Any applicable fees or deposits depend on "
+    "this business's configured policy; I can check those terms for you."
 )
 
 

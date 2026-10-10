@@ -177,7 +177,9 @@ async def test_connection(connection: GoogleCalendarConnection) -> dict[str, Any
 def _event_times(start: datetime, end: datetime, timezone_name: str) -> tuple[dict, dict]:
     from app.services.business_hours import resolve_timezone, timezone_label
 
-    tz = resolve_timezone(timezone_name)
+    from app.services.scheduling_time import business_zone, utc_instant
+    tz = business_zone(timezone_name)
+    start, end = utc_instant(start), utc_instant(end)
     return (
         {"dateTime": start.astimezone(tz).isoformat(), "timeZone": timezone_label(tz)},
         {"dateTime": end.astimezone(tz).isoformat(), "timeZone": timezone_label(tz)},

@@ -56,7 +56,7 @@ class _FakeTransport:
         # Exception instance to raise, consumed in order per search call.
         self.customer_search_results: list[object] = [[]]
         self.create_customer_results: list[object] = [{"customer": {"id": "cust_new"}}]
-        self.created_booking: dict = {"id": "sq_book_1"}
+        self.created_booking: dict = {"id": "sq_book_1", "status": "ACCEPTED"}
 
     async def __call__(self, method: str, path: str, *, json: dict | None = None) -> dict:
         self.calls.append((method, path, json or {}))
@@ -224,7 +224,7 @@ async def test_full_booking_succeeds_end_to_end_after_idempotency_recovery(monke
             code="IDEMPOTENCY_KEY_REUSED",
         ),
     ]
-    transport.created_booking = {"id": "sq_book_42"}
+    transport.created_booking = {"id": "sq_book_42", "status": "ACCEPTED"}
     adapter = _adapter(monkeypatch, transport)
 
     result = await adapter.create_booking(_ctx())

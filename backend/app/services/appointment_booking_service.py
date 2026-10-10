@@ -15,6 +15,7 @@ control:
 An inbound spa conversation therefore cannot reach Dominic's calendar, and one
 spa's receptionist cannot see another spa's diary.
 """
+import json
 import logging
 import uuid
 import asyncio
@@ -32,6 +33,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.tenancy import TenantScope, scope_columns, scope_filter
 from app.models import Appointment, AppointmentStatus, CallLog, Contact, SpaAccount
+from app.services.booking_escalations import unresolved_booking as _unresolved_booking
 from app.models.appointment import CardStatus
 from app.services.booking_adapters import (
     BookingAdapter,
@@ -42,6 +44,7 @@ from app.services.booking_adapters import (
     get_booking_adapter,
 )
 from app.services.business_hours import resolve_timezone
+from app.services.scheduling_time import business_zone, localize_wall_time, elapsed_end, utc_instant
 from app.services.customer_links import upsert_external_customer_link
 from app.services.card_status import card_status_for_booked_appointment
 from app.services.phone_numbers import canonical_customer_phone, is_non_phone_caller_id
@@ -173,7 +176,10 @@ def _parse_dt(value: str | None, local_tz: tzinfo_type | None = None) -> datetim
         return None
     if dt.tzinfo is None:
         tz = local_tz or timezone.utc
-        localized = dt.replace(tzinfo=tz)
+        try:
+            localized = localize_wall_time(dt, tz)
+        except ValueError:
+            return None
         logger.info(
             "booking datetime %r had no UTC offset; localized to tz=%s -> %s",
             value,
@@ -387,7 +393,9 @@ async def _lock_slot(db: AsyncSession, scope: TenantScope, start: datetime, end:
     """Serialize same-scope slot checks when running against PostgreSQL."""
     bind = getattr(db, "bind", None)
     if bind is not None and bind.dialect.name == "postgresql":
-        key = f"{scope.tenant_id or scope.owner_id}:{start.isoformat()}:{end.isoformat()}"
+        # Overlapping intervals with different starts/durations must share
+        # a lock too; an exact-interval key allows both checks to race.
+        key = f"booking-calendar:{scope.tenant_id or scope.owner_id}"
         await db.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"), {"key": key})
 
 
@@ -406,6 +414,16 @@ async def _calendar_call(operation: str, call_sid: str, awaitable):
     truth("BOOKING_PROVIDER", operation=operation, call_sid=call_sid)
     try:
         result = await asyncio.wait_for(awaitable, timeout=CALENDAR_TIMEOUT_SECONDS)
+    except BookingProviderError:
+        # Preserve provider category/retryability; wrapping discarded Square's
+        # permission, conflict and uncertain-outcome codes.
+        raise
+    except asyncio.TimeoutError as exc:
+        raise BookingProviderError(
+            f"{operation} timed out",
+            code="BOOKING_OUTCOME_UNKNOWN" if operation == "create_booking" else "PROVIDER_TIMEOUT",
+            retryable=operation != "create_booking",
+        ) from exc
     except Exception as exc:
         logger.exception("Calendar error: call_sid=%s operation=%s error=%s", call_sid, operation, exc)
         raise BookingProviderError(f"{operation} failed: {exc}") from exc
@@ -448,6 +466,7 @@ def _nearest_openings(
 def _availability_generation(draft: Any) -> tuple[Any, ...]:
     """Identity of the booking request a completed lookup is allowed to speak."""
     return (
+        getattr(draft, "booking_id", None),
         int(getattr(draft, "draft_revision", 0) or 0),
         (getattr(draft, "service_description", None) or "").strip().casefold(),
         getattr(draft, "start_iso", None) or "",
@@ -507,8 +526,8 @@ async def _available_alternatives(
         way.
     """
     suggestions: list[tuple[datetime, dict[str, Any] | None]] = []
-    candidate = requested_start + timedelta(minutes=30)
-    horizon = requested_start + SEARCH_HORIZON
+    candidate = utc_instant(requested_start) + timedelta(minutes=30)
+    horizon = utc_instant(requested_start) + SEARCH_HORIZON
     provider_checks = 0
 
     while candidate < horizon and provider_checks < MAX_PROVIDER_CHECKS:
@@ -689,7 +708,7 @@ def _remember_menu_identity(
         return
     draft = get_draft(session)
     phrase = intent.service_description or draft.service_description
-    if phrase:
+    if phrase and len(adapter.requested_services(phrase)) == 1:
         resolution = adapter.resolve_service(phrase)
         if resolution.status == "resolved" and resolution.entry is not None:
             entry = resolution.entry
@@ -834,6 +853,9 @@ async def _prepare(db: AsyncSession, session: CallSession) -> _Routing:
     if spa is not None:
         from app.services.spa_facts import payment_policy_of
 
+        session.entities["smart_enhancements_enabled"] = bool(
+            (getattr(spa, "enhancement_settings", None) or {}).get("enabled")
+        )
         policy = payment_policy_of(spa)
         session.entities["card_on_file_required"] = bool(
             policy.get("card_required")
@@ -868,6 +890,8 @@ async def _notify_staff_event(spa: SpaAccount | None, event: str, summary: str) 
 
 
 async def _notify_provider_error(session: CallSession, summary: str) -> None:
+    if session.call_sid.startswith("cara-test:"):
+        return
     if session.tenant_id is None:
         return
     try:
@@ -918,6 +942,11 @@ async def _failure(db: AsyncSession, session: CallSession, exc: Exception) -> Bo
         await _safe_rollback(db)
         session.booking_status = "collecting_details"
         return BookingResult(BookingOutcome.MISSING_INFO, message=str(exc))
+    if isinstance(exc, BookingProviderError) and exc.code in {"BOOKING_OUTCOME_UNKNOWN", "PARTIAL_BOOKING_UNRESOLVED"}:
+        await _safe_rollback(db)
+        session.entities["booking_reconciliation_required"] = {"code": exc.code, "details": str(exc)}
+        session.booking_status = "follow_up_required"
+        return BookingResult(BookingOutcome.ERROR, message="I cannot verify the complete visit yet. May a staff member call you to help with it?")
     if isinstance(exc, (BookingProviderError, asyncio.TimeoutError)):
         logger.exception("Calendar booking failed for call %s: %s", session.call_sid, exc)
         await _safe_rollback(db)
@@ -941,20 +970,18 @@ async def _failure(db: AsyncSession, session: CallSession, exc: Exception) -> Bo
 
 
 async def _routing_timezone(routing: _Routing):
-    """Use the provider's live timezone when it exposes one.
-
-    Square returns the configured Location timezone directly.  Falling back to
-    the tenant setting is reserved for providers that do not expose a live
-    location timezone.
-    """
+    """Keep the business zone authoritative; refuse a mismatched provider zone."""
     provider_tz_name = None
     lookup = getattr(routing.adapter, "booking_timezone_name", None)
     if callable(lookup):
         provider_tz_name = await lookup()
-    if provider_tz_name:
-        return resolve_timezone(provider_tz_name)
     if routing.spa:
-        return resolve_timezone(routing.spa.timezone)
+        zone = business_zone(routing.spa.timezone)
+        if provider_tz_name and provider_tz_name != zone.key:
+            raise BookingProviderError("Business and provider timezones differ; verify settings before booking.", code="LOCATION_TIMEZONE")
+        return zone
+    if provider_tz_name:
+        return business_zone(provider_tz_name)
     return timezone.utc
 
 
@@ -972,7 +999,7 @@ def _provider_authoritative_end(
         return fallback_end
     if minutes <= 0:
         return fallback_end
-    return start + timedelta(minutes=minutes)
+    return elapsed_end(start, minutes)
 
 
 async def _draft_window(
@@ -985,10 +1012,9 @@ async def _draft_window(
     if start is None:
         return None
     end = _parse_dt(draft.end_iso, tz) or (
-        start
-        + timedelta(minutes=_duration_minutes(routing.adapter, draft.service_description))
+        elapsed_end(start, _duration_minutes(routing.adapter, draft.service_description))
     )
-    return start, end
+    return utc_instant(start), utc_instant(end)
 
 
 def _draft_intent(draft: BookingDraft) -> AppointmentIntent:
@@ -997,7 +1023,10 @@ def _draft_intent(draft: BookingDraft) -> AppointmentIntent:
     # Keep the already selected duration when resolving that label on recheck.
     service = draft.service_description
     minutes = (draft.selected_slot or {}).get("duration_minutes") or draft.duration_minutes
-    if service and isinstance(minutes, int) and minutes > 0:
+    selected = draft.selected_slot or {}
+    multi_visit = len(selected.get("visit_segments") or []) > 1
+    single_selected = bool(selected) and not multi_visit
+    if service and isinstance(minutes, int) and minutes > 0 and not multi_visit and (single_selected or not re.search(r"\+|;|\band\b|\bthen\b", service, re.I)):
         if not re.search(r"\b\d+\s*(?:min|minute)", service, re.IGNORECASE):
             service = f"{service} ({minutes} min)"
     return AppointmentIntent(
@@ -1099,7 +1128,7 @@ async def _stage_earliest(
         )
 
     tz = await _routing_timezone(routing)
-    first_candidate = _next_half_hour(datetime.now(tz))
+    first_candidate = _next_half_hour(datetime.now(timezone.utc))
     duration = timedelta(minutes=_duration_minutes(routing.adapter, draft.service_description))
     search_end = first_candidate + SEARCH_HORIZON
     ctx = _context(
@@ -1165,7 +1194,7 @@ async def search_day_part(
     "Saturday afternoon" is not one exact minute. This asks the booking
     provider for that window and returns only times it actually confirmed.
     """
-    draft = get_draft(session)
+    draft = invalidate_booking_proposal(session, "day_window_request")
     if intent.service_description:
         draft.service_description = intent.service_description
     if intent.preferred_staff:
@@ -1177,13 +1206,15 @@ async def search_day_part(
     draft.selected_slot = None
     draft.start_iso = None
     draft.end_iso = None
+    draft.draft_revision = int(draft.draft_revision or 0) + 1
     save_draft(session, draft)
+    generation = _availability_generation(draft)
 
     if not draft.service_description:
         session.booking_status = "collecting_details"
         return BookingResult(
             BookingOutcome.MISSING_INFO,
-            message="Ask which service they want before searching that part of the day.",
+            message="Which service would you like, and for how many minutes?",
         )
 
     try:
@@ -1191,6 +1222,12 @@ async def search_day_part(
     except Exception as exc:
         return await _failure(db, session, exc)
 
+    resolve_service = getattr(routing.adapter, "resolve_service", None)
+    if callable(resolve_service) and not (isinstance(routing.adapter, SpaBookingAdapter) and len(routing.adapter.requested_services(draft.service_description)) > 1):
+        resolution = resolve_service(draft.service_description)
+        if resolution.status in {"ambiguous", "unspecified"}:
+            session.booking_status = "collecting_details"
+            return BookingResult(BookingOutcome.MISSING_INFO, message="Which service and duration would you like?")
     duration = timedelta(
         minutes=_duration_minutes(routing.adapter, draft.service_description)
     )
@@ -1199,7 +1236,7 @@ async def search_day_part(
         session,
         _draft_intent(draft),
         window_start,
-        window_start + duration,
+        utc_instant(window_start) + duration,
     )
     list_fn = getattr(routing.adapter, "list_openings", None)
     suggestions: list[tuple[datetime, dict[str, Any] | None]] = []
@@ -1228,9 +1265,17 @@ async def search_day_part(
             local = item.astimezone(window_start.tzinfo) if window_start.tzinfo else item
             if window_start <= local < window_end:
                 suggestions.append((local, slot))
+    if _availability_generation(get_draft(session)) != generation:
+        return BookingResult(BookingOutcome.SKIPPED, message="The request changed. Please check the current request again.")
     suggestions = suggestions[:ALTERNATIVE_SUGGESTIONS]
     draft.alternative_slots = [slot for _dt, slot in suggestions if slot]
     save_draft(session, draft)
+    remember_verified_availability(
+        session, draft.alternative_slots, service=draft.service_description,
+        staff=draft.preferred_staff, location_id=None,
+        duration_minutes=int(duration.total_seconds() / 60),
+        date_iso=window_start.date().isoformat(), source="day_window",
+    )
 
     if not suggestions:
         session.booking_status = "conflict"
@@ -1258,7 +1303,7 @@ async def search_day_part(
 
 
 async def stage_booking(
-    db: AsyncSession, session: CallSession, intent: AppointmentIntent
+    db: AsyncSession, session: CallSession, intent: AppointmentIntent, *, test_adapter: BookingAdapter | None = None
 ) -> BookingResult:
     """Record what the caller asked for. Never writes an appointment.
 
@@ -1274,7 +1319,11 @@ async def stage_booking(
     prior_staff = prior.preferred_staff
     draft = stage(session, intent)
     try:
-        routing = await _prepare(db, session)
+        if test_adapter is None:
+            routing = await _prepare(db, session)
+        else:
+            from app.services.campaign_booking import test_routing
+            routing = await test_routing(db, session, test_adapter)
         if intent.caller_name or intent.caller_email:
             await persist_caller_identity(
                 db, session, intent.caller_name, intent.caller_email
@@ -1515,7 +1564,7 @@ async def _move_existing(
 
 
 async def confirm_booking(
-    db: AsyncSession, session: CallSession, intent: AppointmentIntent | None = None
+    db: AsyncSession, session: CallSession, intent: AppointmentIntent | None = None, *, test_adapter: BookingAdapter | None = None
 ) -> BookingResult:
     """Persist the active draft. The only path that writes an appointment.
 
@@ -1530,6 +1579,8 @@ async def confirm_booking(
     stale HydroLux slot (or an unavailable date) before the caller confirmed
     the CURRENT proposal. Stage via `stage_booking` first.
     """
+    if session.entities.get("booking_reconciliation_required"):
+        return BookingResult(BookingOutcome.ERROR, message="This booking needs staff verification before another attempt. May a staff member call you to help?")
     draft = get_draft(session)
     recover_caller_name_from_history(session)
     draft = get_draft(session)
@@ -1579,7 +1630,11 @@ async def confirm_booking(
             ),
         )
     try:
-        routing = await _prepare(db, session)
+        if test_adapter is None:
+            routing = await _prepare(db, session)
+        else:
+            from app.services.campaign_booking import test_routing
+            routing = await test_routing(db, session, test_adapter)
         window = await _draft_window(routing, draft)
         if window is None:
             session.booking_status = "collecting_details"
@@ -1667,6 +1722,10 @@ async def confirm_booking(
             routing.adapter, session, _draft_intent(draft), start, end,
             selected_slot=draft.selected_slot,
         )
+        unresolved = await _unresolved_booking(db, routing.scope.tenant_id, ctx.customer_phone, start)
+        if unresolved is not None:
+            session.entities["booking_reconciliation_required"] = {"request_id": str(unresolved.id)}
+            return BookingResult(BookingOutcome.ERROR, message="This appointment request is already awaiting staff verification. I cannot confirm another reservation yet.")
         await _lock_slot(db, routing.scope, start, end)
         verdict = await _calendar_call(
             "check_availability", session.call_sid, routing.adapter.check_availability(ctx)
@@ -1740,12 +1799,11 @@ async def confirm_booking(
             return BookingResult(
                 BookingOutcome.CONFLICT,
                 message=(
-                    f"{reason} on {routing.adapter.calendar_label}, held by a different "
-                    "customer. "
+                    "It looks like that time was just taken, but I can check the next closest openings for you. "
                     + (
                         f"Offer these next available times: {suggestion_text}."
                         if suggestion_text
-                        else "No times are available that day; offer the next open day."
+                        else "No verified alternatives were found for that day. Ask which other day to check."
                     )
                 ),
             )
@@ -1790,6 +1848,9 @@ async def confirm_booking(
             f"Booked via {routing.product} on {routing.adapter.calendar_label}. "
             f"Service: {draft.service_description or routing.adapter.default_title}"
         )
+        visit_segments = (draft.selected_slot or {}).get("visit_segments")
+        if visit_segments:
+            description += " Visit itinerary: " + json.dumps(visit_segments, sort_keys=True)
         guest_name = " ".join((draft.guest_name or "").split())
         if guest_name:
             description += f" Guest: {guest_name}."
@@ -1814,7 +1875,7 @@ async def confirm_booking(
             # our insert. Theirs is as good as ours.
             await db.rollback()
             raced = await _load_by_intent_key(db, routing.scope, key)
-            if raced is None:
+            if raced is None or not raced.external_booking_id:
                 raise
             draft.appointment_id = str(raced.id)
             draft.external_booking_id = raced.external_booking_id
@@ -1832,11 +1893,28 @@ async def confirm_booking(
             routing.adapter, session, _draft_intent(draft), start, end, key,
             selected_slot=draft.selected_slot,
         )
-        external = await _calendar_call(
-            "create_booking", session.call_sid, routing.adapter.create_booking(ctx)
-        )
+        # A rejected/uncertain create must become durable staff work after rollback.
+        escalation_spa_id = routing.scope.tenant_id
+        escalation_details = {
+            "customer_name": ctx.customer_name, "customer_phone": ctx.customer_phone,
+            "customer_email": ctx.customer_email, "services": ctx.service_description,
+            "staff_preferences": ctx.preferred_staff, "requested_start": start.isoformat(),
+            "duration_minutes": int((end - start).total_seconds() / 60),
+            "location": getattr(routing.spa, "location", None), "slot": ctx.selected_slot,
+            "provider": routing.adapter.provider, "booking_reference": key,
+        }
+        try:
+            external = await _calendar_call(
+                "create_booking", session.call_sid, routing.adapter.create_booking(ctx)
+            )
+        except asyncio.TimeoutError as exc:
+            if (ctx.selected_slot or {}).get("visit_segments"):
+                raise BookingProviderError("The complete visit outcome is unknown after a timeout; reconcile with the provider before retrying.", code="BOOKING_OUTCOME_UNKNOWN") from exc
+            raise
         if not external.external_id:
             raise BookingProviderError("Calendar returned no appointment ID")
+        escalation_details["external_booking_id"] = external.external_id
+        escalation_details["provider_success_verified"] = True
         appointment.booking_provider = external.provider
         appointment.external_booking_id = external.external_id
         _apply_provider_customer(contact, external)
@@ -1942,6 +2020,19 @@ async def confirm_booking(
             ),
         )
     except Exception as exc:
+        if "escalation_details" in locals() and escalation_spa_id is not None:
+            session.entities["booking_reconciliation_required"] = {"status": "staff_review_required"}
+            await _safe_rollback(db)
+            try:
+                from app.services.booking_escalations import record
+                spa = await db.get(SpaAccount, escalation_spa_id)
+                request = await record(db, spa, session.call_sid, escalation_details, exc)
+                session.entities["booking_escalation_id"] = str(request.id)
+                session.entities["booking_reconciliation_required"] = {"request_id": str(request.id)}
+                session.booking_status = "follow_up_required"
+                return BookingResult(BookingOutcome.ERROR, message="I couldn't confirm that appointment. I've saved your request for staff review. May a staff member contact you to help?")
+            except Exception:
+                logger.exception("Failed to persist booking escalation for call %s", session.call_sid)
         return await _failure(db, session, exc)
 
 
@@ -2043,6 +2134,8 @@ async def cancel_booking(
                 message="No upcoming appointment found for this caller to cancel. Let them know politely.",
             )
 
+        await _lock_call(db, session.call_sid)
+        await _lock_slot(db, routing.scope, existing.start_time, existing.end_time)
         await _calendar_call(
             "cancel_booking",
             session.call_sid,
@@ -2138,13 +2231,16 @@ async def check_availability_only(
     adapter = get_booking_adapter(is_outbound_sales=False, spa=spa)
     session.entities["booking_provider"] = adapter.provider
     provider_tz_name = await adapter.booking_timezone_name()
-    tz = resolve_timezone(provider_tz_name or spa.timezone)
+    try:
+        tz = business_zone(spa.timezone)
+        if provider_tz_name and provider_tz_name != tz.key:
+            raise ValueError("Provider timezone differs from the business")
+    except ValueError:
+        return AvailabilityResult(False, "The business timezone needs to be verified before checking appointments.", lookup_failed=True)
     start = _parse_dt(intent.requested_start_iso, tz)
     if start is None:
         return AvailabilityResult(False, "Ask the caller for a specific date and time.")
-    end = _parse_dt(intent.requested_end_iso, tz) or start + timedelta(
-        minutes=_duration_minutes(adapter, intent.service_description)
-    )
+    end = _parse_dt(intent.requested_end_iso, tz) or elapsed_end(start, _duration_minutes(adapter, intent.service_description))
     ctx = _context(adapter, session, intent, start, end)
     generation = _availability_generation(get_draft(session))
     try:

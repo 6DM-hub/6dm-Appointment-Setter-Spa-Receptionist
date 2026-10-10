@@ -23,6 +23,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from app.services.scheduling_time import utc_instant, elapsed_end
 from app.core.config import settings
 from app.models.spa_account import BookingProvider, SpaAccount
 from app.services.booking_adapters.base import (
@@ -136,9 +137,10 @@ def _parse_slot_start(raw: Any) -> datetime | None:
         parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
     except ValueError:
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
+    try:
+        return utc_instant(parsed)
+    except ValueError:
+        return None
 
 
 def _unique(labels: list[str]) -> tuple[str, ...]:
@@ -557,11 +559,27 @@ class SpaBookingAdapter(BookingAdapter):
         resolution = self.resolve_service(service_description)
         return resolution.name if resolution.status == "resolved" else None
 
+    def requested_services(self, description):
+        from app.services.visit_booking import parts
+        return parts(self, description)
+
+    def requires_visit_validation(self, ctx):
+        if (ctx.selected_slot or {}).get("visit_segments") or len(self.requested_services(ctx.service_description or ctx.title)) > 1:
+            return True
+        entry = self.resolve_service(ctx.service_description or ctx.title).entry or {}
+        rules = (getattr(self.spa, "booking_policies", None) or {}).get("visit", {})
+        return bool(any(entry.get(k) for k in ("resource_ids", "preparation_buffer_minutes", "transition_buffer_minutes", "cleanup_buffer_minutes"))
+                    or rules.get("special_hours") or rules.get("allow_after_hours")
+                    or any(m.get("hours") or m.get("special_hours") for m in self.spa.staff or []))
+
     def duration_for_service(self, service_description: str | None) -> int:
         """Match against the tenant's configured services so voice variants map to the same duration."""
         if not service_description:
             return self.default_duration_minutes
 
+        requested = self.requested_services(service_description)
+        if len(requested) > 1:
+            return sum(self.duration_for_service(item) for item in requested)
         resolution = self.resolve_service(service_description)
         if resolution.status == "resolved" and resolution.entry is not None:
             duration = resolution.entry.get("duration_minutes")
@@ -635,12 +653,7 @@ class SpaBookingAdapter(BookingAdapter):
         return self._apply_entry(ctx, resolution.entry), resolution.name
 
     async def booking_timezone_name(self) -> str | None:
-        """Use a live-verified Square timezone when one is already cached.
-
-        The first parse of a caller time uses the spa dashboard timezone.
-        After Square Location has been retrieved (availability/create/facts),
-        later parses use that provider timezone.
-        """
+        """Expose the provider zone for validation against the business zone."""
         return await self.delegate.booking_timezone_name()
 
     async def describe_location(self) -> dict[str, Any] | None:
@@ -721,7 +734,7 @@ class SpaBookingAdapter(BookingAdapter):
             minutes = int(slot.get("duration_minutes") or fallback_minutes or 60)
         except (TypeError, ValueError):
             minutes = fallback_minutes or 60
-        end = start + timedelta(minutes=max(minutes, 1))
+        end = elapsed_end(start, max(minutes, 1))
         return is_open_between(self.spa.business_hours, self.spa.timezone, start, end)
 
     def _inside_hours(self, slots: list[dict[str, Any]] | tuple, fallback_minutes: int) -> list[dict[str, Any]]:
@@ -731,6 +744,9 @@ class SpaBookingAdapter(BookingAdapter):
         self, verdict: AvailabilityVerdict, ctx: BookingContext
     ) -> AvailabilityVerdict:
         """Square can be open earlier than the dashboard. Both have to agree."""
+        provider_zone = getattr(self.delegate, "timezone_name", None)
+        if provider_zone and provider_zone != self.spa.timezone:
+            raise BookingProviderError("Square and the business timezone differ. Verify settings before booking.", code="LOCATION_TIMEZONE")
         minutes = max(int((ctx.end - ctx.start).total_seconds() / 60), 1)
         if verdict.available and verdict.slot and self._slot_inside_hours(verdict.slot, minutes):
             truth("BUSINESS_HOURS_VALIDATED", open=True, reason="within_hours")
@@ -759,6 +775,9 @@ class SpaBookingAdapter(BookingAdapter):
         return AvailabilityVerdict.no(verdict.reason or "unavailable", alternatives=alternatives)
 
     async def list_openings(self, ctx: BookingContext, range_start, range_end):
+        if self.requires_visit_validation(ctx):
+            from app.services.visit_booking import list_visits
+            return await list_visits(self, ctx, range_start, range_end)
         ctx, staff_block = self._staff_context(ctx)
         if staff_block:
             return []
@@ -771,12 +790,20 @@ class SpaBookingAdapter(BookingAdapter):
                 else ctx
             )
             slots = await self.delegate.list_openings(square_ctx, range_start, range_end)
+            provider_zone = getattr(self.delegate, "timezone_name", None)
+            if provider_zone and provider_zone != self.spa.timezone:
+                raise BookingProviderError("Provider and business timezone differ.", code="LOCATION_TIMEZONE")
             minutes = max(int((ctx.end - ctx.start).total_seconds() / 60), 1)
             return self._inside_hours(slots, minutes)
-        return await self.delegate.list_openings(ctx, range_start, range_end)
+        slots = await self.delegate.list_openings(ctx, range_start, range_end)
+        minutes = max(int((utc_instant(ctx.end) - utc_instant(ctx.start)).total_seconds() / 60), 1)
+        return self._inside_hours(slots, minutes)
 
     # -- BookingAdapter ---------------------------------------------------- #
     async def check_availability(self, ctx: BookingContext) -> AvailabilityVerdict:
+        if self.requires_visit_validation(ctx):
+            from app.services.visit_booking import check_visit
+            return await check_visit(self, ctx)
         # Square is the operational source of truth.  Do not reject a Square
         # request using potentially stale local business hours or a stale local
         # service menu before Square is even queried.
@@ -830,6 +857,9 @@ class SpaBookingAdapter(BookingAdapter):
         )
 
     async def create_booking(self, ctx: BookingContext) -> ExternalBooking:
+        if self.requires_visit_validation(ctx):
+            from app.services.visit_booking import create_visit
+            return await create_visit(self, ctx)
         canonical_ctx, canonical_name = self._canonicalize_ctx(ctx)
         try:
             return await self.delegate.create_booking(

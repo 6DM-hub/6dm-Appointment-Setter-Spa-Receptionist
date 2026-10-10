@@ -67,7 +67,7 @@ class _FakeSquareTransport:
         self.team_members: list[dict] = []
         self.customers: list[dict] = []
         self.created_customer: dict = {"id": "cust_1"}
-        self.created_booking: dict = {"id": "sq_book_1"}
+        self.created_booking: dict = {"id": "sq_book_1", "status": "ACCEPTED"}
 
     async def __call__(self, method: str, path: str, *, json: dict | None = None) -> dict:
         self.calls.append((method, path, json or {}))
@@ -480,7 +480,7 @@ async def test_caller_requested_staff_member_is_resolved_and_filtered_to_exactly
 async def test_unmatched_requested_staff_member_is_refused_not_substituted(monkeypatch):
     """Asking for a therapist who isn't found must not silently fall back to
     booking with somebody else."""
-    spa = make_spa(booking_provider=BookingProvider.SQUARE, booking_config={"access_token": "t", "location_id": "loc_123"})
+    spa = make_spa(timezone="America/Chicago", business_hours={"thu": [{"open": "09:00", "close": "18:00"}]}, booking_provider=BookingProvider.SQUARE, booking_config={"access_token": "t", "location_id": "loc_123"})
     adapter = SpaBookingAdapter(spa)
     transport = _FakeSquareTransport()
     transport.catalog_items = [
@@ -519,7 +519,7 @@ async def test_create_booking_raises_instead_of_substituting_when_staff_becomes_
 
 @pytest.mark.asyncio
 async def test_no_square_availability_is_reported_as_unavailable_not_invented(monkeypatch):
-    spa = make_spa(booking_provider=BookingProvider.SQUARE, booking_config={"access_token": "t", "location_id": "loc_123"})
+    spa = make_spa(timezone="America/Chicago", business_hours={"thu": [{"open": "09:00", "close": "18:00"}]}, booking_provider=BookingProvider.SQUARE, booking_config={"access_token": "t", "location_id": "loc_123"})
     adapter = SpaBookingAdapter(spa)
     transport = _FakeSquareTransport()
     transport.catalog_items = [
@@ -559,7 +559,7 @@ async def test_create_booking_sends_the_exact_segment_square_availability_return
         }
     ]
     transport.customers = [{"id": "cust_1"}]
-    transport.created_booking = {"id": "sq_book_42"}
+    transport.created_booking = {"id": "sq_book_42", "status": "ACCEPTED"}
     monkeypatch.setattr(adapter.delegate, "_request", transport)
 
     result = await adapter.create_booking(_ctx())
@@ -655,6 +655,7 @@ async def test_confirm_booking_end_to_end_via_square_with_local_time_and_no_staf
         appointment_booking_service, "_resolve_contact", lambda *_: _async_value(SimpleNamespace(id=uuid.uuid4()))
     )
     monkeypatch.setattr(appointment_booking_service, "_has_conflict", lambda *_a, **_k: _async_value(False))
+    monkeypatch.setattr(appointment_booking_service, "_unresolved_booking", lambda *_: _async_value(None))
     monkeypatch.setattr(appointment_booking_service, "_load_by_intent_key", lambda *_: _async_value(None))
     monkeypatch.setattr(appointment_booking_service, "_load_call_log_id", lambda *_: _async_value(None))
 
@@ -855,7 +856,7 @@ async def test_unassigned_service_is_not_blocked_by_other_assignments(monkeypatc
     spa = make_spa(
         booking_provider=BookingProvider.SQUARE,
         booking_config={"access_token": "t", "location_id": "loc_123"},
-        timezone="UTC",
+        timezone="America/Chicago",
         business_hours={"fri": [{"open": "08:00", "close": "18:00"}]},
         services=[{
             "name": "Gel nails",

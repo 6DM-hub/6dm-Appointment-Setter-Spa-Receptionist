@@ -1,4 +1,6 @@
 import { useEffect, useState } from "react";
+import VisitSettings from "../../components/VisitSettings";
+import SmartEnhancements from "../../components/SmartEnhancements";
 import { Link, Lock, Phone, RefreshCw, Save, TestTube, Unlink } from "lucide-react";
 import {
   fetchMySpaAccount,
@@ -197,6 +199,8 @@ export default function SpaSettings() {
         cancellation_policy: spa.cancellation_policy,
         amenities: spa.amenities ?? [],
         packages: spa.packages ?? [],
+        booking_policies: spa.booking_policies,
+        enhancement_settings: spa.enhancement_settings,
         upsell_rules: spa.upsell_rules ?? [],
         payment_policy: spa.payment_policy ?? { card_required: false, collection_mode: "none" },
       });
@@ -436,6 +440,8 @@ export default function SpaSettings() {
                   </label>
                 ))}
                 {spa.booking_provider !== "google_calendar" && (
+                  <>
+                  {spa.booking_provider === "square" && <label className="block"><span className="mb-1.5 block text-xs font-medium text-slate-400">Square environment</span><select value={spa.booking_config.environment ?? "production"} disabled={!editable} onChange={event => patch("booking_config", { ...spa.booking_config, environment: event.target.value })} className="w-full rounded-lg border border-slate-700 bg-[#07111f] px-3 py-2.5 text-sm text-white"><option value="production">Production — real business</option><option value="sandbox">Sandbox — test credentials and test location only</option></select><p className="mt-2 text-xs text-slate-400">Use a separate test establishment and development backend for sandbox testing. Keep the working business on production.</p></label>}
                 <div className="flex items-center gap-3 pt-1">
                   {editable && (
                     <button
@@ -450,6 +456,7 @@ export default function SpaSettings() {
                     Status: {connectionStatus ?? (spa.booking_provider_configured ? "configured" : "not configured")}
                   </span>
                 </div>
+                  </>
                 )}
               </div>
             </Panel>
@@ -571,6 +578,8 @@ export default function SpaSettings() {
               </div>
             </Panel>
 
+            <VisitSettings spa={spa} disabled={!editable} onChange={setSpa} />
+            <SmartEnhancements spa={spa} editable={editable} onChange={(value) => patch("enhancement_settings", value)} onServicesChange={(value) => patch("services", value)} />
             <Panel title="Policies, upsells, and Booking CC" subtitle="The receptionist may only quote these configured facts. It will never invent packages, prices, or card rules.">
               <label className="block">
                 <span className="mb-2 block text-xs font-medium text-slate-400">Cancellation policy</span>

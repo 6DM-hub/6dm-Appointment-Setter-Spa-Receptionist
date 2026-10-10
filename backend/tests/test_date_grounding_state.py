@@ -32,7 +32,13 @@ def _session() -> CallSession:
 
 @pytest.fixture
 def voice_session(monkeypatch):
-    voice = XAIVoiceSession("call-1", _session())
+    # Keep the originally reported October 1/2 scenario deterministic. The
+    # dates must be future dates for grounding, regardless of when CI runs.
+    voice = XAIVoiceSession(
+        "call-1",
+        _session(),
+        now_provider=lambda tz: datetime(2026, 9, 23, 12, 0, tzinfo=tz),
+    )
 
     async def _noop() -> None:
         return None
@@ -220,7 +226,7 @@ async def test_d_a_conversational_date_mention_cannot_be_distinguished_from_a_bo
 
 def _next_local(voice_session, weekday: int, hour: int, minute: int = 0) -> datetime:
     """Same rule the voice session uses: next weekday at this clock, or +7 if past."""
-    now = datetime.now(voice_session._tz)
+    now = voice_session._now()
     days = (weekday - now.date().weekday()) % 7
     start = datetime.combine(
         now.date() + timedelta(days=days),
@@ -288,7 +294,7 @@ async def test_saturday_afternoon_searches_the_window_not_one_minute(
     monkeypatch.setattr(voice_session, "_send", capture)
     monkeypatch.setattr("app.services.xai_realtime.search_day_part", fake_search)
 
-    now = datetime.now(voice_session._tz)
+    now = voice_session._now()
     days = (5 - now.date().weekday()) % 7
     start = datetime.combine(
         now.date() + timedelta(days=days), time(12, 0), tzinfo=voice_session._tz

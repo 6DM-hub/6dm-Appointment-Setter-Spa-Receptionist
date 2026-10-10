@@ -380,8 +380,8 @@ class TwilioMediaBridge(XAIVoiceSession):
         """Also drop Twilio-queued audio. A confirmation-guard cancel that
         only hits xAI still lets already-buffered μ-law frames play, which
         sounds like crackle and a cut-off sentence."""
-        await super()._cancel_active_response()
         await self._stop_playback()
+        await super()._cancel_active_response()
 
     # --------------------------------------------------------------- xAI side
     async def _dispatch(self, event: dict[str, Any]) -> None:
@@ -404,6 +404,10 @@ class TwilioMediaBridge(XAIVoiceSession):
                     await self._note_greeting_audio_started(rid)
                 if self._playback_task is None:
                     await self._drain_playback_queue()
+                else:
+                    # Buffered xAI frames can be read without yielding; give
+                    # the sole Twilio writer a chance to drain each delta.
+                    await asyncio.sleep(0)
             return
 
         if etype in _SPEECH_STARTED_EVENTS:
@@ -422,14 +426,22 @@ class TwilioMediaBridge(XAIVoiceSession):
             self._pending_availability_speech = None
             self._availability_speech_interrupted = True
             if self.session.greeting_sent:
-                await self._cancel_active_response()
+                # server_vad has already interrupted generation before sending
+                # speech_started. Sending another cancel races response.done.
+                if self._active_response_id:
+                    self._cancelled_response_ids.add(self._active_response_id)
+                    self._active_response_id = None
+                await self._stop_playback()
             elif self._greeting_pending:
                 logger.info(
                     "call %s: caller speech during opening greeting; keeping the one greeting",
                     self.call_id,
                 )
             else:
-                await self._cancel_active_response()
+                if self._active_response_id:
+                    self._cancelled_response_ids.add(self._active_response_id)
+                    self._active_response_id = None
+                await self._stop_playback()
             return
 
         if etype == "response.created":

@@ -446,15 +446,16 @@ async def lookup_spa_facts(
                 "If a card is needed, Square sends a secure link. Do not collect the number by voice."
             )
         elif payment["collection_mode"] == "secure_sms_link":
+            from app.services.booking_state import CARD_ON_FILE_POLICY, CARD_ON_FILE_HESITANT
+            payload["booking_policy"] = policy_statement(facts)
             payload["message"] = (
                 "A card is required on file. Before booking, say exactly: "
-                "To reserve your appointment, we’ll just need to place a card on file. "
-                "Your card won’t be charged today—it’s simply required for our 24-hour cancellation policy. "
+                + CARD_ON_FILE_POLICY + " "
                 "If the caller hesitates, say exactly: "
-                "The card is kept securely on file and is only charged if the appointment is "
-                "canceled or rescheduled with less than 24 hours’ notice, or in the event of a no-show. "
+                + CARD_ON_FILE_HESITANT + " "
                 "Do not paraphrase either sentence. After booking, mention a secure text only if "
-                "the backend says the text was sent. Do not ask the caller to speak a card number."
+                "the backend says the text was sent. Do not ask the caller to speak a card number. "
+                "Quote cancellation windows or fees ONLY from this business's configured booking_policy."
             )
         elif payment["collection_mode"] == "secure_voice_card":
             from app.services.secure_payment import secure_collection_plan

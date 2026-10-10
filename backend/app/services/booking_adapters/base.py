@@ -11,8 +11,8 @@ write and owns two provider-specific concerns:
 
 Adapters therefore never touch the database. That keeps the transaction
 boundary in one place — `app.services.appointment_booking_service` — and means
-a provider outage degrades to "booked locally, not mirrored" instead of losing
-the appointment.
+an appointment is confirmed locally only after the provider returns success.
+Failed creates are escalated for staff review; they are never reported as booked.
 """
 from abc import ABC, abstractmethod
 from dataclasses import dataclass

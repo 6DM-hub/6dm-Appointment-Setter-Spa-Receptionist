@@ -11,6 +11,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.api import auth
 from app.api.v1 import health
+from app.api.v1.cara_manager import router as cara_manager_router
 from app.api.v1.card_entry import page_router as card_page_router
 from app.api.v1.card_entry import router as card_entry_router
 from app.core.config import parse_cors_origins, settings
@@ -52,9 +53,24 @@ async def lifespan(app: FastAPI):
 
         sync_task = asyncio.create_task(run_periodic_sync())
 
+    from app.services.enhancement_retention import run_retention
+    retention_task = asyncio.create_task(run_retention())
+
+    from app.services.booking_escalations import run_dispatcher
+    escalation_task = asyncio.create_task(run_dispatcher())
     yield
+    escalation_task.cancel()
+    try:
+        await escalation_task
+    except asyncio.CancelledError:
+        pass
 
     logger.info("🛑 Shutting down... cleaning up connections")
+    retention_task.cancel()
+    try:
+        await retention_task
+    except asyncio.CancelledError:
+        pass
 
     if sync_task is not None:
         sync_task.cancel()
@@ -85,6 +101,9 @@ app = FastAPI(
     # errors inside the CORS layer instead, and logs the traceback server-side.
     lifespan=lifespan,
 )
+app.include_router(cara_manager_router, prefix=settings.API_V1_PREFIX)
+from app.api.v1.booking_escalations import router as booking_escalations_router
+app.include_router(booking_escalations_router, prefix=settings.API_V1_PREFIX)
 
 # Parse CORS Origins dynamically from config
 origins = parse_cors_origins(settings.CORS_ORIGINS)

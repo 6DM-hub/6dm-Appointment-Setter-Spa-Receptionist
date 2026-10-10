@@ -155,6 +155,7 @@ export default function RecentCallsTable({ logs }: { logs: CallLog[] }) {
             </div>
 
             <div className="space-y-5 p-6">
+                {selected.ai_analysis.sensitive_health_request === true && <p className="rounded-lg border border-amber-400/30 bg-amber-400/10 p-3 text-xs text-amber-200">Sensitive-health request flagged for human review. Medical-office workflows are disabled pending verification.</p>}
               {selected.ai_summary && (
                 <section className="rounded-xl border border-slate-800 bg-[#07111f] p-4">
                   <h3 className="mb-2 text-[10px] font-bold uppercase tracking-wider text-slate-500">

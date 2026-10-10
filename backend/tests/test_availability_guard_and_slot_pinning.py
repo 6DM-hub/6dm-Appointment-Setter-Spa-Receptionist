@@ -198,7 +198,7 @@ def test_guard_is_scoped_to_square_tenants_only():
 
 @pytest.mark.asyncio
 async def test_alternative_slots_carry_the_real_square_slot_data(monkeypatch):
-    spa = make_spa(booking_provider=BookingProvider.SQUARE, booking_config={"access_token": "t", "location_id": "loc_123"})
+    spa = make_spa(timezone="America/Chicago", business_hours={"thu": [{"open": "09:00", "close": "18:00"}]}, booking_provider=BookingProvider.SQUARE, booking_config={"access_token": "t", "location_id": "loc_123"})
     adapter = SpaBookingAdapter(spa)
     transport = _FakeSquareTransport()
     transport.catalog_items = [
@@ -277,7 +277,7 @@ async def test_create_booking_uses_pinned_therapist_even_if_a_broad_search_would
     adapter = SpaBookingAdapter(spa).delegate
     transport = _FakeSquareTransport()
     transport.customers = [{"id": "cust_1"}]
-    transport.created_booking = {"id": "sq_pinned"}
+    transport.created_booking = {"id": "sq_pinned", "status": "ACCEPTED"}
 
     async def _request(method, path, *, json=None):
         if path == "/v2/bookings/availability/search":
@@ -321,7 +321,7 @@ async def test_create_booking_uses_pinned_service_variation_even_if_recheck_show
         if path == "/v2/customers/search":
             return {"customers": [{"id": "cust_1"}]}
         if path == "/v2/bookings":
-            return {"booking": {"id": "sq_ok"}}
+            return {"booking": {"id": "sq_ok", "status": "ACCEPTED"}}
         raise AssertionError(path)
 
     monkeypatch.setattr(adapter, "_request", _with_square_location(_request))
@@ -368,7 +368,7 @@ async def test_pinned_slot_that_is_no_longer_free_fails_instead_of_substituting(
 
 @pytest.mark.asyncio
 async def test_zero_availability_leaves_nothing_for_the_guard_to_authorize(monkeypatch):
-    spa = make_spa(booking_provider=BookingProvider.SQUARE, booking_config={"access_token": "t", "location_id": "loc_123"})
+    spa = make_spa(timezone="America/Chicago", business_hours={"thu": [{"open": "09:00", "close": "18:00"}]}, booking_provider=BookingProvider.SQUARE, booking_config={"access_token": "t", "location_id": "loc_123"})
     adapter = SpaBookingAdapter(spa)
     transport = _FakeSquareTransport()
     transport.catalog_items = [
@@ -452,7 +452,7 @@ async def test_stage_then_confirm_preserves_the_same_therapist_end_to_end(monkey
         if path == "/v2/customers/search":
             return {"customers": [{"id": "cust_1"}]}
         if path == "/v2/bookings":
-            return {"booking": {"id": "sq_final_booking"}}
+            return {"booking": {"id": "sq_final_booking", "status": "ACCEPTED"}}
         raise AssertionError(path)
 
     monkeypatch.setattr(adapter.delegate, "_request", _with_square_location(_request))
@@ -463,6 +463,7 @@ async def test_stage_then_confirm_preserves_the_same_therapist_end_to_end(monkey
         appointment_booking_service, "_resolve_contact", lambda *_: _async_value(SimpleNamespace(id=uuid.uuid4()))
     )
     monkeypatch.setattr(appointment_booking_service, "_has_conflict", lambda *_a, **_k: _async_value(False))
+    monkeypatch.setattr(appointment_booking_service, "_unresolved_booking", lambda *_: _async_value(None))
     monkeypatch.setattr(appointment_booking_service, "_load_by_intent_key", lambda *_: _async_value(None))
     monkeypatch.setattr(appointment_booking_service, "_load_call_log_id", lambda *_: _async_value(None))
 
@@ -514,6 +515,7 @@ async def test_square_booking_rejection_never_produces_a_booked_outcome(monkeypa
         appointment_booking_service, "_resolve_contact", lambda *_: _async_value(SimpleNamespace(id=uuid.uuid4()))
     )
     monkeypatch.setattr(appointment_booking_service, "_has_conflict", lambda *_a, **_k: _async_value(False))
+    monkeypatch.setattr(appointment_booking_service, "_unresolved_booking", lambda *_: _async_value(None))
     monkeypatch.setattr(appointment_booking_service, "_load_by_intent_key", lambda *_: _async_value(None))
     monkeypatch.setattr(appointment_booking_service, "_load_call_log_id", lambda *_: _async_value(None))
 

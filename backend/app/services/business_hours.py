@@ -57,14 +57,23 @@ def is_open_between(
 ) -> bool:
     """True if [start, end) fits inside one of the day's opening windows.
 
-    An empty/absent `business_hours` config means "no restriction configured" —
-    a brand-new spa that has not filled in hours yet still takes bookings rather
-    than silently refusing every caller.
+    Empty/absent hours are unverified and cannot authorize booking. Missing
+    weekdays are closed. Every instant must be aware and evaluated in the
+    business's valid IANA timezone, independently of the server timezone.
     """
     if not business_hours:
-        return True
+        return False
 
-    tz = resolve_timezone(tz_name)
+    from app.services.scheduling_time import business_zone, localize_wall_time, utc_instant
+    try:
+        tz = business_zone(tz_name)
+    except ValueError:
+        return False
+    if start.tzinfo is None or end.tzinfo is None or start.utcoffset() is None or end.utcoffset() is None:
+        return False
+    start, end = start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+    if end <= start:
+        return False
     local_start = start.astimezone(tz)
     local_end = end.astimezone(tz)
     duration_minutes = (end - start).total_seconds() / 60
@@ -90,7 +99,14 @@ def is_open_between(
         closes = _parse_time(window.get("close", ""))
         if opens is None or closes is None:
             continue
-        if opens <= local_start.time() and local_end.time() <= closes:
+        try:
+            opening = utc_instant(localize_wall_time(datetime.combine(local_start.date(), opens), tz))
+            closing = utc_instant(localize_wall_time(datetime.combine(local_start.date(), closes), tz))
+        except ValueError:
+            # A transition makes the configured boundary ambiguous/missing.
+            # Do not guess which occurrence the business intended.
+            continue
+        if opening <= start < end <= closing:
             return True
     return False
 

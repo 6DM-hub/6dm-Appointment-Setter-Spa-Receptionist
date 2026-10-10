@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from app.services.scheduling_time import utc_instant
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
@@ -57,6 +58,11 @@ async def list_appointments(
     scope: TenantScope = Depends(get_tenant_scope),
     db: AsyncSession = Depends(get_db),
 ) -> Page[AppointmentRead]:
+    try:
+        from_time = utc_instant(from_time) if from_time else None
+        to_time = utc_instant(to_time) if to_time else None
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     query = select(Appointment).where(scope_filter(scope, Appointment))
     if status_filter:
         query = query.where(Appointment.status == status_filter)
@@ -75,8 +81,12 @@ async def list_appointments(
             .limit(size)
         )
     ).scalars().all()
+    from app.models.spa_account import SpaAccount
+    from app.core.config import settings
+    spa = await db.get(SpaAccount, scope.tenant_id) if scope.tenant_id else None
+    zone = spa.timezone if spa else settings.SALES_TIMEZONE
     return Page(
-        items=[AppointmentRead.model_validate(r) for r in rows],
+        items=[AppointmentRead.model_validate(r).model_copy(update={"business_timezone": zone}) for r in rows],
         total=total, page=page, size=size,
     )
 

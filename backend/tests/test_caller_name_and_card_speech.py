@@ -51,31 +51,48 @@ def test_prebooking_policy_is_not_the_postbooking_sms_line():
 
 
 def test_confirmation_speech_mentions_sms_only_when_it_was_sent():
-    session = _session()
-    session.selected_service = "Swedish massage"
-    session.confirmed_datetime = "2026-10-02T16:15:00+00:00"
-    session.timezone = "America/Chicago"
-    voice = XAIVoiceSession("CAname", session)
-    sent = voice._authoritative_tool_followup(
-        "confirm_appointment",
-        '{"status":"booked","appointment_id":"a","external_booking_id":"b",'
-        '"card_status":"pending_card","card_sms":"sent"}',
+    def confirmation(card_status: str, card_sms: str, booking_id: str) -> str:
+        session = _session()
+        session.selected_service = "Swedish massage"
+        session.confirmed_datetime = "2026-10-02T16:15:00+00:00"
+        session.timezone = "America/Chicago"
+        voice = XAIVoiceSession("CAname", session)
+        return voice._authoritative_tool_followup(
+            "confirm_appointment",
+            '{"status":"booked","appointment_id":"a","external_booking_id":"'
+            + booking_id
+            + '","card_status":"'
+            + card_status
+            + '","card_sms":"'
+            + card_sms
+            + '"}',
+        )
+
+    sent = confirmation("pending_card", "sent", "sent-booking")
+    failed = confirmation("pending_card", "failed", "failed-booking")
+    plain = confirmation("not_required", "not_attempted", "plain-booking")
+    confirmed = confirmation("card_confirmed", "not_attempted", "confirmed-booking")
+
+    # Re-delivery of the same provider success must never produce a second
+    # spoken confirmation. This is separate from testing the four card states.
+    duplicate_session = _session()
+    duplicate_session.selected_service = "Swedish massage"
+    duplicate_session.confirmed_datetime = "2026-10-02T16:15:00+00:00"
+    duplicate_voice = XAIVoiceSession("CAname", duplicate_session)
+    duplicate_payload = (
+        '{"status":"booked","appointment_id":"a","external_booking_id":"duplicate",'
+        '"card_status":"pending_card","card_sms":"sent"}'
     )
-    failed = voice._authoritative_tool_followup(
+    first = duplicate_voice._authoritative_tool_followup(
         "confirm_appointment",
-        '{"status":"booked","appointment_id":"a","external_booking_id":"b",'
-        '"card_status":"pending_card","card_sms":"failed"}',
+        duplicate_payload,
     )
-    plain = voice._authoritative_tool_followup(
+    duplicate = duplicate_voice._authoritative_tool_followup(
         "confirm_appointment",
-        '{"status":"booked","appointment_id":"a","external_booking_id":"b",'
-        '"card_status":"not_required","card_sms":"not_attempted"}',
+        duplicate_payload,
     )
-    confirmed = voice._authoritative_tool_followup(
-        "confirm_appointment",
-        '{"status":"booked","appointment_id":"a","external_booking_id":"b",'
-        '"card_status":"card_confirmed","card_sms":"not_attempted"}',
-    )
+    assert first
+    assert duplicate == ""
     assert "reserved pending your card on file" in sent
     assert "is confirmed" not in sent
     assert "secure text link" in sent
@@ -90,8 +107,11 @@ def test_confirmation_speech_mentions_sms_only_when_it_was_sent():
 def test_hesitant_line_is_the_exact_policy_followup():
     assert looks_card_hesitant("Do I have to put a card down?")
     assert not looks_card_hesitant("yes")
-    assert "24 hours" in CARD_ON_FILE_HESITANT
-    assert "won’t be charged today" in CARD_ON_FILE_POLICY
+    assert "24 hours" not in CARD_ON_FILE_HESITANT
+    assert "24-hour" not in CARD_ON_FILE_POLICY
+    assert "$39" not in CARD_ON_FILE_POLICY
+    assert "configured policy" in CARD_ON_FILE_HESITANT
+    assert "does not charge your card" in CARD_ON_FILE_POLICY
 
 
 def test_missing_caller_name_blocks_final_confirmation():

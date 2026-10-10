@@ -63,7 +63,7 @@ export default function CalendarView({
   const byDay = useMemo(() => {
     const groups = new Map<string, Appointment[]>();
     for (const appointment of appointments) {
-      const day = new Date(appointment.start_time).toDateString();
+      const day = new Date(appointment.start_time).toLocaleDateString(undefined, { timeZone: appointment.business_timezone || "UTC", year: "numeric", month: "long", day: "numeric" }) + " · " + (appointment.business_timezone || "UTC");
       groups.set(day, [...(groups.get(day) || []), appointment]);
     }
     return [...groups.entries()];
@@ -98,6 +98,7 @@ export default function CalendarView({
                     >
                       <span className="w-12 pt-0.5 text-[11px] font-semibold text-slate-400">
                         {new Date(appointment.start_time).toLocaleTimeString([], {
+                          timeZone: appointment.business_timezone || "UTC",
                           hour: "2-digit",
                           minute: "2-digit",
                         })}

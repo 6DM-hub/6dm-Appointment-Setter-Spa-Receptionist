@@ -1,7 +1,7 @@
 import uuid
 from typing import Any
 
-from pydantic import BaseModel, EmailStr, Field, model_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 from app.models.user import UserRole
 
@@ -47,6 +47,12 @@ class UserRead(BaseModel):
     role: UserRole
     tenant_id: uuid.UUID | None
     twilio_phone_number: str | None
+    is_business_master: bool = False
+
+    @field_validator("is_business_master", mode="before")
+    @classmethod
+    def master_default(cls, value):
+        return value is True
 
     model_config = {"from_attributes": True}
 

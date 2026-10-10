@@ -1,13 +1,21 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, model_validator, field_validator
 
 from app.models.appointment import AppointmentStatus, CardStatus
 from app.schemas.common import ORMModel
 
 
 class AppointmentBase(BaseModel):
+    @field_validator("start_time", "end_time")
+    @classmethod
+    def normalize_instant(cls, value):
+        from app.services.scheduling_time import utc_instant
+        if value is None:
+            raise ValueError("Appointment timestamps cannot be null")
+        return utc_instant(value)
+
     title: str = Field(..., max_length=255)
     description: str | None = None
     start_time: datetime
@@ -27,6 +35,14 @@ class AppointmentCreate(AppointmentBase):
 
 
 class AppointmentUpdate(BaseModel):
+    @field_validator("start_time", "end_time")
+    @classmethod
+    def normalize_instant(cls, value):
+        from app.services.scheduling_time import utc_instant
+        if value is None:
+            raise ValueError("Appointment timestamps cannot be null")
+        return utc_instant(value)
+
     title: str | None = None
     description: str | None = None
     start_time: datetime | None = None
@@ -35,6 +51,7 @@ class AppointmentUpdate(BaseModel):
 
 
 class AppointmentRead(ORMModel, AppointmentBase):
+    business_timezone: str = "UTC"
     id: uuid.UUID
     # Exactly one of these is set: `user_id` for Dominic's sales calendar,
     # `tenant_id` for a spa's service calendar.

@@ -142,13 +142,11 @@ async def test_one_response_cannot_chain_an_unbounded_run_of_availability_probes
     ]
     assert outputs[0]["status"] == "available"
     for refused in outputs[1:]:
-        # The temporal-grounding guard (turn-scoped) catches these before the
-        # per-response cap even gets a chance to; the hard chain-depth cap is
-        # a further-out backstop that can also catch the tail of a long
-        # enough storm. Either is an acceptable rejection category here —
-        # what matters is NONE of them reached the provider.
-        assert refused["status"] in {"ungrounded_time", "tool_chain_limit"}
-        assert refused["available"] is False
+        # A successful authoritative availability result cancels the model
+        # response that requested it. Any additional calls already queued for
+        # that stale response are discarded before reaching the provider.
+        assert refused["status"] == "cancelled"
+        assert refused.get("available") is not True
 
 
 async def test_per_response_cap_still_refuses_a_second_grounded_probe_in_one_response(
@@ -185,7 +183,7 @@ async def test_per_response_cap_still_refuses_a_second_grounded_probe_in_one_res
         if item.get("type") == "conversation.item.create"
         and item["item"]["type"] == "function_call_output"
     ]
-    assert outputs[1]["status"] == "too_many_attempts"
+    assert outputs[1]["status"] == "cancelled"
 
 
 async def test_a_new_response_id_does_not_reset_permission_to_keep_guessing(
@@ -262,23 +260,29 @@ async def test_response_create_is_not_sent_while_the_same_response_is_still_open
         "no response.create should fire while resp-storm is still open"
     )
 
-    # Once that response actually finishes, its deferred continuation fires —
-    # restricted to speech-only, since two of the three tool results in it
-    # were rejections (the point of this whole fix: the model must be able
-    # to tell the caller something, but not retry a tool autonomously).
+    # The first verified result cancels the model response and is spoken by a
+    # backend-authored force_message. Closing the stale response must not
+    # start another model response or re-open tool access.
     await voice_session._dispatch({"type": "response.done", "response": {"id": "resp-storm"}})
     creates = [item for item in sent if item.get("type") == "response.create"]
-    assert len(creates) == 1
-    assert creates[0].get("response", {}).get("tool_choice") == "none"
+    assert creates == []
+    force_messages = [
+        item for item in sent
+        if item.get("type") == "conversation.item.create"
+        and item.get("item", {}).get("type") == "force_message"
+    ]
+    assert len(force_messages) == 1
 
-    # A genuinely new, grounded caller turn may prompt an unrestricted one.
+    # A genuinely new, grounded caller turn can run a new provider lookup,
+    # but its verified result is still backend-authored and does not create
+    # an overlapping autonomous model response.
     await _caller_says(voice_session, "How about 2pm instead?")
     await voice_session._dispatch(
         _call_done_event(response_id="resp-next", call_id="call-next", start_iso=_tomorrow_iso(14))
     )
     creates = [item for item in sent if item.get("type") == "response.create"]
-    assert len(creates) == 2
-    assert "response" not in creates[1] or creates[1]["response"].get("tool_choice") != "none"
+    assert creates == []
+    assert availability_stub == [_tomorrow_iso(10, 15), _tomorrow_iso(14)]
 
 
 async def test_duplicate_call_id_is_not_executed_twice(voice_session, availability_stub, monkeypatch):

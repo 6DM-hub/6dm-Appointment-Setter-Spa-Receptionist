@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import httpx
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.core.config import settings
 from app.services.call_state import CallSession
@@ -44,6 +44,16 @@ class AppointmentIntent(BaseModel):
     )
     requested_end_iso: str | None = None
     service_description: str | None = None
+    requested_services: list[str] = Field(default_factory=list, max_length=6)
+
+    @model_validator(mode="after")
+    def preserve_all_services(self):
+        if self.requested_services:
+            if any(not item.strip() for item in self.requested_services):
+                raise ValueError("Every requested service must be named")
+            self.service_description = " + ".join(item.strip() for item in self.requested_services)
+        return self
+
 
     # Set when the caller asked for the earliest/soonest/next opening and
     # named no specific date or time themselves. When True, the backend runs

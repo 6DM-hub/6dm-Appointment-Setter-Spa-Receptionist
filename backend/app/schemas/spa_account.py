@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.models.spa_account import BookingProvider, VoiceEngine
 from app.schemas.common import ORMModel
+from app.schemas.enhancements import EnhancementSettings
 
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
@@ -25,6 +26,12 @@ class BusinessHoursWindow(BaseModel):
 
 
 class SpaService(BaseModel):
+    resource_ids: list[str] = Field(default_factory=list)
+    preparation_buffer_minutes: int = Field(0, ge=0, le=180)
+    transition_buffer_minutes: int = Field(0, ge=0, le=180)
+    cleanup_buffer_minutes: int = Field(0, ge=0, le=180)
+    square_variation_id: str | None = Field(None, max_length=255)
+    square_variation_version: int | None = None
     name: str = Field(..., max_length=255)
     duration_minutes: int = Field(60, ge=5, le=600)
     price: str | None = Field(None, max_length=32)
@@ -32,6 +39,9 @@ class SpaService(BaseModel):
 
 
 class SpaStaffMember(BaseModel):
+    provider_id: str | None = None
+    hours: dict[str, list[BusinessHoursWindow]] = Field(default_factory=dict)
+    special_hours: dict[str, list[BusinessHoursWindow]] = Field(default_factory=dict)
     name: str = Field(..., max_length=255)
     role: str | None = Field(None, max_length=255)
     services: list[str] = Field(default_factory=list)
@@ -91,6 +101,20 @@ def _validate_hours(v: dict[str, Any]) -> dict[str, Any]:
 
 
 class SpaAccountBase(BaseModel):
+    @field_validator("timezone")
+    @classmethod
+    def validate_business_timezone(cls, value):
+        from app.services.scheduling_time import business_zone
+        return business_zone(value).key
+
+    @field_validator("booking_policies")
+    @classmethod
+    def validate_visit_policy(cls, value):
+        if value and "visit" in value:
+            from app.services.visit_booking import VisitPolicy
+            value = {**value, "visit": VisitPolicy.model_validate(value["visit"]).model_dump()}
+        return value
+
     name: str = Field(..., max_length=255)
     location: str | None = Field(None, max_length=512)
     twilio_phone_number: str | None = Field(None, max_length=32)
@@ -107,10 +131,16 @@ class SpaAccountBase(BaseModel):
     cancellation_policy: str | None = Field(None, max_length=4000)
     amenities: list[str] = Field(default_factory=list)
     packages: list[Any] = Field(default_factory=list)
+    enhancement_settings: EnhancementSettings = Field(default_factory=EnhancementSettings)
     upsell_rules: list[SpaUpsellRule] = Field(default_factory=list)
     payment_policy: SpaPaymentPolicy = Field(default_factory=SpaPaymentPolicy)
     notification_settings: dict[str, Any] = Field(default_factory=dict)
     booking_policies: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("enhancement_settings", mode="before")
+    @classmethod
+    def default_enhancements(cls, value):
+        return value or {}
 
     @field_validator("twilio_phone_number")
     @classmethod
@@ -129,6 +159,20 @@ class SpaAccountCreate(SpaAccountBase):
 
 
 class SpaAccountUpdate(BaseModel):
+    @field_validator("timezone")
+    @classmethod
+    def validate_business_timezone(cls, value):
+        from app.services.scheduling_time import business_zone
+        return business_zone(value).key
+
+    @field_validator("booking_policies")
+    @classmethod
+    def validate_visit_policy(cls, value):
+        if value and "visit" in value:
+            from app.services.visit_booking import VisitPolicy
+            value = {**value, "visit": VisitPolicy.model_validate(value["visit"]).model_dump()}
+        return value
+
     """Every field optional; a PATCH from the spa's own settings screen."""
 
     name: str | None = Field(None, max_length=255)
@@ -149,10 +193,18 @@ class SpaAccountUpdate(BaseModel):
     cancellation_policy: str | None = Field(None, max_length=4000)
     amenities: list[str] | None = None
     packages: list[Any] | None = None
+    enhancement_settings: EnhancementSettings | None = None
     upsell_rules: list[SpaUpsellRule] | None = None
     payment_policy: SpaPaymentPolicy | None = None
     notification_settings: dict[str, Any] | None = None
     booking_policies: dict[str, Any] | None = None
+
+    @field_validator("enhancement_settings")
+    @classmethod
+    def validate_enhancement_settings(cls, value):
+        if value is None:
+            raise ValueError("enhancement_settings cannot be null; use enabled=false to disable")
+        return value
 
     @field_validator("voice_engine")
     @classmethod

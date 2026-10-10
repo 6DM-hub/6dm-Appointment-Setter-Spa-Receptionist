@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 # Create the Async Engine using the DATABASE_URL_ASYNC property
 engine = create_async_engine(
     settings.DATABASE_URL_ASYNC,
+    # Explicit UTC session settings prevent server-local SQL date conversions.
+    connect_args={"server_settings": {"timezone": "UTC"}} if settings.DATABASE_URL_ASYNC.startswith("postgresql+asyncpg:") else {},
     echo=settings.DB_ECHO,
     pool_size=settings.DB_POOL_SIZE,
     max_overflow=settings.DB_MAX_OVERFLOW,

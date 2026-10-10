@@ -61,6 +61,12 @@ def resolve_service_host(host: str) -> str:
         return "localhost"
 
 class Settings(BaseSettings):
+    STAFF_SMTP_HOST: str = ""
+    STAFF_SMTP_PORT: int = 465
+    STAFF_SMTP_FROM: str = ""
+    STAFF_SMTP_USER: str = ""
+    STAFF_SMTP_PASSWORD: str = ""
+
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",
         env_file_encoding="utf-8",

@@ -147,6 +147,10 @@ class SpaAccount(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         JSONB, nullable=False, default=dict, server_default="{}"
     )
 
+    enhancement_settings: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+
     # --- Relationships ---
     users: Mapped[list["User"]] = relationship(back_populates="tenant")
     google_calendar_connection: Mapped["GoogleCalendarConnection | None"] = relationship(

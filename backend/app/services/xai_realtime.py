@@ -27,7 +27,7 @@ import logging
 import re
 import time
 from datetime import date, datetime, time as dt_time, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import websockets
@@ -59,6 +59,7 @@ from app.services.booking_state import (
     CARD_ON_FILE_POLICY,
     authoritative_availability_speech,
     booking_card_speech,
+    bind_verified_slot,
     caller_name_required_for,
     capture_caller_name_answer,
     contains_unauthorized_availability_claim,
@@ -68,6 +69,7 @@ from app.services.booking_state import (
     looks_card_hesitant,
     looks_like_unverified_booking_success,
     mark_read_back,
+    proposal_fingerprint,
     record_pure_confirmation,
     recover_caller_name_from_history,
     save_draft,
@@ -399,288 +401,7 @@ def _extract_day_part(utterance: str) -> tuple[dt_time, dt_time] | None:
 
 # How many of the most recent caller turns count as "still establishing the
 # date" for a later turn that names only a time. Kept short deliberately: a
-# date mentioned many turns ago in an unrelated part of the conversation is
-# not the caller confirming that date now.
-_RECENT_DATE_CONTEXT_TURNS = 4
-# Prefix distinguishing an xAI voice call from a Twilio CallSid in the shared
-# `call_logs.twilio_call_sid` column. 4 + 36 chars fits the String(64) column,
-# so this needs no migration.
-XAI_SID_PREFIX = "xai:"
-XAI_REALTIME_MODEL = "grok-voice-latest"
-
-
-def build_xai_realtime_url(*, call_id: str | None = None) -> str:
-    """Build a realtime URL that always pins the current recommended voice model.
-
-    `XAI_REALTIME_URL` may already contain query parameters, so preserve them
-    instead of blindly appending another `?`.  Explicit model selection avoids
-    drifting onto whatever server default happens to be active.
-    """
-    parts = urlsplit(settings.XAI_REALTIME_URL)
-    query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    query["model"] = query.get("model") or XAI_REALTIME_MODEL
-    if call_id is not None:
-        query["call_id"] = call_id
-    return urlunsplit(
-        (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
-    )
-
-
-def xai_call_sid(call_id: str) -> str:
-    return f"{XAI_SID_PREFIX}{call_id}"
-
-
-PROPOSE_APPOINTMENT_TOOL: dict[str, Any] = {
-    "type": "function",
-    "name": "propose_appointment",
-    "description": (
-        "Record what the caller is asking for and check whether the slot is free. "
-        "This NEVER books anything. Call it every time the caller names or changes "
-        "a date, time or service — including when they change their mind. There is "
-        "only one pending request per call, so a change replaces the previous one "
-        "rather than adding a second appointment. After calling this, the backend "
-        "speaks the Square result. If caller_name is not already stored from this "
-        "call, the backend asks for the caller's name before any booking "
-        "confirmation. A known profile or a Square customer matched by phone is "
-        "not that name. Pass caller_name once the caller says it, and do not ask "
-        "again when it is already stored.\n\n"
-        "NEVER invent or guess a date/time to 'try' it. A weekday is the next "
-        "upcoming one — do not ask if they mean the coming Saturday. "
-        "'Thursday at 4pm' is complete: set requested_start_iso to that local "
-        "time. 'Saturday afternoon' is also complete: call this tool; the "
-        "backend searches that part of the day. If the caller has not stated "
-        "a day or a time at all, either ask them, or — if they asked for the "
-        "earliest/soonest/next opening — set earliest=true and leave "
-        "requested_start_iso unset; the backend runs one real forward search "
-        "and returns up to three actual openings. Calling this again with a "
-        "different self-chosen time because the last one didn't work is not "
-        "allowed and will be refused."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "caller_name": {"type": "string", "description": "Caller's full name."},
-            "caller_email": {"type": "string", "description": "Caller's email, if given."},
-            "requested_start_iso": {
-                "type": "string",
-                "description": (
-                    "Requested start as THIS BUSINESS'S LOCAL wall-clock time in "
-                    "ISO8601 with NO timezone suffix and NO 'Z' — e.g. "
-                    "2026-09-04T14:00:00 for 2pm local time. Never convert this to "
-                    "UTC yourself and never append 'Z'; the backend localizes it. "
-                    "ONLY set this to a time the caller actually said, or one of the "
-                    "authoritative options already offered to them. Leave unset "
-                    "when earliest=true."
-                ),
-            },
-            "requested_end_iso": {
-                "type": "string",
-                "description": (
-                    "Requested end as THIS BUSINESS'S LOCAL wall-clock time, same "
-                    "format as requested_start_iso (no 'Z', no offset). Omit to use "
-                    "the service's duration."
-                ),
-            },
-            "service_description": {
-                "type": "string",
-                "description": "Service requested, e.g. '60 minute deep tissue massage'.",
-            },
-            "preferred_staff": {
-                "type": "string",
-                "description": (
-                    "Name of the specific staff member the caller asked for, e.g. "
-                    "'Sarah'. Leave this out entirely if the caller said 'anyone', "
-                    "'whoever's free', or didn't mention a preference — never guess "
-                    "a name."
-                ),
-            },
-            "operation": {
-                "type": "string",
-                "enum": ["schedule", "reschedule"],
-                "description": (
-                    "Use reschedule when the caller is moving an existing appointment; "
-                    "otherwise use schedule. A reschedule never creates a second appointment."
-                ),
-            },
-            "appointment_id": {
-                "type": "string",
-                "description": (
-                    "For reschedule only: an appointment_id previously returned by the "
-                    "backend lookup/offered choices. Never invent an ID."
-                ),
-            },
-            "earliest": {
-                "type": "boolean",
-                "description": (
-                    "True ONLY when the caller asked for the earliest/soonest/next "
-                    "available opening and named no specific date or time "
-                    "themselves. When true, leave requested_start_iso unset — the "
-                    "backend performs the actual forward search."
-                ),
-            },
-            "guest_name": {
-                "type": "string",
-                "description": (
-                    "Name of the person the appointment is FOR when the caller is "
-                    "booking for someone else. Leave empty if the appointment is "
-                    "for the caller. Never copy preferred_staff here."
-                ),
-            },
-        },
-        "required": [],
-    },
-}
-
-CONFIRM_APPOINTMENT_TOOL: dict[str, Any] = {
-    "type": "function",
-    "name": "confirm_appointment",
-    "description": (
-        "Actually book the pending request, after the caller has explicitly agreed "
-        "to the exact date and time you read back to them. Takes no date: it always "
-        "commits the latest pending request, so it cannot book a time the caller has "
-        "already changed. Safe to call more than once — repeat calls return the same "
-        "appointment instead of creating another. If the caller changed their mind "
-        "after a booking was made, this moves that booking rather than adding one. "
-        "IMPORTANT: after the caller says yes/book it/that works, call this tool immediately "
-        "BEFORE speaking any acknowledgment or success wording. Do not call this until "
-        "caller_name is stored. The backend speaks the final confirmation only after "
-        "the provider returns a real external booking ID, and it mentions a secure "
-        "card text only when that text was actually sent."
-    ),
-    "parameters": {"type": "object", "properties": {}, "required": []},
-}
-
-LOOKUP_APPOINTMENTS_TOOL: dict[str, Any] = {
-    "type": "function",
-    "name": "lookup_appointments",
-    "description": (
-        "Read-only lookup of this caller's upcoming appointments. Use this for questions "
-        "like 'when is my next appointment?' and before selecting among multiple appointments "
-        "for cancellation or rescheduling. This never books, moves, or cancels anything."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "purpose": {
-                "type": "string",
-                "enum": ["lookup", "cancel", "reschedule"],
-                "description": "Why the appointments are being listed.",
-            }
-        },
-        "required": [],
-    },
-}
-
-CANCEL_APPOINTMENT_TOOL: dict[str, Any] = {
-    "type": "function",
-    "name": "cancel_appointment",
-    "description": (
-        "Cancel this caller's appointment. If several upcoming appointments exist, first "
-        "read back the backend-provided choices and then pass the appointment_id for the "
-        "one the caller selected. Never invent an appointment_id."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "appointment_id": {
-                "type": "string",
-                "description": "One of the appointment IDs previously offered by the backend.",
-            }
-        },
-        "required": [],
-    },
-}
-
-NEW_APPOINTMENT_TOOL: dict[str, Any] = {
-    "type": "function",
-    "name": "start_new_appointment",
-    "description": (
-        "Start a SECOND, separate appointment. Only call this when the caller "
-        "explicitly says they want an additional appointment as well as the one "
-        "already arranged. Never call it because they changed the date or time of "
-        "the appointment already being discussed — use propose_appointment for that."
-    ),
-    "parameters": {"type": "object", "properties": {}, "required": []},
-}
-
-MANAGE_APPOINTMENT_TOOL: dict[str, Any] = {
-    "type": "function",
-    "name": "manage_appointment",
-    "description": (
-        "Commit a booking, reschedule or cancellation the caller has explicitly "
-        "agreed to. Prefer propose_appointment followed by confirm_appointment; "
-        "this remains for a single-step confirmed action. Repeat calls resolve to "
-        "the same appointment rather than creating another."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "intent": {
-                "type": "string",
-                "enum": ["schedule", "reschedule", "cancel"],
-                "description": "What the caller wants to do.",
-            },
-            "caller_name": {"type": "string", "description": "Caller's full name."},
-            "caller_email": {"type": "string", "description": "Caller's email, if given."},
-            "requested_start_iso": {
-                "type": "string",
-                "description": (
-                    "Requested start as THIS BUSINESS'S LOCAL wall-clock time in "
-                    "ISO8601 with NO timezone suffix and NO 'Z' — e.g. "
-                    "2026-09-04T14:00:00 for 2pm local time. Never convert this to "
-                    "UTC yourself and never append 'Z'; the backend localizes it."
-                ),
-            },
-            "requested_end_iso": {
-                "type": "string",
-                "description": (
-                    "Requested end as THIS BUSINESS'S LOCAL wall-clock time, same "
-                    "format as requested_start_iso (no 'Z', no offset). Omit to use "
-                    "the service's duration."
-                ),
-            },
-            "service_description": {
-                "type": "string",
-                "description": "Service requested, e.g. '60 minute deep tissue massage'.",
-            },
-            "preferred_staff": {
-                "type": "string",
-                "description": (
-                    "Name of the specific staff member the caller asked for. Leave "
-                    "this out if they have no preference."
-                ),
-            },
-        },
-        "required": ["intent"],
-    },
-}
-
-CHECK_AVAILABILITY_TOOL: dict[str, Any] = {
-    "type": "function",
-    "name": "check_availability",
-    "description": (
-        "Check one EXACT spa slot the caller actually stated, or one of the "
-        "options already offered to them. This never books or reserves it. "
-        "NEVER call this with a date/time you invented yourself to see if it "
-        "happens to be free — that is not allowed and will be refused. For "
-        "'earliest/soonest opening' requests use propose_appointment with "
-        "earliest=true instead; it runs the real forward search."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "requested_start_iso": {
-                "type": "string",
-                "description": (
-                    "This business's LOCAL wall-clock time, ISO8601, no 'Z', no "
-                    "offset — e.g. 2026-09-04T14:00:00 for 2pm local time. Must be "
-                    "a time the caller said, or one of the options already offered."
-                ),
-            },
-            "requested_end_iso": {
-                "type": "string",
-                "description": "Same local, no-offset format as requested_start_iso.",
-            },
+# date mentioned many turns ago in an unrelated part of the conversation is treatment."},
             "service_description": {"type": "string"},
             "preferred_staff": {
                 "type": "string",
@@ -892,7 +613,13 @@ class XAIVoiceSession:
     HOLD_TONE_DELAY_SECONDS = 1.2
     GREETING_WATCHDOG_SECONDS = 2.5
 
-    def __init__(self, call_id: str, session: CallSession) -> None:
+    def __init__(
+        self,
+        call_id: str,
+        session: CallSession,
+        *,
+        now_provider: Callable[[Any], datetime] | None = None,
+    ) -> None:
         self.call_id = call_id
         self.session = session
         self._ws: Any = None
@@ -913,6 +640,10 @@ class XAIVoiceSession:
         self._deadline = time.monotonic() + settings.XAI_VOICE_MAX_CALL_SECONDS
         # Resolved once per call for the availability-claim guard below.
         self._tz = resolve_timezone(session.timezone)
+        # Keep all caller-facing date resolution on one injectable clock. This
+        # makes year-boundary/DST regression tests deterministic without ever
+        # changing the business timezone or using a fixed UTC offset.
+        self._now_provider = now_provider or (lambda tz: datetime.now(tz))
         # Response lifecycle tracking. xAI can emit several function calls
         # under one `response_id` before that response is done; without
         # this, nothing distinguishes "a response is still open" from "the
@@ -956,6 +687,7 @@ class XAIVoiceSession:
         #
         # The set is cleared when the caller states a new time of day.
         self._grounded_exact_times: set[str] = set()
+        self._grounding_rejections: dict[tuple, int] = {}
         # Guard-rail rejections (ungrounded time/earliest, per-response cap)
         # must not autonomously re-trigger the same probe forever. These two
         # are the loop-breaker: an identical rejected probe signature is
@@ -970,6 +702,7 @@ class XAIVoiceSession:
         self._restricted_response_needed_after_tool = False
         self._inflight_tools: set[asyncio.Task] = set()
         self._hold_ack_played_this_turn = False
+
         self._availability_recent: dict[str, tuple[float, str]] = {}
         self._availability_lookup_open = False
         self._muted_availability_response_id: str | None = None
@@ -990,6 +723,10 @@ class XAIVoiceSession:
     @property
     def _url(self) -> str:
         return build_xai_realtime_url(call_id=self.call_id)
+
+    def _now(self) -> datetime:
+        """Current aware wall time in this business's configured timezone."""
+        return self._now_provider(self._tz)
 
     async def _send(self, payload: dict[str, Any]) -> None:
         await self._ws.send(json.dumps(payload))
@@ -1105,10 +842,18 @@ class XAIVoiceSession:
         self._tool_chain_depth_this_turn = 0
         self._hold_ack_played_this_turn = False
 
+        # Clarification supersedes a callback offer, without authorizing one.
+        if not is_affirmative(text) and (
+            _DATE_MENTION_RE.search(text) or _TIME_MENTION_RE.search(text)
+            or re.search(r"\b(availability|openings|available|rebook|instead|actually|change|switch|different|service|massage|facial|wax)\b", text, re.I)
+        ):
+            self.session.entities.pop("callback_offer_pending", None)
+        self._availability_recent.clear()
+
         # A newly stated time replaces the previous caller-grounded exact time.
         # Do NOT clear on a plain "yes"/"that works" turn: the already-selected
         # provider slot must remain reusable through confirmation/recheck.
-        if _TIME_MENTION_RE.search(text):
+        if _TIME_MENTION_RE.search(text) or _DATE_MENTION_RE.search(text) or _DATE_CANCEL_RE.search(text):
             if self._grounded_exact_times:
                 logger.info(
                     "call %s: caller stated a new time; clearing %d previously grounded exact time(s)",
@@ -1116,6 +861,19 @@ class XAIVoiceSession:
                     len(self._grounded_exact_times),
                 )
             self._grounded_exact_times.clear()
+            # Preserve caller evidence BEFORE a tool runs. Staff/name answers
+            # may arrive between the time selection and the first lookup.
+            # This permits a search; it grants neither availability nor consent.
+            clock = _extract_clock_time(text)
+            spoken_date, _ = self._spoken_date(text, self._now().date())
+            if clock is not None and spoken_date is not None and not _DATE_CANCEL_RE.search(text):
+                from app.services.scheduling_time import localize_wall_time
+                try:
+                    start = localize_wall_time(datetime.combine(spoken_date, clock), self._tz)
+                except ValueError:
+                    start = None
+                if start is not None and start > self._now():
+                    self._remember_grounded_exact_time(start.isoformat())
 
     def _flush_agent_turn(self) -> None:
         """Commit the accumulated agent utterance as one history turn.
@@ -1190,6 +948,17 @@ class XAIVoiceSession:
         confirmed a booking but never called ``confirm_appointment``. Once a real
         read-back has been recorded, the state machine—not the LLM—owns the write.
         """
+        from app.services.enhancements import respond as enhancement_response
+        handled, line, event, resume = enhancement_response(self.session, caller_text)
+        if event:
+            await self._record_enhancement(event)
+        if handled:
+            await self._cancel_active_response()
+            if line:
+                await self._send_force_message(line)
+            if resume:
+                await self._confirm_pending_booking_from_caller("yes")
+            return True
         if self.session.entities.get("callback_offer_pending"):
             if is_affirmative(caller_text):
                 self.session.entities["callback_authorized"] = True
@@ -1314,6 +1083,9 @@ class XAIVoiceSession:
             payload = {}
         status = str(payload.get("status") or "failed")
         message = str(payload.get("message") or "")
+        if status == "upgrade_unavailable":
+            await self._send_force_message(message)
+            return True
         if "caller has not given their name" in message:
             await self._ask_for_caller_name(again=True)
             return True
@@ -1884,7 +1656,7 @@ class XAIVoiceSession:
             save_draft(self.session, draft)
 
         current = get_draft(self.session)
-        raw_service = str(args.get("service_description") or current.service_description or "")
+        raw_service = str(" + ".join(args.get("requested_services") or []) or args.get("service_description") or current.service_description or "")
         def menu_tokens(value):
             return re.sub(r"\b(?:\d+|minute|minutes|min|massage)\b", "", value.casefold()).strip()
         duration = re.search(r"\b(\d+)\s*(?:minute|minutes|min)\b", raw_service, re.IGNORECASE)
@@ -1935,6 +1707,9 @@ class XAIVoiceSession:
         })
 
     async def _run_confirm_appointment(self, _raw_arguments: str = "") -> str:
+        from app.services.enhancements import pending as enhancement_pending, KEY
+        if enhancement_pending(self.session):
+            return json.dumps({"status": "awaiting_enhancement_response", "booked": False})
         """Commit the pending request. Idempotent; the only tool that writes."""
         draft = get_draft(self.session)
         last = self._last_user_utterance() or ""
@@ -1997,6 +1772,38 @@ class XAIVoiceSession:
         async with AsyncSessionLocal() as db:
             result = await confirm_booking(db, self.session)
 
+        enhancement = self.session.entities.get(KEY) or {}
+        if enhancement.get("phase") == "accepted":
+            current = get_draft(self.session)
+            matches_upgrade = (
+                proposal_fingerprint(current) == enhancement.get("upgrade_fingerprint")
+                and current.service_description == enhancement.get("target_service")
+            )
+            if matches_upgrade and result.outcome is BookingOutcome.BOOKED and result.appointment is not None and result.appointment.external_booking_id:
+                enhancement["phase"] = "booked"
+                await self._record_enhancement("booked", external_booking_id=result.appointment.external_booking_id)
+            elif matches_upgrade and result.outcome is BookingOutcome.CONFLICT:
+                # No successful provider write: offer the original, never create it automatically.
+                from app.services.booking_state import BookingDraft
+                original = BookingDraft.from_dict(enhancement["original"])
+                original.caller_name = current.caller_name
+                original.caller_email = current.caller_email
+                original.read_back = False
+                original.confirmation_authorized = False
+                save_draft(self.session, original)
+                bind_verified_slot(self.session, original.selected_slot)
+                remember_offer(self.session)
+                self.session.entities.pop("accepted_booking_offer", None)
+                enhancement["phase"] = "failed"
+                await self._record_enhancement("failed")
+                self.session.booking_status = "awaiting_confirmation"
+                return json.dumps({"status": "upgrade_unavailable", "booked": False,
+                    "message": "The upgrade is no longer available. Would you like me to continue with your original treatment?"})
+            elif not matches_upgrade:
+                enhancement["phase"] = "superseded"
+                await self._record_enhancement("superseded")
+            elif result.outcome not in {BookingOutcome.BOOKED, BookingOutcome.SKIPPED}:
+                await self._record_enhancement("failed")
         apply_booking_result(self.session, result)
         if result.appointment is not None:
             self.session.entities["active_appointment_id"] = str(result.appointment.id)
@@ -2071,6 +1878,22 @@ class XAIVoiceSession:
         async with AsyncSessionLocal() as db:
             result = await cancel_booking(db, self.session, appointment_id=appointment_id)
         apply_booking_result(self.session, result)
+        if result.outcome is BookingOutcome.CANCELLED:
+            self._availability_recent.clear()
+            self._rejected_probe_signatures_this_turn.clear()
+            self._grounded_exact_times.clear()
+            self._tool_chain_depth_this_turn = 0
+            self.session.entities.pop("callback_offer_pending", None)
+            self.session.entities.pop("requested_availability_window", None)
+            if result.appointment:
+                appointment = result.appointment
+                minutes = int((appointment.end_time - appointment.start_time).total_seconds() / 60)
+                service = appointment.title or ""
+                if not re.search(r"\b\d+\s*(?:min|minute)", service, re.I):
+                    service = f"{minutes} minute {service}"
+                self.session.entities["last_cancelled_appointment"] = {
+                    "start_iso": appointment.start_time.isoformat(), "service": service,
+                }
         if result.outcome is not BookingOutcome.SKIPPED:
             self.session.add_turn("system", result.to_system_message())
         await self._persist_session()
@@ -2125,6 +1948,14 @@ class XAIVoiceSession:
     ) -> None:
         """Search a morning/afternoon/evening the caller named, not one invented minute."""
         start, end = window
+        draft = get_draft(self.session)
+        signature = json.dumps({"window": [start.date().isoformat(), end.isoformat()],
+            "service": " + ".join(parsed_args.get("requested_services") or []) or parsed_args.get("service_description") or draft.service_description,
+            "staff": parsed_args.get("preferred_staff") or draft.preferred_staff}, sort_keys=True)
+        cached = cached_availability_output(self._availability_recent, signature, time.monotonic(), source="day_window")
+        if cached is not None:
+            await self._send_function_output(call_ref, cached, nudge=False)
+            return
         try:
             intent = AppointmentIntent(
                 confidence=1.0,
@@ -2132,35 +1963,69 @@ class XAIVoiceSession:
                 caller_name=parsed_args.get("caller_name"),
                 caller_email=parsed_args.get("caller_email"),
                 service_description=parsed_args.get("service_description"),
+                requested_services=parsed_args.get("requested_services") or [],
                 preferred_staff=parsed_args.get("preferred_staff"),
                 guest_name=parsed_args.get("guest_name"),
             )
         except Exception:
             intent = AppointmentIntent(confidence=1.0, intent="schedule")
+        caller_turn = self._user_turn_count
+        async def lookup(_raw: str) -> str:
+            if intent.service_description or get_draft(self.session).service_description:
+                await self._arm_availability_hold()
+            try:
+                async with AsyncSessionLocal() as db:
+                    result = await search_day_part(db, self.session, intent, start, end)
+                return json.dumps({"status": result.outcome.value, "message": result.message})
+            finally:
+                self._availability_lookup_open = False
         try:
-            async with AsyncSessionLocal() as db:
-                result = await search_day_part(db, self.session, intent, start, end)
+            result_payload = json.loads(await self._invoke_tool_with_hold(CHECK_AVAILABILITY_TOOL["name"], lookup, "{}"))
         except Exception:
             logger.exception("call %s: day-part search failed", self.call_id)
-            result_message = (
-                "I could not check that part of the day. Ask whether another "
-                "day or time would work. Do not invent a time."
-            )
-            found = False
+            await self._send_function_output(call_ref, json.dumps({"status": "lookup_failed", "lookup_failed": True}), nudge=False)
+            await self._offer_staff_callback()
+            return
         else:
-            result_message = result.message
-            found = "Openings" in result.message
+            if caller_turn != self._user_turn_count:
+                await self._send_function_output(call_ref, json.dumps({"status": "stale", "available": False}), nudge=False)
+                return
+            result_message = result_payload.get("message") or ""
+            found = "Openings" in result_message
+            if result_payload.get("status") == BookingOutcome.ERROR.value:
+                await self._send_function_output(call_ref, json.dumps({**result_payload, "lookup_failed": True}), nudge=False)
+                await self._offer_staff_callback()
+                return
+            if result_payload.get("status") == "lookup_timeout":
+                await self._send_function_output(call_ref, json.dumps(result_payload), nudge=False)
+                return
+            if result_payload.get("status") == BookingOutcome.SKIPPED.value:
+                await self._send_function_output(call_ref, json.dumps(result_payload), nudge=False)
+                return
+            if result_payload.get("status") == BookingOutcome.MISSING_INFO.value:
+                self.session.entities["requested_availability_window"] = [start.isoformat(), end.isoformat()]
+                await self._persist_session()
+                output = json.dumps({"status": "missing_info", "available": False,
+                    "message": result_message, "spoken": "Which service would you like, and for how many minutes?"})
+                self._availability_recent[signature] = (time.monotonic(), output)
+                if not self._availability_model_response_id:
+                    self._availability_model_response_id = self._active_response_id
+                await self._deliver_authoritative_availability(call_ref, output)
+                return
+            self.session.entities.pop("requested_availability_window", None)
         await self._persist_session()
-        await self._send_function_output(
-            call_ref,
-            json.dumps({
+        output = json.dumps({
                 "status": "day_part_openings" if found else "day_part_empty",
                 "available": found,
                 "window_start": start.strftime("%Y-%m-%dT%H:%M:%S"),
                 "window_end": end.strftime("%Y-%m-%dT%H:%M:%S"),
                 "message": result_message,
-            }),
-        )
+                "spoken": (grounded_availability_speech(self.session, self._tz) + " Which time would you prefer?"
+                    if found and grounded_availability_speech(self.session, self._tz)
+                    else "I couldn't verify an opening for that request. Would another day work?"),
+            })
+        self._availability_recent[signature] = (time.monotonic(), output)
+        await self._deliver_authoritative_availability(call_ref, output)
 
     async def _block_unverified_availability(self, spoken: str) -> None:
         """Stop an availability sentence that Square has not verified.
@@ -2431,7 +2296,7 @@ class XAIVoiceSession:
         parsed, or if nothing recent enough establishes one at all — see
         `_RECENT_DATE_CONTEXT_TURNS`.
         """
-        today = datetime.now(self._tz).date()
+        today = self._now().date()
         recent = self._recent_user_utterances(_RECENT_DATE_CONTEXT_TURNS + 1)
         for utterance in recent[1:]:  # [0] is the current turn itself
             has_date = _DATE_MENTION_RE.search(utterance)
@@ -2460,7 +2325,7 @@ class XAIVoiceSession:
 
     def _prior_date_is_weekday(self) -> bool:
         """True when the date still in play came from a weekday name, not a calendar date."""
-        today = datetime.now(self._tz).date()
+        today = self._now().date()
         recent = self._recent_user_utterances(_RECENT_DATE_CONTEXT_TURNS + 1)
         for utterance in recent[1:]:
             has_date = bool(_DATE_MENTION_RE.search(utterance))
@@ -2486,7 +2351,7 @@ class XAIVoiceSession:
         clock = _extract_clock_time(utterance)
         if clock is None:
             return None
-        now = datetime.now(self._tz)
+        now = self._now()
         spoken_date, source = self._spoken_date(utterance, now.date())
         # Calendar dates and "tomorrow" stay exactly as the model sent them.
         # Only a weekday ("Thursday at 4pm", or "4pm" after "Thursday") is
@@ -2504,16 +2369,31 @@ class XAIVoiceSession:
         """Local window for "Saturday afternoon" when no clock time was said."""
         utterance = self._last_user_utterance()
         if not utterance or _extract_clock_time(utterance):
+            self.session.entities.pop("requested_availability_window", None)
             return None
         hours = _extract_day_part(utterance)
-        if hours is None:
+        date_wide = bool(re.search(
+            r"\b(availability|openings|available|what\s+times)\b", utterance, re.I
+        )) or bool(self.session.entities.get("requested_availability_window") and _DATE_MENTION_RE.search(utterance))
+        if hours is None and not date_wide:
+            pending = self.session.entities.get("requested_availability_window")
+            if pending and not _DATE_MENTION_RE.search(utterance):
+                start, end = (_parse_dt(value, self._tz) for value in pending)
+                now = self._now()
+                if start is not None and end is not None and end > now:
+                    return max(start, now), end
             return None
-        now = datetime.now(self._tz)
+        now = self._now()
         spoken_date, source = self._spoken_date(utterance, now.date())
         if spoken_date is None or source == "none":
             return None
-        start = datetime.combine(spoken_date, hours[0], tzinfo=self._tz)
-        end = datetime.combine(spoken_date, hours[1], tzinfo=self._tz)
+        if hours is None:
+            start = datetime.combine(spoken_date, dt_time.min, tzinfo=self._tz)
+            end = datetime.combine(spoken_date + timedelta(days=1), dt_time.min, tzinfo=self._tz)
+            start = max(start, now)
+        else:
+            start = datetime.combine(spoken_date, hours[0], tzinfo=self._tz)
+            end = datetime.combine(spoken_date, hours[1], tzinfo=self._tz)
         weekday_based = source == "weekday" or (
             source == "active" and self._prior_date_is_weekday()
         )
@@ -2536,6 +2416,13 @@ class XAIVoiceSession:
             return None
         return target.astimezone(timezone.utc).isoformat()
 
+    def _cancelled_slot_reference(self) -> dict[str, Any] | None:
+        utterance = self._last_user_utterance() or ""
+        if (_DATE_MENTION_RE.search(utterance) or _extract_clock_time(utterance)
+                or not re.search(r"\b(?:same|that)\s+(?:time|slot|appointment)\b", utterance, re.I)):
+            return None
+        return self.session.entities.get("last_cancelled_appointment")
+
     def _is_time_grounded(self, requested_start_iso: str | None) -> bool:
         """Whether an exact-time probe has real evidence behind it.
 
@@ -2553,6 +2440,11 @@ class XAIVoiceSession:
         key = self._time_key(requested_start_iso)
         if key is None:
             return False
+        cancelled = self._cancelled_slot_reference()
+        if cancelled and key == self._time_key(cancelled.get("start_iso")):
+            # Caller authorization to SEARCH only. A cancelled appointment is
+            # never evidence that its slot is currently free or booked.
+            return True
 
         # Same exact caller-grounded instant may be retried without forcing the
         # caller to repeat themselves.
@@ -2705,6 +2597,13 @@ class XAIVoiceSession:
 
         if tool_name != CONFIRM_APPOINTMENT_TOOL["name"]:
             return None
+        if status == "conflict":
+            alternatives = grounded_availability_speech(self.session, self._tz)
+            return (
+                "It looks like that time was just taken, but I can check the next closest openings for you. "
+                + (alternatives + " Which time would you prefer?" if alternatives
+                   else "Would you like me to check another day?")
+            )
         if status not in {"booked", "rescheduled"}:
             return None
         if not payload.get("appointment_id") or not payload.get("external_booking_id"):
@@ -2720,6 +2619,16 @@ class XAIVoiceSession:
         confirmed = self.session.confirmed_datetime
 
         def finish(sentence: str) -> str:
+            slot = get_draft(self.session).selected_slot or {}
+            if slot.get("visit_segments"):
+                itinerary = []
+                for item in slot["visit_segments"]:
+                    begins = datetime.fromisoformat(item["start"]).astimezone(self._tz).strftime("%I:%M %p").lstrip("0")
+                    ends = datetime.fromisoformat(item["end"]).astimezone(self._tz).strftime("%I:%M %p").lstrip("0")
+                    staff = f" with {item['provider_name']}" if item.get("provider_name") else ""
+                    itinerary.append(f"{item['service_name']} from {begins} to {ends}{staff}")
+                sentence = sentence.replace("Is there anything else I can help you with today?", "")
+                sentence += " Your visit includes " + "; then ".join(itinerary) + f". Total visit time is {slot['duration_minutes']} minutes. Is there anything else I can help you with today?"
             if payload.get("card_status") == "pending_card":
                 sentence = sentence.replace("You're all set. ", "")
                 sentence = sentence.replace("is confirmed", "is reserved pending your card on file")
@@ -2868,6 +2777,39 @@ class XAIVoiceSession:
             self._availability_expect_hold = True
             await self._send_force_message(HOLD_ACK_TEXT)
 
+    async def _record_enhancement(self, status: str, **extra) -> None:
+        from app.services.enhancements import record
+        try:
+            async with AsyncSessionLocal() as db:
+                await record(db, self.session, status, **extra)
+        except Exception:
+            logger.warning("call %s: enhancement analytics unavailable", self.call_id)
+
+    async def _maybe_enhancement(self) -> str | None:
+        from app.services.enhancements import prepare, KEY
+        if not self.session.entities.get("smart_enhancements_enabled") or self.session.entities.get(KEY):
+            return None
+        try:
+            async with AsyncSessionLocal() as db:
+                routing = await _prepare(db, self.session)
+                line = await asyncio.wait_for(prepare(db, self.session, routing), timeout=3.0)
+                if offer_accepted(self.session) or get_draft(self.session).is_persisted:
+                    state = self.session.entities.get(KEY)
+                    if state:
+                        state["phase"] = "superseded"
+                    return None
+                if line:
+                    self.session.entities[KEY]["presented"] = True
+                    await self._record_enhancement("presented")
+                return line
+        except Exception:
+            # Optional reads cannot break the requested booking or cause silent loops.
+            state = self.session.entities.get(KEY)
+            if state:
+                state["phase"] = "skipped"
+            logger.info("call %s: enhancement skipped; original booking preserved", self.call_id)
+            return None
+
     async def _speak_availability(self, spoken: str) -> None:
         """Offer once; collect identity after the caller accepts the slot."""
         draft = get_draft(self.session)
@@ -2882,6 +2824,11 @@ class XAIVoiceSession:
         }
         self._after_availability_line = None
         self._prompt_caller_name_after_response = False
+        suggestion = await self._maybe_enhancement()
+        if suggestion:
+            # One question: retain the real original slot read-back, defer booking consent.
+            spoken = re.split(r"(?i)(?:would you like|shall I|may I|do you want)", spoken)[0].strip()
+            spoken = f"{spoken} {suggestion}"
         await self._send_force_message(spoken)
 
     async def _deliver_authoritative_availability(self, call_ref: str | None, output: str) -> None:
@@ -3013,6 +2960,10 @@ class XAIVoiceSession:
         if name in self._AVAILABILITY_PROBE_TOOLS and self._recover_availability_tool:
             self._recover_availability_tool = False
 
+        from app.services.enhancements import pending as enhancement_pending
+        if (enhancement_pending(self.session) or (self.session.entities.get("smart_enhancement") or {}).get("phase") == "checking") and name in self._AVAILABILITY_PROBE_TOOLS | {CONFIRM_APPOINTMENT_TOOL["name"]}:
+            await self._send_function_output(call_ref, json.dumps({"status": "awaiting_enhancement_response", "booked": False}), nudge=False)
+            return
         if self.session.entities.get("callback_offer_pending") and name in self._AVAILABILITY_PROBE_TOOLS | {CONFIRM_APPOINTMENT_TOOL["name"]}:
             await self._send_function_output(call_ref, json.dumps({"status": "awaiting_callback_consent", "booked": False}), nudge=False)
             return
@@ -3082,6 +3033,15 @@ class XAIVoiceSession:
                 parsed_args = json.loads(raw_args or "{}")
             except (TypeError, ValueError):
                 parsed_args = {}
+            cancelled = self._cancelled_slot_reference()
+            if parsed_args.get("requested_services"):
+                parsed_args["service_description"] = " + ".join(parsed_args["requested_services"])
+                raw_args = json.dumps(parsed_args)
+            if cancelled:
+                parsed_args.setdefault("requested_start_iso", cancelled["start_iso"])
+                parsed_args.setdefault("service_description", cancelled.get("service"))
+                parsed_args["earliest"] = False
+                raw_args = json.dumps(parsed_args)
             spoken_window = self._spoken_day_part_window()
             if spoken_window is not None and name in {
                 CHECK_AVAILABILITY_TOOL["name"],
@@ -3113,7 +3073,12 @@ class XAIVoiceSession:
             # (and its follow-up) over and over — this is the actual
             # loop-breaker, independent of whether the model respects the
             # speech-only continuation below.
-            signature = (name, self._time_key(requested_start) if not is_earliest else "earliest")
+            signature = (name, json.dumps({
+                "time": self._time_key(requested_start) if not is_earliest else "earliest",
+                "service": parsed_args.get("service_description"),
+                "staff": parsed_args.get("preferred_staff"),
+                "revision": get_draft(self.session).draft_revision,
+            }, sort_keys=True))
             if signature in self._rejected_probe_signatures_this_turn:
                 logger.error(
                     "TOOL_CONTINUATION blocked call=%s turn=%d tool=%s reason=duplicate_rejected_probe "
@@ -3172,16 +3137,22 @@ class XAIVoiceSession:
                     self.call_id, requested_start,
                 )
                 self._rejected_probe_signatures_this_turn.add(signature)
+                attempts = self._grounding_rejections.get(signature, 0) + 1
+                self._grounding_rejections[signature] = attempts
+                if attempts >= 2:
+                    await self._send_function_output(call_ref, json.dumps({
+                        "status": "needs_staff_help", "booked": False,
+                        "message": "The requested appointment needs clarification. Nothing has been booked."
+                    }), nudge=False)
+                    await self._offer_staff_callback()
+                    return
                 await self._send_function_output(
                     call_ref,
                     json.dumps({
                         "status": "ungrounded_time",
                         "available": False,
                         "message": (
-                            "That exact time was not something the caller just said, nor "
-                            "one of the options already offered. Ask the caller for a "
-                            "date/time, or use earliest=true if they want the soonest "
-                            "opening — do not guess another time yourself."
+                            "Which date and time would you like? Please include AM or PM."
                         ),
                     }),
                     restrict_continuation=True,
@@ -3447,6 +3418,12 @@ class XAIVoiceSession:
         # type == "error" would file real failures under _UNHANDLED.
         if etype == "error" or (not etype and "error" in event):
             message = _first_str(data, "message", "error", "code") or json.dumps(data)[:300]
+            if "cancellation failed: no active response found" in message.lower():
+                # Generation can finish on the server before its response.done
+                # reaches us. A cancel in that interval is benign: do not replay
+                # the greeting or disturb a newer response when the error arrives.
+                logger.info("call %s: response cancellation raced with completion", self.call_id)
+                return
             logger.error("call %s: xAI realtime error: %s", self.call_id, message)
             if self.session.greeting_sent:
                 truth(
@@ -3517,6 +3494,10 @@ class XAIVoiceSession:
                         response_id=self._greeting_response_id,
                     )
             elif etype == "response.done":
+                event_response_id = self._response_id_of(data)
+                if (event_response_id and self._active_response_id
+                        and event_response_id != self._active_response_id):
+                    return
                 self._mark_timing("LLM COMPLETE")
                 self._flush_agent_turn()
                 self._finish_turn()
@@ -3676,6 +3657,8 @@ class XAIVoiceSession:
                     if self.session.booking_status != "none"
                     else "no_booking",
                     "linked_appointment_id": self.session.appointment_id,
+                    "sensitive_health_request": bool(self.session.entities.get("sensitive_health_request")),
+                    "medical_workflow_enabled": False,
                 }
                 if analysis:
                     call_log.ai_summary = analysis.summary

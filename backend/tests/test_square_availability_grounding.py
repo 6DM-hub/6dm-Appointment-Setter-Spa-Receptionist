@@ -509,7 +509,7 @@ def _patch_booking(monkeypatch, calendar):
         "app.services.appointment_booking_service._has_conflict",
         lambda *_a, **_k: _async(False),
     )
-    for name in ("_load_by_intent_key", "_load_active_appointment", "_load_call_owned_appointment", "_load_call_log_id"):
+    for name in ("_unresolved_booking", "_load_by_intent_key", "_load_active_appointment", "_load_call_owned_appointment", "_load_call_log_id"):
         monkeypatch.setattr(
             f"app.services.appointment_booking_service.{name}",
             lambda *_a, **_k: _async(None),

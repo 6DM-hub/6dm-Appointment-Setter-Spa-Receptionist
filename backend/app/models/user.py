@@ -43,6 +43,8 @@ class User(Base, UUIDPrimaryKeyMixin, TimestampMixin):
             " OR (role <> 'super_admin' AND tenant_id IS NOT NULL)",
             name="ck_users_role_tenant_consistency",
         ),
+        CheckConstraint("NOT is_business_master OR (role = 'spa_admin' AND tenant_id IS NOT NULL)",
+                        name="ck_users_business_master_scope"),
     )
 
     email: Mapped[str] = mapped_column(
@@ -52,6 +54,8 @@ class User(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     full_name: Mapped[str | None] = mapped_column(String(255))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_superuser: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Provisioned explicitly, independently of platform administration.
+    is_business_master: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
 
     role: Mapped[UserRole] = mapped_column(
         Enum(

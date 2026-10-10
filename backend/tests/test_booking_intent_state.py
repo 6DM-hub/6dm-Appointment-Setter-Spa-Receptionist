@@ -176,6 +176,7 @@ def world(monkeypatch):
     monkeypatch.setattr(svc, "get_booking_adapter", lambda **_k: adapter)
     monkeypatch.setattr(svc, "_lock_call", _noop)
     monkeypatch.setattr(svc, "_lock_slot", _noop)
+    monkeypatch.setattr(svc, "_unresolved_booking", _noop)
     monkeypatch.setattr(svc, "_load_call_log_id", _noop)
     monkeypatch.setattr(svc, "persist_caller_identity", _noop)
 
@@ -657,14 +658,14 @@ async def test_provider_timeout_is_not_confirmed_and_does_not_duplicate_on_retry
     assert first.outcome is BookingOutcome.ERROR
     assert world["store"].live == []
 
-    # The provider recovers; the caller (or the agent) retries the same
-    # confirmation. Exactly one appointment must exist afterward.
+    # A healthy provider does not prove that the timed-out write failed.
+    # Keep the request blocked until authoritative reconciliation.
     adapter.create_booking_failure = None
     second = await confirm_booking(db, session)
 
-    assert second.outcome is BookingOutcome.BOOKED
-    assert len(world["store"].live) == 1
-    assert len(world["adapter"].created) == 1
+    assert second.outcome is BookingOutcome.ERROR
+    assert len(world["store"].live) == 0
+    assert len(world["adapter"].created) == 0
 
 
 async def test_genuine_slot_conflict_is_classified_as_conflict_not_a_technical_error(world):
@@ -840,6 +841,7 @@ async def test_duplicate_swedish_names_recheck_and_create_same_sixty_minute_slot
 
     spa = world["spa"]
     spa.timezone = "America/Chicago"
+    spa.business_hours = {"fri": [{"open": "09:00", "close": "18:00"}]}
     spa.services = [
         {"name": "Swedish Massage", "duration_minutes": 60},
         {"name": "Swedish Massage", "duration_minutes": 90},
