@@ -51,10 +51,12 @@ def test_bare_three_does_not_invent_meridiem_or_availability():
     assert not v._is_time_grounded(tomorrow(v).isoformat())
 
 
-async def test_repeated_ungrounded_slot_across_turns_offers_callback(monkeypatch):
+async def test_repeated_unclear_time_preference_offers_callback_without_guessing(monkeypatch):
     v=voice()
     v._send_function_output=AsyncMock()
     v._offer_staff_callback=AsyncMock()
+    v._send_force_message=AsyncMock()
+    v._cancel_active_response=AsyncMock()
     v._persist_session=AsyncMock()
     v._run_propose_appointment=AsyncMock()
     say(v,'Tomorrow')
@@ -62,8 +64,11 @@ async def test_repeated_ungrounded_slot_across_turns_offers_callback(monkeypatch
         say(v,utterance)
         await v._handle_function_call({'name':'propose_appointment','call_id':str(i),'arguments':json.dumps({'requested_start_iso':tomorrow(v).isoformat(),'service_description':'60 minute deep tissue massage','preferred_staff':'SIX'})})
     outputs=[json.loads(call.args[1]) for call in v._send_function_output.await_args_list]
-    assert [o['status'] for o in outputs]==['ungrounded_time','needs_staff_help']
-    assert outputs[0]['message']=='Which date and time would you like? Please include AM or PM.'
+    assert [o['status'] for o in outputs]==['missing_day_part','needs_staff_help']
+    assert outputs[0]['message']=="What's the best time for you to come in?"
+    v._send_force_message.assert_awaited_once_with(
+        "What's the best time for you to come in?"
+    )
     v._offer_staff_callback.assert_awaited_once()
     v._run_propose_appointment.assert_not_awaited()
     say(v,'Tomorrow at 3 PM')

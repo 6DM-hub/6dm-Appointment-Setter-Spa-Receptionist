@@ -754,7 +754,8 @@ LOOKUP_SPA_FACTS_TOOL: dict[str, Any] = {
         "Look up authoritative spa business facts from the dashboard and the "
         "active booking provider. REQUIRED before answering questions about "
         "location, address, hours, phone, services, prices, policies, packages, "
-        "upsells, payment, or a catalog-grounded facial/massage consultation. "
+        "upsells, or payment. Facial and massage booking consultations are "
+        "managed by propose_appointment. "
         "Never invent a fact if this tool returns unknown."
     ),
     "parameters": {
@@ -773,7 +774,6 @@ LOOKUP_SPA_FACTS_TOOL: dict[str, Any] = {
                     "vip",
                     "upsells",
                     "payment",
-                    "consultation",
                     "all",
                 ],
             },
@@ -788,51 +788,6 @@ LOOKUP_SPA_FACTS_TOOL: dict[str, Any] = {
             "location_query": {
                 "type": "string",
                 "description": "Branch or city the caller named, if any.",
-            },
-            "consultation_kind": {
-                "type": "string",
-                "enum": ["facial", "massage"],
-                "description": "Which service family the caller wants help choosing.",
-            },
-            "main_concern": {
-                "type": "string",
-                "description": "Brief non-medical skin concern, without identity or card details.",
-            },
-            "skin_feel": {
-                "type": "string",
-                "description": "Oily, dry, combination, or balanced, as stated by the caller.",
-            },
-            "skin_flags": {
-                "type": "string",
-                "description": "Only whether breakouts, sensitivity, or redness were stated; do not add medical detail.",
-            },
-            "massage_reason": {
-                "type": "string",
-                "description": "Brief goal such as relaxation, tension, or recovery; omit medical detail.",
-            },
-            "massage_areas": {
-                "type": "string",
-                "description": "General focus area such as shoulders or feet; never include injury details.",
-            },
-            "pressure_preference": {
-                "type": "string",
-                "description": "Light, medium, or deeper pressure, as stated by the caller.",
-            },
-            "safety_answered": {
-                "type": "boolean",
-                "description": (
-                    "True after the caller answered whether there are injuries or areas to avoid. "
-                    "Never include or repeat their details."
-                ),
-            },
-            "selected_service_name": {
-                "type": "string",
-                "description": "Exact configured service name the caller selected, if already chosen.",
-            },
-            "selected_duration_minutes": {
-                "type": "integer",
-                "enum": [30, 60],
-                "description": "The real 30- or 60-minute option the caller selected.",
             },
         },
         "required": ["topic"],
@@ -1324,6 +1279,9 @@ class XAIVoiceSession:
         resolved = _extract_explicit_date(text, today)
         weekday = _extract_weekday_date(text, today)
         if resolved is not None:
+            # A newly chosen day starts one fresh time-preference exchange.
+            self.session.entities.pop("day_part_question_turn", None)
+            self.session.entities.pop("time_preference_question_attempts", None)
             self.session.entities["caller_grounded_requested_date"] = {
                 "date": resolved.isoformat(),
                 "source": "weekday" if weekday == resolved else "explicit",
@@ -1343,6 +1301,8 @@ class XAIVoiceSession:
             return
         hours = _extract_day_part(text)
         if hours is not None:
+            self.session.entities.pop("day_part_question_turn", None)
+            self.session.entities.pop("time_preference_question_attempts", None)
             active_date = self._active_established_date()
             if active_date is not None:
                 start = datetime.combine(active_date, hours[0], tzinfo=self._tz)
@@ -4858,11 +4818,22 @@ class XAIVoiceSession:
             )
             raw_args = json.dumps(parsed_args)
 
-            # A calendar day plus a service is enough to continue the
-            # conversation, but it is not permission for the model to invent
-            # one exact timestamp or to dump an entire day of results. Ask for
-            # the caller's preferred part of day, then perform one bounded
-            # provider search that returns at most three real openings.
+            # Complete the server-owned consultation and its soft choices
+            # before asking scheduling questions. This keeps the consultation
+            # from appearing in the middle of an availability search.
+            if not skip_consultation and await self._enforce_service_consultation(
+                call_ref, parsed_args
+            ):
+                return
+            self._apply_caller_service_durations(parsed_args)
+            self._coalesce_service_arguments(parsed_args)
+            raw_args = json.dumps(parsed_args)
+
+            # A calendar day plus a service is enough to ask for the caller's
+            # preferred time, but it is not permission for the model to invent
+            # one exact timestamp or dump an entire day of results. An explicit
+            # morning/afternoon/evening window is already a complete preference
+            # and must flow directly into a bounded provider search.
             utterance = self._last_user_utterance() or ""
             approximate_hour = re.search(
                 rf"\b(?:around|about|near)\s+(?:[01]?\d|2[0-3]|{_TIME_WORD})\b",
@@ -4875,43 +4846,60 @@ class XAIVoiceSession:
                 and approximate_hour is None
             )
             pending_window = self.session.entities.get("requested_availability_window")
-            caller_named_day = bool(_DATE_MENTION_RE.search(utterance))
+            active_date = self._active_established_date()
             has_service = bool(
                 parsed_args.get("service_description")
                 or parsed_args.get("requested_services")
                 or get_draft(self.session).service_description
             )
-            if no_spoken_time and has_service and (caller_named_day or pending_window):
-                if caller_named_day:
-                    now = self._now()
-                    named_date, source = self._spoken_date(utterance, now.date())
-                    if named_date is not None and source != "none":
-                        day_start = datetime.combine(named_date, dt_time.min, tzinfo=self._tz)
-                        day_end = datetime.combine(named_date + timedelta(days=1), dt_time.min, tzinfo=self._tz)
-                        self.session.entities["requested_availability_window"] = [
-                            max(day_start, now).isoformat(), day_end.isoformat()
-                        ]
+            requested_start = parsed_args.get("requested_start_iso")
+            grounded_existing_start = bool(
+                requested_start and self._is_time_grounded(requested_start)
+            )
+            if (
+                no_spoken_time
+                and has_service
+                and active_date is not None
+                and not pending_window
+                and not grounded_existing_start
+            ):
+                attempts = int(
+                    self.session.entities.get("time_preference_question_attempts") or 0
+                )
+                previous_turn = self.session.entities.get("day_part_question_turn")
+                if previous_turn != self._user_turn_count:
+                    attempts += 1
+                    self.session.entities["time_preference_question_attempts"] = attempts
+                if attempts >= 2:
+                    await self._send_function_output(
+                        call_ref,
+                        json.dumps({
+                            "status": "needs_staff_help",
+                            "available": False,
+                            "booked": False,
+                            "message": (
+                                "The appointment time still needs clarification. "
+                                "Nothing has been booked."
+                            ),
+                        }),
+                        nudge=False,
+                    )
+                    await self._offer_staff_callback()
+                    return
                 await self._send_function_output(
                     call_ref,
                     json.dumps({
                         "status": "missing_day_part",
                         "available": False,
-                        "message": "Would you prefer a morning, afternoon, or evening appointment?",
+                        "message": "What's the best time for you to come in?",
                     }),
                     nudge=False,
                 )
                 if self.session.entities.get("day_part_question_turn") != self._user_turn_count:
                     self.session.entities["day_part_question_turn"] = self._user_turn_count
                     await self._cancel_active_response()
-                    await self._send_force_message("Would you prefer morning, afternoon, or evening?")
+                    await self._send_force_message("What's the best time for you to come in?")
                 return
-            if not skip_consultation and await self._enforce_service_consultation(
-                call_ref, parsed_args
-            ):
-                return
-            self._apply_caller_service_durations(parsed_args)
-            self._coalesce_service_arguments(parsed_args)
-            raw_args = json.dumps(parsed_args)
             spoken_window = self._spoken_day_part_window()
             if spoken_window is not None and name in {
                 CHECK_AVAILABILITY_TOOL["name"],

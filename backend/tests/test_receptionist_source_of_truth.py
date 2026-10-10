@@ -49,21 +49,19 @@ def test_realtime_prompt_contains_grounded_consultation_flow():
     assert "ask one question at a time" in text
     assert "For every facial booking request" in text
     assert "For every massage booking request" in text
-    assert "gather the remaining quick consultation answers" in text
+    assert "backend owns the full consultation" in text
+    assert "never restart consultation through lookup_spa_facts" in text
     assert "Offer both only when the tool confirms both" in text
     assert "qualified providers and any provider-managed transition time" in text
     assert text.index("Persona only.") < text.index("FACIAL AND MASSAGE CONSULTATION RULES")
 
 
-def test_realtime_fact_tool_accepts_consultation_without_injury_fields():
+def test_realtime_fact_tool_does_not_duplicate_server_managed_consultation():
     properties = LOOKUP_SPA_FACTS_TOOL["parameters"]["properties"]
     topics = properties["topic"]["enum"]
-    assert "consultation" in topics
-    assert properties["consultation_kind"]["enum"] == ["facial", "massage"]
-    assert properties["selected_duration_minutes"]["enum"] == [30, 60]
-    assert properties["safety_answered"]["type"] == "boolean"
-    assert "areas_to_avoid" not in properties
-    assert "injuries" not in properties
+    assert "consultation" not in topics
+    assert "managed by propose_appointment" in LOOKUP_SPA_FACTS_TOOL["description"]
+    assert "consultation_kind" not in properties
 
 
 def test_service_consultation_metadata_survives_account_validation():

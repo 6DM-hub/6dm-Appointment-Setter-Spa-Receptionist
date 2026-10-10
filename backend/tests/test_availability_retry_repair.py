@@ -326,10 +326,11 @@ async def test_day_query_asks_for_missing_service_without_provider_lookup(monkey
     prepare.assert_not_awaited()
 
 
-async def test_day_and_service_ask_for_day_part_before_any_provider_probe(monkeypatch):
+async def test_completed_consultation_asks_best_time_before_any_provider_probe(monkeypatch):
     v = voice()
-    v.session.add_turn("user", "Tomorrow for a 60 minute deep tissue massage")
-    v._user_turn_count = 1
+    v._pending_caller = "Tomorrow for a 60 minute deep tissue massage"
+    v._flush_caller_turn()
+    v._enforce_service_consultation = AsyncMock(return_value=False)
     v._send_function_output = AsyncMock()
     v._send_force_message = AsyncMock()
     v._cancel_active_response = AsyncMock()
@@ -346,11 +347,13 @@ async def test_day_and_service_ask_for_day_part_before_any_provider_probe(monkey
     })
 
     v._run_propose_appointment.assert_not_awaited()
+    v._enforce_service_consultation.assert_awaited_once()
     v._send_force_message.assert_awaited_once_with(
-        "Would you prefer morning, afternoon, or evening?"
+        "What's the best time for you to come in?"
     )
     output = json.loads(v._send_function_output.await_args.args[1])
     assert output["status"] == "missing_day_part"
+    assert output["message"] == "What's the best time for you to come in?"
 
 
 def test_service_clarification_retains_requested_day():
