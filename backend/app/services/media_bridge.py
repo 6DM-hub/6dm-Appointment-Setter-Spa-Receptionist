@@ -37,7 +37,9 @@ from app.services.xai_realtime import (
     XAIVoiceSession,
     build_xai_realtime_url,
     _AUDIO_DELTA_EVENTS,
+    _CALLER_TRANSCRIPT_DONE,
     _FUNCTION_CALL_DONE,
+    _first_str,
 )
 
 logger = logging.getLogger(__name__)
@@ -423,8 +425,10 @@ class TwilioMediaBridge(XAIVoiceSession):
                 )
                 return
             await self.stop_hold_tone()
-            self._pending_availability_speech = None
-            self._availability_speech_interrupted = True
+            self._cancel_availability_hold_watchdog()
+            # VAD start alone is not proof of caller speech. Noise and echo can
+            # generate start/stop with no transcript; keep a completed Square
+            # result buffered until a non-empty caller utterance exists.
             if self.session.greeting_sent:
                 # server_vad has already interrupted generation before sending
                 # speech_started. Sending another cancel races response.done.
@@ -443,6 +447,24 @@ class TwilioMediaBridge(XAIVoiceSession):
                     self._active_response_id = None
                 await self._stop_playback()
             return
+
+        if etype == "input_audio_buffer.speech_stopped":
+            if self._pending_availability_speech is not None:
+                self._start_availability_hold_watchdog()
+
+        if etype in _CALLER_TRANSCRIPT_DONE:
+            caller_text = _first_str(event, "transcript", "text")
+            if (
+                caller_text
+                and caller_text.strip()
+                and self._pending_availability_speech is not None
+            ):
+                # A real caller turn supersedes pending playback. The tool
+                # output is already in the realtime conversation, so xAI can
+                # answer the new words without speaking stale times over them.
+                self._cancel_availability_hold_watchdog()
+                self._pending_availability_speech = None
+                self._availability_speech_interrupted = True
 
         if etype == "response.created":
             self._allow_audio = True
@@ -577,9 +599,7 @@ class TwilioMediaBridge(XAIVoiceSession):
             # cannot play until the lookup returns.
             etype = event.get("type") if isinstance(event, dict) else None
             if etype in _FUNCTION_CALL_DONE:
-                task = asyncio.create_task(self._dispatch(event))
-                self._inflight_tools.add(task)
-                task.add_done_callback(self._inflight_tools.discard)
+                self._spawn_function_call(event)
                 continue
             await self._dispatch(event)
 

@@ -52,7 +52,18 @@ from app.services.appointment_booking_service import (
     _parse_dt,
     _prepare,
 )
-from app.services.spa_facts import lookup_spa_facts
+from app.services.spa_facts import dashboard_facts, lookup_spa_facts
+from app.services.consultation_gate import (
+    availability_gate as consultation_availability_gate,
+    infer_consultation_kind,
+    initialize_consultation,
+    record_duration_selection,
+    record_pending_answer,
+    take_duration_offer,
+    take_massage_addon_offer,
+    take_next_question,
+)
+from app.services.service_consultation import configured_service_for_category
 from app.services.booking_conversation import (remember_offer, accept_offer, offer_accepted, authorize_accepted_offer)
 from app.services.booking_state import (
     CALLER_NAME_QUESTION,
@@ -982,6 +993,9 @@ class XAIVoiceSession:
     MAX_TOOL_CHAIN_DEPTH_PER_TURN = 6
     HOLD_ACK_DELAY_SECONDS = 5.0
     HOLD_TONE_DELAY_SECONDS = 1.2
+    HOLD_RESPONSE_WATCHDOG_SECONDS = 4.0
+    SESSION_PERSIST_TIMEOUT_SECONDS = 2.0
+    TOOL_DRAIN_TIMEOUT_SECONDS = 20.0
     GREETING_WATCHDOG_SECONDS = 2.5
 
     def __init__(
@@ -1083,17 +1097,27 @@ class XAIVoiceSession:
         # probe's follow-up may only ask the caller something, never retry.
         self._restricted_response_needed_after_tool = False
         self._inflight_tools: set[asyncio.Task] = set()
+        self._tool_task_names: dict[asyncio.Task, str] = {}
+        # Function calls must not block the socket receive loop (audio and
+        # barge-in still need to flow), but they do mutate one shared booking
+        # draft.  Serialize only the tool handlers so two calls emitted in one
+        # model response cannot race the same session state.
+        self._tool_dispatch_lock = asyncio.Lock()
         self._hold_ack_played_this_turn = False
         self._hold_ack_index = 0
         self._booking_completed_turn: int | None = None
 
         self._availability_recent: dict[str, tuple[float, str]] = {}
+        self._consultation_catalog_cache: tuple[list[dict[str, Any]], list[dict[str, Any]]] | None = None
+        self._consultation_catalog_available: bool | None = None
         self._availability_lookup_open = False
         self._muted_availability_response_id: str | None = None
         self._availability_model_response_id: str | None = None
         self._availability_hold_response_id: str | None = None
+        self._availability_releasing_hold_response_id: str | None = None
         self._availability_hold_done = False
         self._availability_expect_hold = False
+        self._availability_hold_watchdog_task: asyncio.Task | None = None
         self._pending_availability_speech: str | None = None
         self._prompt_caller_name_after_response = False
         self._caller_name_prompt_after_id: str | None = None
@@ -1304,12 +1328,36 @@ class XAIVoiceSession:
                 "date": resolved.isoformat(),
                 "source": "weekday" if weekday == resolved else "explicit",
             }
+            hours = _extract_day_part(text)
+            if hours is not None:
+                start = datetime.combine(resolved, hours[0], tzinfo=self._tz)
+                end = datetime.combine(resolved, hours[1], tzinfo=self._tz)
+                self.session.entities["requested_availability_window"] = [
+                    start.isoformat(),
+                    end.isoformat(),
+                ]
+            else:
+                # A changed date without a part of day must not inherit an old
+                # morning/afternoon/evening window from the previous request.
+                self.session.entities.pop("requested_availability_window", None)
+            return
+        hours = _extract_day_part(text)
+        if hours is not None:
+            active_date = self._active_established_date()
+            if active_date is not None:
+                start = datetime.combine(active_date, hours[0], tzinfo=self._tz)
+                end = datetime.combine(active_date, hours[1], tzinfo=self._tz)
+                self.session.entities["requested_availability_window"] = [
+                    start.isoformat(),
+                    end.isoformat(),
+                ]
             return
         if _DATE_CANCEL_RE.search(text) or _DATE_MENTION_RE.search(text):
             # A retraction or an unresolved date correction must not revive the
             # older date.  Keep a tombstone so the history fallback cannot
             # resurrect it while we wait for a new caller-provided date.
             self._clear_caller_requested_date()
+            self.session.entities.pop("requested_availability_window", None)
 
     def _clear_caller_requested_date(self) -> None:
         self.session.entities["caller_grounded_requested_date"] = {
@@ -1378,7 +1426,11 @@ class XAIVoiceSession:
                 consultation_kind == "facial" and "facial" in joined_words
             )
             if same_modality:
-                selected = str(consultation.get("selected_service") or "").strip()
+                selected = str(
+                    consultation.get("selected_service")
+                    or consultation.get("selected_service_name")
+                    or ""
+                ).strip()
                 recommended = str(consultation.get("recommended_service") or "").strip()
                 consultation_matches = [
                     value for value in (selected, recommended)
@@ -1450,7 +1502,29 @@ class XAIVoiceSession:
         self.session.add_turn("assistant", text)
 
     async def _persist_session(self) -> None:
-        await self._store().save(self.session)
+        """Best-effort live-call state persistence with a hard latency bound.
+
+        Redis is useful for reconnect/recovery, but the in-memory session is
+        authoritative for the active socket.  A stalled Redis write must never
+        keep a caller in silence after the calendar has already answered.
+        """
+        try:
+            await asyncio.wait_for(
+                self._store().save(self.session),
+                timeout=self.SESSION_PERSIST_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "call %s: live session persistence timed out after %.1fs; continuing",
+                self.call_id,
+                self.SESSION_PERSIST_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            logger.warning(
+                "call %s: live session persistence failed; continuing",
+                self.call_id,
+                exc_info=True,
+            )
 
     @property
     def _booking_is_persisted(self) -> bool:
@@ -2166,9 +2240,7 @@ class XAIVoiceSession:
                 continue
             etype = event.get("type") if isinstance(event, dict) else None
             if etype in _FUNCTION_CALL_DONE:
-                task = asyncio.create_task(self._dispatch(event))
-                self._inflight_tools.add(task)
-                task.add_done_callback(self._inflight_tools.discard)
+                self._spawn_function_call(event)
             else:
                 await self._dispatch(event)
 
@@ -2837,16 +2909,15 @@ class XAIVoiceSession:
                 return
             if result_payload.get("status") == BookingOutcome.MISSING_INFO.value:
                 self.session.entities["requested_availability_window"] = [start.isoformat(), end.isoformat()]
-                await self._persist_session()
                 output = json.dumps({"status": "missing_info", "available": False,
                     "message": result_message, "spoken": "Which service would you like, and for how many minutes?"})
                 self._availability_recent[signature] = (time.monotonic(), output)
                 if not self._availability_model_response_id:
                     self._availability_model_response_id = self._active_response_id
                 await self._deliver_authoritative_availability(call_ref, output)
+                await self._persist_session()
                 return
             self.session.entities.pop("requested_availability_window", None)
-        await self._persist_session()
         output = json.dumps({
                 "status": "day_part_openings" if found else "day_part_empty",
                 "available": found,
@@ -2859,6 +2930,7 @@ class XAIVoiceSession:
             })
         self._availability_recent[signature] = (time.monotonic(), output)
         await self._deliver_authoritative_availability(call_ref, output)
+        await self._persist_session()
 
     async def _block_unverified_availability(self, spoken: str) -> None:
         """Stop an availability sentence that Square has not verified.
@@ -2963,6 +3035,541 @@ class XAIVoiceSession:
         })
         self._availability_recent[signature] = (time.monotonic(), output)
         return output
+
+    @staticmethod
+    def _consultation_service_candidates(args: dict[str, Any]) -> list[str]:
+        """Return caller-requested service phrases without splitting names on 'and'."""
+        raw = args.get("requested_services")
+        if isinstance(raw, list):
+            values = [str(value).strip() for value in raw if str(value).strip()]
+        else:
+            description = str(args.get("service_description") or "").strip()
+            # The booking layer uses a literal plus between structured
+            # services.  Never split on the word "and" because it is part of
+            # real menu names such as Head and Neck Massage.
+            values = [part.strip() for part in description.split(" + ") if part.strip()]
+        return values
+
+    def _remember_consultation_booking_request(self, args: dict[str, Any]) -> None:
+        """Keep scheduling facts while the caller answers consultation questions."""
+        remembered = self.session.entities.get("consultation_booking_request")
+        if not isinstance(remembered, dict):
+            remembered = {}
+        for field in (
+            "requested_start_iso",
+            "requested_end_iso",
+            "service_description",
+            "preferred_staff",
+            "guest_name",
+            "caller_name",
+            "caller_email",
+        ):
+            value = args.get(field)
+            if value not in (None, "", [], {}):
+                remembered[field] = value
+        services = args.get("requested_services")
+        if isinstance(services, list) and any(str(item).strip() for item in services):
+            current = [str(item).strip() for item in services if str(item).strip()]
+            prior = [
+                str(item).strip()
+                for item in remembered.get("requested_services") or []
+                if str(item).strip()
+            ]
+            # Realtime tool calls often repeat only the service currently being
+            # discussed. Preserve other modalities from the caller's original
+            # multi-service request rather than replacing the whole visit with
+            # that partial model argument.
+            current_kinds = {
+                kind
+                for item in current
+                if (kind := infer_consultation_kind(item)) is not None
+            }
+            merged = list(current)
+            for item in prior:
+                kind = infer_consultation_kind(item)
+                if kind is not None and kind not in current_kinds:
+                    merged.append(item)
+                elif kind is None and item.casefold() not in {
+                    value.casefold() for value in merged
+                }:
+                    merged.append(item)
+            remembered["requested_services"] = merged
+            remembered["service_description"] = " + ".join(merged)
+        if args.get("earliest") is True:
+            remembered["earliest"] = True
+        self.session.entities["consultation_booking_request"] = remembered
+
+    def _restore_consultation_booking_request(self, args: dict[str, Any]) -> None:
+        remembered = self.session.entities.get("consultation_booking_request")
+        if not isinstance(remembered, dict):
+            return
+        for field in (
+            "requested_start_iso",
+            "requested_end_iso",
+            "preferred_staff",
+            "guest_name",
+            "caller_name",
+            "caller_email",
+        ):
+            if args.get(field) in (None, "", [], {}):
+                value = remembered.get(field)
+                if value not in (None, "", [], {}):
+                    args[field] = value
+        if not args.get("requested_services") and remembered.get("requested_services"):
+            args["requested_services"] = list(remembered["requested_services"])
+        elif args.get("requested_services") and remembered.get("requested_services"):
+            current = self._consultation_service_candidates(args)
+            prior = [str(item) for item in remembered["requested_services"]]
+            if len(current) == len(prior) == 1:
+                current_kind = infer_consultation_kind(current[0])
+                prior_kind = infer_consultation_kind(prior[0])
+                current_duration = self._spoken_duration_choice(current[0])
+                prior_duration = self._spoken_duration_choice(prior[0])
+                if (
+                    current_kind == prior_kind
+                    and current_duration is None
+                    and (
+                        prior_duration is not None
+                        or current[0].strip().casefold()
+                        in {"facial", "facials", "massage", "massages"}
+                    )
+                ):
+                    args["requested_services"] = prior
+                    args["service_description"] = prior[0]
+                    current = list(prior)
+            # If a partial follow-up drops an explicit duration, restore the
+            # one caller-grounded item of that modality before merging the
+            # remaining services.
+            for index, item in enumerate(current):
+                kind = infer_consultation_kind(item)
+                same_kind = [
+                    old for old in prior
+                    if infer_consultation_kind(old) == kind
+                ]
+                if (
+                    kind is not None
+                    and len(same_kind) == 1
+                    and self._spoken_duration_choice(item) is None
+                    and self._spoken_duration_choice(same_kind[0]) is not None
+                ):
+                    current[index] = same_kind[0]
+            if current:
+                args["requested_services"] = current
+            # Retain services of another modality when xAI repeats only the
+            # consultation item currently in focus.
+            current_kinds = {
+                kind
+                for item in current
+                if (kind := infer_consultation_kind(item)) is not None
+            }
+            merged = list(self._consultation_service_candidates(args))
+            for item in prior:
+                kind = infer_consultation_kind(item)
+                if kind is not None and kind not in current_kinds:
+                    merged.append(item)
+                elif kind is None and item.casefold() not in {
+                    value.casefold() for value in merged
+                }:
+                    merged.append(item)
+            if merged:
+                args["requested_services"] = merged
+                args["service_description"] = " + ".join(merged)
+        if not args.get("service_description") and remembered.get("service_description"):
+            args["service_description"] = remembered["service_description"]
+        if "earliest" not in args and remembered.get("earliest") is True:
+            args["earliest"] = True
+
+    async def _consultation_catalog(
+        self,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        if self._consultation_catalog_cache is not None:
+            return self._consultation_catalog_cache
+
+        async def load() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+            async with AsyncSessionLocal() as db:
+                routing = await _prepare(db, self.session)
+                if routing.spa is None:
+                    self._consultation_catalog_available = False
+                    return [], []
+                if not hasattr(routing.spa, "services"):
+                    self._consultation_catalog_available = False
+                    return [], []
+                facts = dashboard_facts(routing.spa)
+                services = [
+                    dict(item)
+                    for item in facts.get("services") or []
+                    if isinstance(item, dict)
+                ]
+                rules = [
+                    dict(item)
+                    for item in facts.get("upsell_rules") or []
+                    if isinstance(item, dict)
+                ]
+                self._consultation_catalog_available = True
+                return services, rules
+
+        try:
+            self._consultation_catalog_cache = await asyncio.wait_for(load(), timeout=3.0)
+        except Exception:
+            logger.exception("call %s: consultation catalog lookup failed", self.call_id)
+            self._consultation_catalog_available = False
+            self._consultation_catalog_cache = ([], [])
+        return self._consultation_catalog_cache
+
+    async def _speak_consultation_gate(
+        self,
+        call_ref: str | None,
+        *,
+        status: str,
+        spoken: str,
+    ) -> None:
+        """End the model's tool response and play one backend-owned question."""
+        self._response_needed_after_tool = False
+        self._restricted_response_needed_after_tool = False
+        self._pending_forced_tool_message = None
+        await self._send_function_output(
+            call_ref,
+            json.dumps({
+                "status": status,
+                "available": False,
+                "booked": False,
+                "message": spoken,
+                "spoken": spoken,
+            }),
+            nudge=False,
+        )
+        await self._cancel_active_response()
+        await self._send_force_message(spoken)
+
+    @staticmethod
+    def _spoken_duration_choice(text: str) -> int | None:
+        match = re.search(
+            r"\b(30|60|thirty|sixty)\s*(?:-?\s*(?:minute|minutes|min|mins))?\b",
+            text or "",
+            re.IGNORECASE,
+        )
+        if match is None:
+            return None
+        return 30 if match.group(1).casefold() in {"30", "thirty"} else 60
+
+    @staticmethod
+    def _caller_declines_optional_item(text: str) -> bool:
+        return bool(
+            re.search(
+                r"\b(?:no|nope|neither|none|skip|without|not today|no thanks)\b",
+                text or "",
+                re.IGNORECASE,
+            )
+        )
+
+    @staticmethod
+    def _apply_consultation_selection(
+        args: dict[str, Any], kind: str, state: dict[str, Any]
+    ) -> None:
+        selected = str(state.get("selected_service_name") or "").strip()
+        if not selected:
+            return
+        services = XAIVoiceSession._consultation_service_candidates(args)
+        replaced = False
+        updated: list[str] = []
+        for service in services:
+            if not replaced and infer_consultation_kind(service) == kind:
+                updated.append(selected)
+                replaced = True
+            else:
+                updated.append(service)
+        if not replaced:
+            updated.insert(0, selected)
+        args["requested_services"] = updated
+        args["service_description"] = " + ".join(updated)
+
+    async def _enforce_service_consultation(
+        self, call_ref: str | None, args: dict[str, Any]
+    ) -> bool:
+        """Require the configured facial/massage flow before availability.
+
+        Returns True when this tool call was consumed by a consultation step.
+        All calendar/provider facts remain staged in session state meanwhile.
+        """
+        self._restore_consultation_booking_request(args)
+        self._apply_caller_service_durations(args)
+        self._coalesce_service_arguments(args)
+        self._remember_consultation_booking_request(args)
+        services, upsell_rules = await self._consultation_catalog()
+        if self._consultation_catalog_available is False:
+            # A call with no resolved tenant cannot enforce tenant-specific
+            # menu advice. The booking layer will still apply its own routing
+            # refusal; this also keeps isolated guard tests/provider recovery
+            # independent from dashboard fixtures.
+            return False
+        candidates = self._consultation_service_candidates(args)
+        kinds: list[tuple[str, str]] = []
+        for service in candidates:
+            kind = infer_consultation_kind(service, services)
+            if kind and all(existing_kind != kind for existing_kind, _ in kinds):
+                kinds.append((kind, service))
+        if not kinds:
+            return False
+
+        states = self.session.entities.get("consultation_states")
+        if not isinstance(states, dict):
+            states = {}
+        completed = {
+            str(value)
+            for value in self.session.entities.get("consultation_completed_kinds", [])
+            if str(value)
+        }
+        question_turns = self.session.entities.get("consultation_question_turns")
+        if not isinstance(question_turns, dict):
+            question_turns = {}
+        duration_turns = self.session.entities.get("consultation_duration_offer_turns")
+        if not isinstance(duration_turns, dict):
+            duration_turns = {}
+        addon_pending = self.session.entities.get("consultation_addon_pending")
+        if not isinstance(addon_pending, dict):
+            addon_pending = {}
+        caller_text = self._last_user_utterance() or ""
+
+        for kind, requested_service in kinds:
+            prior = states.get(kind)
+            state = initialize_consultation(
+                requested_service,
+                services=services,
+                prior_state=prior if isinstance(prior, dict) else None,
+            )
+            if state is None:
+                continue
+
+            # A backend-owned question can only be answered by a later caller
+            # turn. The model cannot mark fields complete in tool arguments.
+            asked_turn = question_turns.get(kind)
+            if isinstance(asked_turn, int) and self._user_turn_count > asked_turn:
+                recorded = record_pending_answer(state, caller_utterance=caller_text)
+                state = recorded["state"]
+                if recorded.get("status") == "answer_recorded":
+                    question_turns.pop(kind, None)
+
+            question = take_next_question(state)
+            state = question["state"]
+            states[kind] = state
+            self.session.entities["consultation_state"] = state
+            self.session.entities["consultation_states"] = states
+            self.session.entities["consultation_question_turns"] = question_turns
+            if question["status"] == "ask_question":
+                question_turns[kind] = self._user_turn_count
+                self.session.entities["consultation_question_turns"] = question_turns
+                await self._speak_consultation_gate(
+                    call_ref,
+                    status="consultation_required",
+                    spoken=question["question"]["text"],
+                )
+                return True
+            if question["status"] == "awaiting_answer":
+                await self._send_function_output(
+                    call_ref,
+                    json.dumps({
+                        "status": "awaiting_consultation_answer",
+                        "available": False,
+                        "booked": False,
+                    }),
+                    nudge=False,
+                )
+                return True
+
+            # If the duration comparison was spoken on a prior turn, accept a
+            # grounded 30/60 change. An explicit original duration remains the
+            # selection when the caller says to keep it.
+            offer_turn = duration_turns.get(kind)
+            if isinstance(offer_turn, int) and self._user_turn_count > offer_turn:
+                chosen = self._spoken_duration_choice(caller_text)
+                if chosen is not None:
+                    try:
+                        state = record_duration_selection(
+                            state, selected_duration_minutes=chosen
+                        )
+                    except ValueError:
+                        choices = ", ".join(
+                            str(item.get("minutes"))
+                            for item in state.get("duration_choices") or []
+                        )
+                        await self._speak_consultation_gate(
+                            call_ref,
+                            status="duration_selection_required",
+                            spoken=f"I have {choices}-minute options. Which would you prefer?",
+                        )
+                        return True
+                duration_turns.pop(kind, None)
+
+            generic_request = re.sub(
+                r"\b(?:30|60|thirty|sixty)\s*(?:minutes?|mins?)?\b",
+                " ",
+                requested_service.casefold(),
+            )
+            generic_request = " ".join(re.findall(r"[a-z]+", generic_request))
+            recommended_service = None
+            if generic_request in {"facial", "facials", "massage", "massages"}:
+                recommended_service = configured_service_for_category(
+                    services,
+                    category=state.get("category"),
+                    service_kind=kind,
+                )
+            duration = take_duration_offer(
+                state,
+                services,
+                recommended_service=recommended_service,
+            )
+            state = duration["state"]
+            states[kind] = state
+            self.session.entities["consultation_state"] = state
+            self.session.entities["consultation_states"] = states
+            if duration["status"] == "offer_duration":
+                duration_turns[kind] = self._user_turn_count
+                self.session.entities["consultation_duration_offer_turns"] = duration_turns
+                await self._speak_consultation_gate(
+                    call_ref,
+                    status="duration_options",
+                    spoken=duration["offer"]["text"],
+                )
+                return True
+
+            gate = consultation_availability_gate(state)
+            if gate["status"] == "duration_selection_required":
+                choices = [
+                    str(item.get("minutes"))
+                    for item in state.get("duration_choices") or []
+                    if item.get("minutes")
+                ]
+                wording = " or ".join(choices) or "one of the configured"
+                await self._speak_consultation_gate(
+                    call_ref,
+                    status="duration_selection_required",
+                    spoken=f"Would you prefer the {wording}-minute option?",
+                )
+                return True
+
+            if kind == "massage":
+                pending = addon_pending.get(kind)
+                if isinstance(pending, dict) and self._user_turn_count > int(
+                    pending.get("turn", self._user_turn_count)
+                ):
+                    offered = [str(name) for name in pending.get("names") or []]
+                    normalized_text = " ".join(re.findall(r"[a-z0-9]+", caller_text.casefold()))
+                    chosen_addons = [
+                        name
+                        for name in offered
+                        if " ".join(re.findall(r"[a-z0-9]+", name.casefold())) in normalized_text
+                    ]
+                    if not chosen_addons and offered:
+                        if re.search(r"\b(?:both|all(?: of them)?)\b", normalized_text):
+                            chosen_addons = offered[:]
+                        elif len(offered) > 1 and re.search(
+                            r"\b(?:the )?(?:second|2nd|two)\b", normalized_text
+                        ):
+                            chosen_addons = offered[1:2]
+                        elif re.search(r"\b(?:the )?(?:first|1st)\b", normalized_text):
+                            chosen_addons = offered[:1]
+                    if not chosen_addons and is_affirmative(caller_text) and len(offered) == 1:
+                        chosen_addons = offered[:1]
+                    if (
+                        not chosen_addons
+                        and is_affirmative(caller_text)
+                        and len(offered) > 1
+                    ):
+                        await self._speak_consultation_gate(
+                            call_ref,
+                            status="addon_selection_required",
+                            spoken=(
+                                "Which would you prefer: "
+                                + ", or ".join(offered)
+                                + "?"
+                            ),
+                        )
+                        pending["turn"] = self._user_turn_count
+                        addon_pending[kind] = pending
+                        self.session.entities["consultation_addon_pending"] = addon_pending
+                        return True
+                    if chosen_addons:
+                        current = self._consultation_service_candidates(args)
+                        for addon in chosen_addons:
+                            if addon.casefold() not in {item.casefold() for item in current}:
+                                current.append(addon)
+                        args["requested_services"] = current
+                        args["service_description"] = " + ".join(current)
+                        self._remember_consultation_booking_request(args)
+                    elif not self._caller_declines_optional_item(caller_text):
+                        await self._speak_consultation_gate(
+                            call_ref,
+                            status="addon_selection_required",
+                            spoken=(
+                                "Would you like "
+                                + ", or ".join(offered)
+                                + ", or would you prefer no add-on?"
+                            ),
+                        )
+                        pending["turn"] = self._user_turn_count
+                        addon_pending[kind] = pending
+                        self.session.entities["consultation_addon_pending"] = addon_pending
+                        return True
+                    addon_pending.pop(kind, None)
+                    self.session.entities["consultation_addon_pending"] = addon_pending
+
+                addon = take_massage_addon_offer(state, services, upsell_rules)
+                state = addon["state"]
+                states[kind] = state
+                self.session.entities["consultation_state"] = state
+                self.session.entities["consultation_states"] = states
+                if addon["status"] == "offer_addons":
+                    items = addon["offer"]["items"]
+                    names = [str(item["service_name"]) for item in items]
+                    addon_pending[kind] = {
+                        "turn": self._user_turn_count,
+                        "names": names,
+                    }
+                    self.session.entities["consultation_addon_pending"] = addon_pending
+                    descriptions = " ".join(str(item["description"]) for item in items)
+                    await self._speak_consultation_gate(
+                        call_ref,
+                        status="addon_options",
+                        spoken=(
+                            descriptions
+                            + " Would you like either of those, or would you prefer no add-on?"
+                        ),
+                    )
+                    return True
+
+            gate = consultation_availability_gate(state)
+            if not gate["allow"]:
+                # Catalog/configuration gaps must not silently bypass the
+                # required flow or invent a service.
+                await self._speak_consultation_gate(
+                    call_ref,
+                    status=str(gate["status"]),
+                    spoken=(
+                        "I couldn't verify the treatment options in the spa's menu. "
+                        "Would you like a service provider to call you back to help?"
+                    ),
+                )
+                return True
+
+            completed.add(kind)
+            self._apply_consultation_selection(args, kind, state)
+            # A following modality may still need several caller turns. Save
+            # this completed recommendation and any accepted add-ons now so a
+            # partial next tool call cannot erase them.
+            self._remember_consultation_booking_request(args)
+
+        self.session.entities["consultation_completed_kinds"] = sorted(completed)
+        self.session.entities["consultation_states"] = states
+        self.session.entities["consultation_duration_offer_turns"] = duration_turns
+        self._restore_consultation_booking_request(args)
+        # Apply every completed selection again after restoring the original
+        # multi-service request, then remember the grounded, final version.
+        for kind, _requested in kinds:
+            state = states.get(kind)
+            if isinstance(state, dict) and kind in completed:
+                self._apply_consultation_selection(args, kind, state)
+        self._remember_consultation_booking_request(args)
+        return False
 
     async def _run_lookup_spa_facts(self, raw_arguments: str) -> str:
         try:
@@ -3738,6 +4345,7 @@ class XAIVoiceSession:
         Fast lookups answer directly. The delayed task supplies one short status
         line only if the provider is still working after five seconds.
         """
+        self._cancel_availability_hold_watchdog()
         self._availability_lookup_open = True
         self._availability_speech_interrupted = False
         self._availability_model_response_id = self._active_response_id
@@ -3746,6 +4354,66 @@ class XAIVoiceSession:
         self._availability_hold_done = False
         self._availability_expect_hold = False
         self._pending_availability_speech = None
+
+    def _cancel_availability_hold_watchdog(self) -> None:
+        task = self._availability_hold_watchdog_task
+        self._availability_hold_watchdog_task = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    def _start_availability_hold_watchdog(self) -> None:
+        """Bound how long a verified result may wait for hold response.done.
+
+        The realtime server has occasionally accepted a force_message without
+        delivering the matching response.done.  The availability result is
+        already authoritative at this point, so keeping it buffered forever is
+        worse than cancelling the stale hold response and speaking the result.
+        """
+        self._cancel_availability_hold_watchdog()
+        self._availability_hold_watchdog_task = asyncio.create_task(
+            self._availability_hold_watchdog()
+        )
+
+    async def _availability_hold_watchdog(self) -> None:
+        try:
+            await asyncio.sleep(self.HOLD_RESPONSE_WATCHDOG_SECONDS)
+        except asyncio.CancelledError:
+            return
+        if self._pending_availability_speech is None:
+            return
+        logger.warning(
+            "call %s: availability hold response did not finish; releasing verified result",
+            self.call_id,
+        )
+        await self._release_pending_availability(reason="hold_response_timeout")
+
+    async def _release_pending_availability(self, *, reason: str) -> bool:
+        """Release one buffered provider result and close stale hold state."""
+        self._cancel_availability_hold_watchdog()
+        hold_response = self._availability_hold_response_id
+        self._availability_expect_hold = False
+        self._availability_hold_done = True
+        self._availability_hold_response_id = None
+        if hold_response and reason != "hold_response_done":
+            # A late response.done for the canceled hold is bookkeeping only;
+            # it must not start a generic model continuation over the
+            # authoritative provider result we are about to speak.
+            self._availability_releasing_hold_response_id = hold_response
+        if hold_response and self._active_response_id == hold_response:
+            await self._cancel_active_response()
+        elif hold_response:
+            self._cancelled_response_ids.add(hold_response)
+        pending = self._pending_availability_speech
+        self._pending_availability_speech = None
+        if pending and not self._availability_speech_interrupted:
+            logger.info(
+                "call %s: speaking buffered authoritative availability reason=%s",
+                self.call_id,
+                reason,
+            )
+            await self._speak_availability(pending)
+            return True
+        return False
 
     async def _record_enhancement(self, status: str, **extra) -> None:
         from app.services.enhancements import record
@@ -3823,6 +4491,7 @@ class XAIVoiceSession:
             )
             if hold_still_open:
                 self._pending_availability_speech = str(spoken)
+                self._start_availability_hold_watchdog()
             else:
                 await self._speak_availability(str(spoken))
 
@@ -3882,6 +4551,138 @@ class XAIVoiceSession:
             stop = getattr(self, "stop_hold_tone", None)
             if stop is not None:
                 await stop()
+
+    def _spawn_function_call(self, event: dict[str, Any]) -> asyncio.Task:
+        """Run a tool off the receive loop while preserving per-call ordering."""
+        task = asyncio.create_task(self._dispatch_function_call_safely(event))
+        self._inflight_tools.add(task)
+        self._tool_task_names[task] = (
+            _first_str(event, "name", "function_name") or "unknown"
+        )
+        task.add_done_callback(self._function_call_task_done)
+        return task
+
+    def _function_call_task_done(self, task: asyncio.Task) -> None:
+        """Retrieve every task result so background failures are never lost."""
+        self._inflight_tools.discard(task)
+        self._tool_task_names.pop(task, None)
+        if task.cancelled():
+            return
+        exception = task.exception()
+        if exception is not None:
+            # `_dispatch_function_call_safely` normally absorbs and recovers
+            # ordinary exceptions. This is a defensive last line for failures
+            # in the recovery path itself.
+            logger.error(
+                "TOOL_DISPATCH_TASK_FAILED call=%s error=%r",
+                self.call_id,
+                exception,
+            )
+
+    async def _settle_inflight_tools(self) -> None:
+        """Finish provider work before persisting the call's terminal state."""
+        current = asyncio.current_task()
+        tasks = {
+            task for task in self._inflight_tools
+            if task is not current and not task.done()
+        }
+        if not tasks:
+            return
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=self.TOOL_DRAIN_TIMEOUT_SECONDS,
+        )
+        if pending:
+            names = sorted({self._tool_task_names.get(task, "unknown") for task in pending})
+            logger.warning(
+                "call %s: cancelling %d tool task(s) after %.1fs names=%s",
+                self.call_id,
+                len(pending),
+                self.TOOL_DRAIN_TIMEOUT_SECONDS,
+                names,
+            )
+            for task in pending:
+                task.cancel()
+        await asyncio.gather(*done, *pending, return_exceptions=True)
+
+    async def _stop_availability_hold_watchdog(self) -> None:
+        task = self._availability_hold_watchdog_task
+        self._availability_hold_watchdog_task = None
+        if task is None or task is asyncio.current_task():
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def _dispatch_function_call_safely(self, event: dict[str, Any]) -> None:
+        name = _first_str(event, "name", "function_name") or "unknown"
+        call_ref = _first_str(event, "call_id", "tool_call_id", "id")
+        try:
+            async with self._tool_dispatch_lock:
+                await self._dispatch(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "TOOL_DISPATCH_FAILED call=%s tool=%s tool_call_id=%s",
+                self.call_id,
+                name,
+                call_ref,
+            )
+            try:
+                await self._recover_tool_dispatch_failure(name, call_ref)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "TOOL_DISPATCH_RECOVERY_FAILED call=%s tool=%s tool_call_id=%s",
+                    self.call_id,
+                    name,
+                    call_ref,
+                )
+
+    async def _recover_tool_dispatch_failure(
+        self, name: str, call_ref: str | None
+    ) -> None:
+        """End hold state and give one safe, deterministic caller recovery."""
+        self._availability_lookup_open = False
+        stop = getattr(self, "stop_hold_tone", None)
+        if stop is not None:
+            await stop()
+        released = await self._release_pending_availability(
+            reason="tool_dispatch_failure"
+        )
+        failure_output = json.dumps({
+            "status": "tool_failed",
+            "booked": False,
+            "message": "The request could not be completed. Do not claim success or retry automatically.",
+        })
+        if call_ref and call_ref not in self._call_id_outputs:
+            await self._send_function_output(
+                call_ref,
+                failure_output,
+                nudge=False,
+            )
+        if released:
+            return
+        if name == CONFIRM_APPOINTMENT_TOOL["name"]:
+            # A write may have reached Square before the local exception. Never
+            # retry it blindly; reconcile through the existing confirmation
+            # text/read-only path.
+            self._response_needed_after_tool = False
+            self._restricted_response_needed_after_tool = False
+            await self._cancel_active_response()
+            await self._send_force_message(self._arm_confirmation_text_check())
+            return
+        if name in self._AVAILABILITY_PROBE_TOOLS | {
+            CANCEL_APPOINTMENT_TOOL["name"],
+            MANAGE_APPOINTMENT_TOOL["name"],
+        }:
+            await self._offer_staff_callback()
+            return
+        await self._cancel_active_response()
+        await self._send_force_message(
+            "I couldn't finish that request. Could you please say it again?"
+        )
 
     async def _handle_function_call(self, data: dict[str, Any]) -> None:
         name = _first_str(data, "name", "function_name") or ""
@@ -4044,13 +4845,18 @@ class XAIVoiceSession:
             self._apply_caller_service_durations(parsed_args)
             self._coalesce_service_arguments(parsed_args)
             cancelled = self._cancelled_slot_reference()
-            if parsed_args.get("requested_services"):
-                raw_args = json.dumps(parsed_args)
             if cancelled:
                 parsed_args.setdefault("requested_start_iso", cancelled["start_iso"])
                 parsed_args.setdefault("service_description", cancelled.get("service"))
                 parsed_args["earliest"] = False
-                raw_args = json.dumps(parsed_args)
+            operation = str(parsed_args.get("operation") or "").strip().casefold()
+            skip_consultation = bool(
+                cancelled
+                or operation == "reschedule"
+                or get_draft(self.session).operation_mode == "reschedule"
+                or offer_accepted(self.session)
+            )
+            raw_args = json.dumps(parsed_args)
 
             # A calendar day plus a service is enough to continue the
             # conversation, but it is not permission for the model to invent
@@ -4099,6 +4905,13 @@ class XAIVoiceSession:
                     await self._cancel_active_response()
                     await self._send_force_message("Would you prefer morning, afternoon, or evening?")
                 return
+            if not skip_consultation and await self._enforce_service_consultation(
+                call_ref, parsed_args
+            ):
+                return
+            self._apply_caller_service_durations(parsed_args)
+            self._coalesce_service_arguments(parsed_args)
+            raw_args = json.dumps(parsed_args)
             spoken_window = self._spoken_day_part_window()
             if spoken_window is not None and name in {
                 CHECK_AVAILABILITY_TOOL["name"],
@@ -4485,6 +5298,12 @@ class XAIVoiceSession:
                 logger.info("call %s: response cancellation raced with completion", self.call_id)
                 return
             logger.error("call %s: xAI realtime error: %s", self.call_id, message)
+            if (
+                self._availability_expect_hold
+                or self._availability_hold_response_id is not None
+                or self._pending_availability_speech is not None
+            ):
+                await self._release_pending_availability(reason="xai_error")
             if self.session.greeting_sent:
                 truth(
                     "CALL_GREETING_SUPPRESSED",
@@ -4555,6 +5374,20 @@ class XAIVoiceSession:
                     )
             elif etype == "response.done":
                 event_response_id = self._response_id_of(data)
+                if (
+                    event_response_id
+                    and event_response_id
+                    == self._availability_releasing_hold_response_id
+                ):
+                    self._availability_releasing_hold_response_id = None
+                    if self._active_response_id == event_response_id:
+                        self._active_response_id = None
+                    logger.info(
+                        "call %s: ignored late response.done for canceled availability hold %s",
+                        self.call_id,
+                        event_response_id,
+                    )
+                    return
                 # The short hold response can finish after xAI has already
                 # declared a newer response active.  Process that completion
                 # before the stale-response guard so a completed Square lookup
@@ -4564,11 +5397,7 @@ class XAIVoiceSession:
                     and event_response_id == self._availability_hold_response_id
                     and event_response_id != self._active_response_id
                 ):
-                    self._availability_hold_done = True
-                    pending_availability = self._pending_availability_speech
-                    self._pending_availability_speech = None
-                    if pending_availability and not self._availability_speech_interrupted:
-                        await self._speak_availability(pending_availability)
+                    await self._release_pending_availability(reason="hold_response_done")
                     return
                 if (event_response_id and self._active_response_id
                         and event_response_id != self._active_response_id):
@@ -4590,11 +5419,10 @@ class XAIVoiceSession:
                 self._active_response_id = None
                 finished = self._response_id_of(data) or finished_response_id
                 if finished and finished == self._availability_hold_response_id:
-                    self._availability_hold_done = True
-                    pending_availability = self._pending_availability_speech
-                    self._pending_availability_speech = None
-                    if pending_availability and not self._availability_speech_interrupted:
-                        await self._speak_availability(pending_availability)
+                    released = await self._release_pending_availability(
+                        reason="hold_response_done"
+                    )
+                    if released:
                         return
                 if finished and finished == self._caller_name_prompt_after_id:
                     self._caller_name_prompt_after_id = None
@@ -4679,9 +5507,7 @@ class XAIVoiceSession:
                     # Provider tools must not stall websocket receive / VAD / barge-in.
                     etype = event.get("type") if isinstance(event, dict) else None
                     if etype in _FUNCTION_CALL_DONE:
-                        task = asyncio.create_task(self._dispatch(event))
-                        self._inflight_tools.add(task)
-                        task.add_done_callback(self._inflight_tools.discard)
+                        self._spawn_function_call(event)
                     else:
                         await self._dispatch(event)
         except Exception:
@@ -4697,10 +5523,30 @@ class XAIVoiceSession:
         /voice/status handler does the same job for the Twilio path."""
         self._cancel_confirmation_wait()
         self._cancel_greeting_watchdog()
+        await self._stop_availability_hold_watchdog()
+        await self._settle_inflight_tools()
         mark_call_ended(self.session)
         store = self._store()
-        await store.save(self.session)
-        await store.end(self.call_id)
+        try:
+            await asyncio.wait_for(
+                store.save(self.session),
+                timeout=self.SESSION_PERSIST_TIMEOUT_SECONDS,
+            )
+            await asyncio.wait_for(
+                store.end(self.call_id),
+                timeout=self.SESSION_PERSIST_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "call %s: final session persistence timed out; continuing call-log finalization",
+                self.call_id,
+            )
+        except Exception:
+            logger.warning(
+                "call %s: final session persistence failed; continuing call-log finalization",
+                self.call_id,
+                exc_info=True,
+            )
 
         transcript = self.session.transcript_text
         analysis = None

@@ -659,7 +659,13 @@ def start_new_intent(session: Any) -> BookingDraft:
     # reset.
     for key in (
         "consultation_state",
+        "consultation_states",
+        "consultation_completed_kinds",
         "consultation_addon_names",
+        "consultation_addon_pending",
+        "consultation_booking_request",
+        "consultation_question_turns",
+        "consultation_duration_offer_turns",
         "caller_grounded_service_durations",
         "caller_grounded_exact_times",
         "requested_availability_window",

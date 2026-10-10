@@ -1,4 +1,5 @@
 """Live-call regressions: natural day queries, cancellation and response races."""
+import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -17,6 +18,11 @@ from tests.test_booking_intent_state import world, _confirm, _wants, SEPT_22
 def voice():
     session = CallSession("retry", "inbound", "+15550000001", "+15550000002", timezone="America/Chicago")
     return XAIVoiceSession("retry", session)
+
+
+class _HangingStore:
+    async def save(self, _session):
+        await asyncio.Event().wait()
 
 
 @pytest.mark.parametrize("question", ["What availability do you have today?", "What times are available tomorrow?", "Any openings today?"])
@@ -68,6 +74,139 @@ async def test_late_hold_completion_releases_verified_availability_without_closi
     assert v._active_response_id == "new"
     assert v._pending_availability_speech is None
     v._speak_availability.assert_awaited_once_with("Three PM is available.")
+
+
+async def test_missing_hold_response_done_releases_verified_availability_once():
+    v = voice()
+    v.HOLD_RESPONSE_WATCHDOG_SECONDS = 0.01
+    v._availability_hold_response_id = "lost-hold"
+    v._availability_hold_done = False
+    v._send_function_output = AsyncMock()
+    v._speak_availability = AsyncMock()
+
+    await v._deliver_authoritative_availability(
+        "availability-1",
+        json.dumps({"status": "day_part_openings", "spoken": "Three PM is available."}),
+    )
+    await asyncio.sleep(0.03)
+
+    assert v._pending_availability_speech is None
+    assert v._availability_hold_response_id is None
+    v._speak_availability.assert_awaited_once_with("Three PM is available.")
+    # A late duplicate completion cannot replay the already-spoken result.
+    await v._dispatch({"type": "response.done", "response": {"id": "lost-hold"}})
+    v._speak_availability.assert_awaited_once()
+
+
+async def test_normal_hold_completion_cancels_watchdog_without_duplicate_speech():
+    v = voice()
+    v.HOLD_RESPONSE_WATCHDOG_SECONDS = 0.02
+    v._availability_hold_response_id = "hold"
+    v._send_function_output = AsyncMock()
+    v._speak_availability = AsyncMock()
+
+    await v._deliver_authoritative_availability(
+        "availability-1",
+        json.dumps({"status": "day_part_openings", "spoken": "Three PM is available."}),
+    )
+    await v._dispatch({"type": "response.done", "response": {"id": "hold"}})
+    await asyncio.sleep(0.04)
+
+    v._speak_availability.assert_awaited_once_with("Three PM is available.")
+
+
+async def test_live_session_persistence_timeout_is_best_effort(caplog):
+    v = voice()
+    v.SESSION_PERSIST_TIMEOUT_SECONDS = 0.01
+    v._store = lambda: _HangingStore()
+
+    await asyncio.wait_for(v._persist_session(), timeout=0.1)
+
+    assert "live session persistence timed out" in caplog.text
+
+
+async def test_day_window_delivers_before_hanging_session_persistence(monkeypatch):
+    v = voice()
+    v.SESSION_PERSIST_TIMEOUT_SECONDS = 0.01
+    v._store = lambda: _HangingStore()
+    delivered = AsyncMock()
+    v._deliver_authoritative_availability = delivered
+    monkeypatch.setattr(realtime, "AsyncSessionLocal", lambda: _NullDBContext())
+    monkeypatch.setattr(
+        realtime,
+        "search_day_part",
+        AsyncMock(return_value=booking.BookingResult(
+            booking.BookingOutcome.CONFLICT,
+            message="Openings: 3 PM.",
+        )),
+    )
+    monkeypatch.setattr(
+        realtime,
+        "grounded_availability_speech",
+        lambda *_args: "Three PM is available.",
+    )
+    start = datetime.now(v._tz) + timedelta(days=1)
+
+    await asyncio.wait_for(
+        v._offer_spoken_window(
+            "day-window",
+            (start, start + timedelta(hours=4)),
+            {"service_description": "60 minute Swedish massage"},
+        ),
+        timeout=0.2,
+    )
+
+    delivered.assert_awaited_once()
+    output = json.loads(delivered.await_args.args[1])
+    assert output["spoken"] == "Three PM is available. Which time would you prefer?"
+
+
+async def test_function_tool_tasks_are_serialized():
+    v = voice()
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    order: list[str] = []
+
+    async def dispatch(event):
+        name = event["call_id"]
+        order.append(f"start-{name}")
+        if name == "first":
+            first_started.set()
+            await release_first.wait()
+        order.append(f"end-{name}")
+
+    v._dispatch = dispatch
+    first = v._spawn_function_call({"call_id": "first", "name": "check_availability"})
+    await first_started.wait()
+    second = v._spawn_function_call({"call_id": "second", "name": "propose_appointment"})
+    await asyncio.sleep(0)
+    assert order == ["start-first"]
+    release_first.set()
+    await asyncio.gather(first, second)
+    assert order == ["start-first", "end-first", "start-second", "end-second"]
+
+
+async def test_function_tool_exception_is_observed_and_recovers_once(caplog):
+    v = voice()
+
+    async def fail(_event):
+        raise RuntimeError("calendar task crashed")
+
+    v._dispatch = fail
+    v._send_function_output = AsyncMock()
+    v._offer_staff_callback = AsyncMock()
+    v._release_pending_availability = AsyncMock(return_value=False)
+    task = v._spawn_function_call({
+        "type": "response.function_call_arguments.done",
+        "call_id": "broken",
+        "name": "check_availability",
+    })
+
+    await task
+
+    assert "TOOL_DISPATCH_FAILED" in caplog.text
+    v._send_function_output.assert_awaited_once()
+    v._offer_staff_callback.assert_awaited_once()
 
 
 async def test_cancel_race_does_not_replay_greeting_or_mutate_new_response():
