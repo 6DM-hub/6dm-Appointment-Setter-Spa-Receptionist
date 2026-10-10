@@ -113,6 +113,8 @@ HOLD_ACK_TEXT = HOLD_ACK_TEXTS[0]
 AVAILABILITY_CACHE_SECONDS = 3
 BOOKING_CONFIRMATION_TEXT_QUESTION = (
     "It looks like I'm having trouble on my end. "
+    "The confirmation text can take up to ten seconds to arrive. "
+    "I'll wait while you check. "
     "Did you receive a confirmation text for your appointment?"
 )
 
@@ -3595,16 +3597,23 @@ class XAIVoiceSession:
         if self.session.entities.get("callback_offer_pending") and name in self._AVAILABILITY_PROBE_TOOLS | {CONFIRM_APPOINTMENT_TOOL["name"]}:
             await self._send_function_output(call_ref, json.dumps({"status": "awaiting_callback_consent", "booked": False}), nudge=False)
             return
-        if self.session.entities.get("confirmation_text_check_pending") and name in self._AVAILABILITY_PROBE_TOOLS | {CONFIRM_APPOINTMENT_TOOL["name"]}:
+        if self.session.entities.get("confirmation_text_check_pending") and name in self._AVAILABILITY_PROBE_TOOLS | {
+            CONFIRM_APPOINTMENT_TOOL["name"],
+            CANCEL_APPOINTMENT_TOOL["name"],
+            MANAGE_APPOINTMENT_TOOL["name"],
+        }:
             # The next caller turn must answer the recovery question. Never let
-            # a model retry the write while we are checking whether a provider
-            # confirmation may already exist.
+            # a model retry, replace, or cancel the write while we are checking
+            # whether a provider confirmation may already exist.
             await self._send_function_output(
                 call_ref,
                 json.dumps({
                     "status": "awaiting_confirmation_text_answer",
                     "booked": False,
-                    "message": "Wait for the caller's yes or no. Do not retry or confirm the appointment.",
+                    "message": (
+                        "Wait for the caller's yes or no. Do not retry, replace, "
+                        "confirm, or cancel the appointment."
+                    ),
                 }),
                 nudge=False,
             )

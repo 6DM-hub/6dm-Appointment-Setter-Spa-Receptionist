@@ -5,6 +5,7 @@ reported. Provider-managed buffers/resources must be present in availability.
 """
 import itertools
 import json
+import logging
 import re
 from dataclasses import replace
 from datetime import timedelta, date, datetime, timezone
@@ -16,6 +17,9 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 from app.services.booking_adapters.base import AvailabilityVerdict, BookingProviderError, ExternalBooking
 from app.services.business_hours import is_open_between
 from app.services.scheduling_time import business_zone, utc_instant, elapsed_end
+
+
+logger = logging.getLogger(__name__)
 
 
 class VisitPolicy(BaseModel):
@@ -257,31 +261,88 @@ async def create_visit(router, ctx):
     booking_id = record.get("id")
     if not booking_id:
         raise BookingProviderError("The provider did not return a visit booking ID.", code="BOOKING_OUTCOME_UNKNOWN")
-    actual = record.get("appointment_segments") or []
     expected = slot["visit_segments"]
-    try:
-        returned_start = delegate._parse_square_datetime(record.get("start_at") or "")
-    except (TypeError, ValueError):
-        returned_start = None
-    # `transition_time_minutes` is a read-only Square field and may be non-zero
-    # in the CreateBooking response even though it was absent or zero in the
-    # request. It must not cause a valid accepted booking to be cancelled. The
-    # immutable caller-facing facts below remain strict: active status, exact
-    # location/customer/start, segment count, duration, service and provider.
-    exact = (record.get("status") == "ACCEPTED" and record.get("location_id") == delegate.location_id
-        and record.get("customer_id") == customer_id
-        and returned_start == ctx.start and len(actual) == len(expected))
-    if exact:
+    # Square may populate or omit provider-managed, read-only fields such as
+    # transition_time_minutes, intermission_minutes, any_team_member and
+    # resource_ids when serialising the accepted Booking. None can be supplied
+    # in CreateBooking, so requiring them to echo SearchAvailability causes a
+    # valid appointment to be created and then incorrectly cancelled. Resources
+    # and buffers were already verified by the immediately preceding atomic
+    # SearchAvailability response. Keep every caller-controlled/core field
+    # strict and compare timestamps as instants rather than serialisations.
+    expected_start = utc_instant(ctx.start)
+    core_segment_fields = (
+        "duration_minutes",
+        "service_variation_id",
+        "service_variation_version",
+        "team_member_id",
+    )
+    def validation_mismatches(candidate):
+        if not isinstance(candidate, dict):
+            return ["booking_shape"]
+        candidate_segments = candidate.get("appointment_segments") or []
         try:
-            exact = all(all(a.get(k) == e.get(k) for k in ("duration_minutes", "service_variation_id", "service_variation_version", "team_member_id"))
-                and int(a.get("intermission_minutes") or 0) == int(e.get("intermission_minutes") or 0)
-                and set(e.get("resource_ids") or []).issubset(a.get("resource_ids") or []) for a, e in zip(actual, expected))
-        except (TypeError, ValueError, AttributeError):
-            exact = False
-    if not exact:
+            candidate_start = delegate._parse_square_datetime(candidate.get("start_at") or "")
+        except (TypeError, ValueError):
+            candidate_start = None
+        failures = []
+        if candidate.get("id") != booking_id:
+            failures.append("booking_id")
+        if candidate.get("status") != "ACCEPTED":
+            failures.append("status")
+        if candidate.get("location_id") != delegate.location_id:
+            failures.append("location_id")
+        if candidate.get("customer_id") != customer_id:
+            failures.append("customer_id")
+        if candidate_start != expected_start:
+            failures.append("start_at")
+        if not isinstance(candidate_segments, list) or len(candidate_segments) != len(expected):
+            failures.append("segment_count")
+        else:
+            for index, (returned_segment, requested_segment) in enumerate(zip(candidate_segments, expected)):
+                if not isinstance(returned_segment, dict) or not isinstance(requested_segment, dict):
+                    failures.append(f"segment_{index}_shape")
+                    continue
+                for field in core_segment_fields:
+                    if returned_segment.get(field) != requested_segment.get(field):
+                        failures.append(f"segment_{index}_{field}")
+        return failures
+
+    mismatches = validation_mismatches(record)
+    if mismatches:
+        # IDs and field names are enough to diagnose the contract mismatch;
+        # never log the customer record, phone number, notes or full payload.
+        logger.warning(
+            "VISIT_CREATE_VALIDATION_MISMATCH stage=create booking_id=%s mismatch_fields=%s",
+            booking_id,
+            ",".join(mismatches),
+        )
         try:
-            await delegate.cancel_booking(ExternalBooking(provider="square", external_id=booking_id))
+            readback_data = await delegate._request("GET", f"/v2/bookings/{booking_id}")
+            readback = readback_data.get("booking") if isinstance(readback_data, dict) else None
         except Exception as exc:
-            raise BookingProviderError(f"Partial visit requires staff reconciliation. Provider booking {booking_id} could not be cancelled.", code="PARTIAL_BOOKING_UNRESOLVED") from exc
-        raise BookingProviderError("The complete visit was not confirmed; the inconsistent provider booking was cancelled.", code="VISIT_ROLLED_BACK")
+            logger.warning(
+                "VISIT_CREATE_VALIDATION_MISMATCH stage=retrieve booking_id=%s mismatch_fields=readback_failed",
+                booking_id,
+            )
+            raise BookingProviderError(
+                f"Square created booking {booking_id}, but its active details could not be verified. "
+                "Do not retry; staff must reconcile it in Square.",
+                code="BOOKING_OUTCOME_UNKNOWN",
+            ) from exc
+        mismatches = validation_mismatches(readback)
+        if mismatches:
+            logger.warning(
+                "VISIT_CREATE_VALIDATION_MISMATCH stage=retrieve booking_id=%s mismatch_fields=%s",
+                booking_id,
+                ",".join(mismatches),
+            )
+            # Square may already have notified the customer. Never generate a
+            # contradictory cancellation while Cara asks them to check that
+            # confirmation and staff reconciliation remains pending.
+            raise BookingProviderError(
+                f"Square created booking {booking_id}, but its active details could not be verified. "
+                "Do not retry; staff must reconcile it in Square.",
+                code="BOOKING_OUTCOME_UNKNOWN",
+            )
     return ExternalBooking(provider="square", external_id=booking_id, external_customer_id=customer_id)

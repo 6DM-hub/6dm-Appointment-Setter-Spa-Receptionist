@@ -14,6 +14,8 @@ from tests.test_confirmation_pause import pending_voice
 
 CONFIRMATION_TEXT_QUESTION = (
     "It looks like I'm having trouble on my end. "
+    "The confirmation text can take up to ten seconds to arrive. "
+    "I'll wait while you check. "
     "Did you receive a confirmation text for your appointment?"
 )
 
@@ -64,6 +66,50 @@ async def test_uncertain_provider_result_asks_exact_confirmation_text_question()
     assert voice.session.booking_status not in {"booked", "rescheduled"}
     assert voice.session.appointment_id is None
     assert voice.session.external_booking_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "handler_name"),
+    [
+        ("confirm_appointment", "_run_confirm_appointment"),
+        ("cancel_appointment", "_run_cancel_appointment"),
+        ("manage_appointment", "_run_manage_appointment"),
+    ],
+)
+async def test_confirmation_text_wait_blocks_booking_mutations_until_caller_answers(
+    tool_name, handler_name
+):
+    voice = pending_voice()
+    voice._arm_confirmation_text_check()
+    handler = AsyncMock(
+        side_effect=AssertionError(
+            "booking mutations must wait for the caller's confirmation-text answer"
+        )
+    )
+    setattr(voice, handler_name, handler)
+
+    await voice._handle_function_call(
+        {
+            "type": "response.function_call_arguments.done",
+            "name": tool_name,
+            "call_id": f"blocked-{tool_name}",
+            "arguments": "{}",
+        }
+    )
+
+    handler.assert_not_awaited()
+    outputs = [
+        payload
+        for payload in voice.spoken
+        if payload.get("item", {}).get("type") == "function_call_output"
+    ]
+    assert outputs
+    result = json.loads(outputs[-1]["item"]["output"])
+    assert result["status"] == "awaiting_confirmation_text_answer"
+    assert "Do not retry, replace, confirm, or cancel" in result["message"]
+    assert voice.session.entities["confirmation_text_check_pending"]
+    assert voice.session.booking_status not in {"booked", "rescheduled"}
 
 
 @pytest.mark.asyncio

@@ -46,7 +46,8 @@ def visit():
     provider.cancel_booking = AsyncMock()
     provider.check_availability = AsyncMock(return_value=AvailabilityVerdict.ok())
     provider.create_booking = AsyncMock()
-    state = dict(start=instant(), available=True, returned_count=None, timeout=0, calls=[], wrong_staff=False)
+    state = dict(start=instant(), available=True, returned_count=None, timeout=0, calls=[], wrong_staff=False,
+                 last_create_response=None)
     async def request(method, path, **kwargs):
         state['calls'].append((method, path, copy.deepcopy(kwargs)))
         if path.startswith('/v2/catalog/object/'):
@@ -66,6 +67,8 @@ def visit():
             if state['wrong_staff']:
                 segments[0]['team_member_id'] = 'bob'
             return {'availabilities': [{'start_at': state['start'].isoformat(), 'location_id': 'loc', 'appointment_segments': segments}]}
+        if method == 'GET' and path.startswith('/v2/bookings/'):
+            return {'booking': copy.deepcopy(state['last_create_response'])}
         if method == 'GET' and path == '/v2/bookings':
             return {'bookings': []}
         assert method == 'POST' and path == '/v2/bookings'
@@ -78,6 +81,7 @@ def visit():
             record['appointment_segments'] = record['appointment_segments'][:state['returned_count']]
         if state.get('missing_start'):
             record.pop('start_at')
+        state['last_create_response'] = copy.deepcopy(record)
         return {'booking': record}
     provider._request = request
     ctx = BookingContext(start=instant(), end=instant()+timedelta(minutes=150), title='Visit', customer_phone='+15550000001',
@@ -104,7 +108,7 @@ async def test_two_treatments_different_staff_one_atomic_write(visit):
     assert router.duration_for_service(ctx.service_description) == 150
 
 
-async def test_square_read_only_transition_time_does_not_cancel_valid_visit(visit):
+async def test_square_read_only_booking_metadata_does_not_cancel_valid_visit(visit):
     router, _, state = visit
     ctx = await pinned(visit)
     original = router.delegate._request
@@ -112,7 +116,21 @@ async def test_square_read_only_transition_time_does_not_cancel_valid_visit(visi
     async def request(method, path, **kwargs):
         result = await original(method, path, **kwargs)
         if method == 'POST' and path == '/v2/bookings':
-            result['booking']['transition_time_minutes'] = 15
+            booking = result['booking']
+            booking.update(
+                version=0,
+                transition_time_minutes=15,
+                all_day=False,
+                creator_details={'creator_type': 'CUSTOMER'},
+                source='EXTERNAL',
+            )
+            for segment in booking['appointment_segments']:
+                segment.update(
+                    intermission_minutes=15,
+                    any_team_member=False,
+                    resource_ids=['provider-managed-room'],
+                    modifier_ids=[],
+                )
         return result
 
     router.delegate._request = request
@@ -123,16 +141,16 @@ async def test_square_read_only_transition_time_does_not_cancel_valid_visit(visi
 
 @pytest.mark.parametrize('mismatch', [
     'status', 'location', 'customer', 'start', 'duration',
-    'service', 'version', 'staff', 'intermission',
+    'service', 'version', 'staff',
 ])
-async def test_true_create_response_mismatch_is_compensated(visit, mismatch):
-    router, _, _ = visit
+async def test_true_create_response_mismatch_requires_reconciliation_without_cancellation(visit, mismatch):
+    router, _, state = visit
     ctx = await pinned(visit)
     original = router.delegate._request
 
     async def request(method, path, **kwargs):
         result = await original(method, path, **kwargs)
-        if method != 'POST' or path != '/v2/bookings':
+        if path != '/v2/bookings' and not (method == 'GET' and path.startswith('/v2/bookings/')):
             return result
         booking = result['booking']
         # The allowed read-only field must not hide a real response mismatch.
@@ -154,27 +172,48 @@ async def test_true_create_response_mismatch_is_compensated(visit, mismatch):
             segment['service_variation_version'] += 1
         elif mismatch == 'staff':
             segment['team_member_id'] = 'another-staff-member'
-        else:
-            segment['intermission_minutes'] = 15
         return result
 
     router.delegate._request = request
     with pytest.raises(BookingProviderError) as caught:
         await router.create_booking(ctx)
-    assert caught.value.code == 'VISIT_ROLLED_BACK'
-    router.delegate.cancel_booking.assert_awaited_once()
+    assert caught.value.code == 'BOOKING_OUTCOME_UNKNOWN'
+    assert 'visit-1' in str(caught.value)
+    assert any(method == 'GET' and path == '/v2/bookings/visit-1'
+               for method, path, _ in state['calls'])
+    router.delegate.cancel_booking.assert_not_awaited()
 
 
-async def test_missing_verified_resource_in_create_response_is_compensated(visit):
+async def test_create_mismatch_is_accepted_when_authoritative_retrieve_matches(visit):
+    router, _, state = visit
+    ctx = await pinned(visit)
+    original = router.delegate._request
+
+    async def request(method, path, **kwargs):
+        result = await original(method, path, **kwargs)
+        # Simulate a sparse/inconsistent immediate Create response while the
+        # authoritative RetrieveBooking record already has the correct facts.
+        if method == 'POST' and path == '/v2/bookings':
+            result['booking']['appointment_segments'] = result['booking']['appointment_segments'][:1]
+        return result
+
+    router.delegate._request = request
+    result = await router.create_booking(ctx)
+    assert result.external_id == 'visit-1'
+    assert any(method == 'GET' and path == '/v2/bookings/visit-1'
+               for method, path, _ in state['calls'])
+    router.delegate.cancel_booking.assert_not_awaited()
+
+
+async def test_missing_read_only_resource_echo_does_not_cancel_valid_visit(visit):
     router, ctx, state = visit
     router.spa.services[0]['resource_ids'] = ['facial-room']
     state['resources'] = ['facial-room']
     ctx = await pinned(visit)
 
-    with pytest.raises(BookingProviderError) as caught:
-        await router.create_booking(ctx)
-    assert caught.value.code == 'VISIT_ROLLED_BACK'
-    router.delegate.cancel_booking.assert_awaited_once()
+    result = await router.create_booking(ctx)
+    assert result.external_id == 'visit-1'
+    router.delegate.cancel_booking.assert_not_awaited()
 
 
 async def test_each_catalog_lookup_uses_its_service_duration_not_total_visit(visit):
@@ -264,32 +303,41 @@ async def test_final_recheck_prevents_stale_write(visit):
     assert not any(path == '/v2/bookings' for _, path, _ in state['calls'])
 
 
-async def test_partial_provider_result_is_compensated(visit):
+async def test_partial_provider_result_requires_reconciliation_without_cancellation(visit):
     router, _, state = visit
     ctx = await pinned(visit)
     state['returned_count'] = 1
     with pytest.raises(BookingProviderError) as caught:
         await router.create_booking(ctx)
-    assert caught.value.code == 'VISIT_ROLLED_BACK'
-    router.delegate.cancel_booking.assert_awaited_once()
+    assert caught.value.code == 'BOOKING_OUTCOME_UNKNOWN'
+    assert 'visit-1' in str(caught.value)
+    assert any(method == 'GET' and path == '/v2/bookings/visit-1'
+               for method, path, _ in state['calls'])
+    router.delegate.cancel_booking.assert_not_awaited()
 
 
-async def test_failed_compensation_is_flagged(visit):
+async def test_partial_readback_never_attempts_provider_cancellation(visit):
     router, _, state = visit
     ctx = await pinned(visit)
     state['returned_count'] = 1
-    router.delegate.cancel_booking.side_effect = BookingProviderError('unavailable')
     with pytest.raises(BookingProviderError) as caught:
         await router.create_booking(ctx)
-    assert caught.value.code == 'PARTIAL_BOOKING_UNRESOLVED'
+    assert caught.value.code == 'BOOKING_OUTCOME_UNKNOWN'
+    assert 'visit-1' in str(caught.value)
+    router.delegate.cancel_booking.assert_not_awaited()
 
 
-async def test_malformed_provider_success_cannot_bypass_compensation(visit):
+async def test_malformed_provider_success_requires_reconciliation_without_cancellation(visit):
     router, _, state = visit
     ctx = await pinned(visit)
     state['missing_start'] = True
-    with pytest.raises(BookingProviderError): await router.create_booking(ctx)
-    router.delegate.cancel_booking.assert_awaited_once()
+    with pytest.raises(BookingProviderError) as caught:
+        await router.create_booking(ctx)
+    assert caught.value.code == 'BOOKING_OUTCOME_UNKNOWN'
+    assert 'visit-1' in str(caught.value)
+    assert any(method == 'GET' and path == '/v2/bookings/visit-1'
+               for method, path, _ in state['calls'])
+    router.delegate.cancel_booking.assert_not_awaited()
 
 
 @pytest.mark.parametrize('timeouts', [1,2])
