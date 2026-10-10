@@ -128,6 +128,14 @@ export interface SpaService {
   duration_minutes: number;
   price?: string | null;
   description?: string | null;
+  category?: string | null;
+  consultation_kind?: "facial" | "massage" | null;
+  consultation_category?: string | null;
+  consultation_tags?: string[];
+  aliases?: string[];
+  service_family?: string | null;
+  approved_benefit?: string | null;
+  is_add_on?: boolean;
 }
 
 export interface ServiceCategory {
@@ -168,7 +176,7 @@ export interface EnhancementSettings {
   personalize: boolean;
   retention_days: number;
   excluded_services: string[];
-  rules: { base_service: string; target_service: string; priority: number; requires_resources: boolean; phrase_variants?: string[] }[];
+  rules: { base_service: string; target_service: string; priority: number; offer_type?: "replace" | "append"; requires_resources: boolean; phrase_variants?: string[] }[];
 }
 export interface EnhancementReport {
   eligible: number; presented: number; accepted: number; declined: number; booked: number;

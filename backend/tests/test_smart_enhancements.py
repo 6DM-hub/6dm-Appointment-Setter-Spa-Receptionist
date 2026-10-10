@@ -42,6 +42,376 @@ def setup():
     db = SimpleNamespace(execute=AsyncMock(return_value=result), commit=AsyncMock())
     return voice, routing, db
 
+
+def setup_append():
+    """A read-only, atomically verified massage followed by a facial."""
+    voice, routing, db = setup()
+    routing.spa.enhancement_settings = dict(
+        enabled=True,
+        rules=[dict(
+            base_service="Massage 60",
+            target_service="European Facial 60",
+            priority=1,
+            offer_type="append",
+            requires_resources=True,
+        )],
+    )
+    routing.spa.services = [dict(
+        name="European Facial 60",
+        duration_minutes=60,
+        square_variation_id="FACIAL",
+    )]
+
+    async def request(method, path):
+        variation = path.split("/")[-1]
+        assert method == "GET" and variation in {"BASE", "FACIAL"}
+        return {"object": {
+            "id": variation,
+            "version": 1 if variation == "BASE" else 2,
+            "item_variation_data": {
+                "pricing_type": "FIXED_PRICING",
+                "price_money": {
+                    "amount": 10000 if variation == "BASE" else 12000,
+                    "currency": "USD",
+                },
+                "service_duration": 60 * 60000,
+            },
+        }}
+
+    routing.adapter._request = AsyncMock(side_effect=request)
+    slot = {
+        "start": "2026-10-10T17:30:00+00:00",
+        "location_id": "LOCATION",
+        "duration_minutes": 120,
+        "treatment_minutes": 120,
+        "team_member_id": "STAFF",
+        "service_variation_id": "BASE",
+        "service_variation_version": 1,
+        "visit_segments": [
+            {
+                "service_name": "Massage 60",
+                "duration_minutes": 60,
+                "service_variation_id": "BASE",
+                "service_variation_version": 1,
+                "team_member_id": "STAFF",
+                "provider_name": "Massage Therapist",
+                "start": "2026-10-10T17:30:00+00:00",
+                "end": "2026-10-10T18:30:00+00:00",
+            },
+            {
+                "service_name": "European Facial 60",
+                "duration_minutes": 60,
+                "service_variation_id": "FACIAL",
+                "service_variation_version": 2,
+                "team_member_id": "ESTHETICIAN",
+                "provider_name": "Esthetician",
+                "start": "2026-10-10T18:30:00+00:00",
+                "end": "2026-10-10T19:30:00+00:00",
+            },
+        ],
+    }
+    routing.adapter.list_openings = AsyncMock(return_value=[slot])
+    return voice, routing, db, slot
+
+
+def setup_chained_append():
+    """An existing two-service visit followed by a provider-verified facial."""
+    voice, routing, db, _ = setup_append()
+    draft = get_draft(voice.session)
+    draft.service_description = "Massage 60 + Extended Scalp 15"
+    draft.duration_minutes = 85
+    draft.preferred_staff = "Massage Therapist"
+    draft.provider_id = "STAFF"
+    draft.end_iso = "2026-10-10T18:55:00+00:00"
+    draft.selected_slot = {
+        "start": "2026-10-10T17:30:00+00:00",
+        "location_id": "LOCATION",
+        "duration_minutes": 85,
+        "treatment_minutes": 75,
+        "team_member_id": "STAFF",
+        "service_variation_id": "BASE",
+        "service_variation_version": 1,
+        "visit_segments": [
+            {
+                "service_name": "Massage 60",
+                "duration_minutes": 60,
+                "service_variation_id": "BASE",
+                "service_variation_version": 1,
+                "team_member_id": "STAFF",
+                "provider_name": "Massage Therapist",
+                "resource_ids": ["MASSAGE_ROOM"],
+                "intermission_minutes": 5,
+                "start": "2026-10-10T17:30:00+00:00",
+                "end": "2026-10-10T18:30:00+00:00",
+            },
+            {
+                "service_name": "Extended Scalp 15",
+                "duration_minutes": 15,
+                "service_variation_id": "SCALP",
+                "service_variation_version": 3,
+                "team_member_id": "STAFF",
+                "provider_name": "Massage Therapist",
+                "resource_ids": ["MASSAGE_ROOM"],
+                "intermission_minutes": 5,
+                "start": "2026-10-10T18:35:00+00:00",
+                "end": "2026-10-10T18:50:00+00:00",
+            },
+        ],
+    }
+    draft.verified_fingerprint = proposal_fingerprint(draft)
+    save_draft(voice.session, draft)
+    routing.spa.enhancement_settings = dict(
+        enabled=True,
+        rules=[dict(
+            base_service="Massage 60 + Extended Scalp 15",
+            target_service="European Facial 60",
+            priority=1,
+            offer_type="append",
+            requires_resources=True,
+        )],
+    )
+    routing.spa.services = [
+        dict(name="Massage 60", duration_minutes=60, square_variation_id="BASE"),
+        dict(name="Extended Scalp 15", duration_minutes=15, square_variation_id="SCALP"),
+        dict(
+            name="European Facial 60",
+            duration_minutes=60,
+            cleanup_buffer_minutes=10,
+            square_variation_id="FACIAL",
+        ),
+    ]
+    prices = {"BASE": 10000, "SCALP": 3000, "FACIAL": 12000}
+    durations = {"BASE": 60, "SCALP": 15, "FACIAL": 60}
+    versions = {"BASE": 1, "SCALP": 3, "FACIAL": 2}
+
+    async def request(method, path):
+        variation = path.split("/")[-1]
+        assert method == "GET" and variation in prices
+        return {"object": {
+            "id": variation,
+            "version": versions[variation],
+            "item_variation_data": {
+                "pricing_type": "FIXED_PRICING",
+                "price_money": {"amount": prices[variation], "currency": "USD"},
+                "service_duration": durations[variation] * 60000,
+            },
+        }}
+
+    routing.adapter._request = AsyncMock(side_effect=request)
+    slot = copy.deepcopy(draft.selected_slot)
+    slot.update(duration_minutes=155, treatment_minutes=135)
+    slot["visit_segments"].append({
+        "service_name": "European Facial 60",
+        "duration_minutes": 60,
+        "service_variation_id": "FACIAL",
+        "service_variation_version": 2,
+        "team_member_id": "ESTHETICIAN",
+        "provider_name": "Esthetician",
+        "resource_ids": ["FACIAL_ROOM"],
+        "intermission_minutes": 10,
+        "start": "2026-10-10T18:55:00+00:00",
+        "end": "2026-10-10T19:55:00+00:00",
+    })
+    routing.adapter.list_openings = AsyncMock(return_value=[slot])
+    return voice, routing, db, slot
+
+
+@pytest.mark.asyncio
+async def test_automatic_engine_does_not_repeat_consultation_addon():
+    voice, routing, db = setup()
+    voice.session.entities["consultation_addon_names"] = ["Massage 90"]
+
+    assert await engine.prepare(db, voice.session, routing) is None
+    routing.adapter.check_availability.assert_not_awaited()
+    assert voice.session.entities.get(engine.KEY) is None
+
+
+@pytest.mark.asyncio
+async def test_append_prepare_is_read_only_and_requires_exact_atomic_visit():
+    voice, routing, db, slot = setup_append()
+    original = copy.deepcopy(get_draft(voice.session).to_dict())
+
+    line = await engine.prepare(db, voice.session, routing)
+
+    assert "esthetician is available right after your massage" in line
+    assert get_draft(voice.session).to_dict() == original
+    routing.adapter.check_availability.assert_not_awaited()
+    routing.adapter.list_openings.assert_awaited_once()
+    ctx, range_start, range_end = routing.adapter.list_openings.call_args.args
+    assert ctx.service_description == "Massage 60 + European Facial 60"
+    assert ctx.preferred_staff is None and ctx.provider_id is None
+    assert ctx.start.isoformat() == original["selected_slot"]["start"].replace("Z", "+00:00")
+    assert (ctx.end - ctx.start).total_seconds() == 120 * 60
+    assert range_start == ctx.start and range_end > range_start
+    assert voice.session.entities[engine.KEY]["target_slot"] == slot
+
+
+@pytest.mark.asyncio
+async def test_append_allows_provider_verified_transition_gap_and_counts_reserved_time():
+    voice, routing, db, slot = setup_append()
+    slot["visit_segments"][0]["intermission_minutes"] = 15
+    slot["visit_segments"][1].update(
+        start="2026-10-10T18:45:00+00:00",
+        end="2026-10-10T19:45:00+00:00",
+    )
+    slot["duration_minutes"] = 135
+
+    line = await engine.prepare(db, voice.session, routing)
+
+    assert "available following your massage" in line
+    assert "right after" not in line
+    handled, price_line, _, resume = engine.respond(voice.session, "yes")
+    assert handled and not resume
+    assert "75 additional minutes" in price_line
+    assert engine.respond(voice.session, "yes please")[3]
+    assert get_draft(voice.session).duration_minutes == 135
+
+
+@pytest.mark.asyncio
+async def test_append_extends_existing_visit_and_prices_every_existing_segment():
+    voice, routing, db, slot = setup_chained_append()
+    original = copy.deepcopy(get_draft(voice.session).to_dict())
+
+    line = await engine.prepare(db, voice.session, routing)
+
+    assert "European Facial 60" in line
+    assert get_draft(voice.session).to_dict() == original
+    ctx = routing.adapter.list_openings.call_args.args[0]
+    assert ctx.service_description == (
+        "Massage 60 + Extended Scalp 15 + European Facial 60"
+    )
+    assert ctx.preferred_staff is None and ctx.provider_id is None
+    assert (ctx.end - ctx.start).total_seconds() == 155 * 60
+    handled, price_line, _, resume = engine.respond(voice.session, "yes")
+    assert handled and not resume
+    assert "120.00 extra" in price_line
+    assert "70 additional minutes" in price_line
+    assert "250.00 total" in price_line
+
+    assert engine.respond(voice.session, "yes please")[3]
+    combined = get_draft(voice.session)
+    assert combined.selected_slot == slot
+    assert combined.duration_minutes == 155
+    assert combined.end_iso == "2026-10-10T20:05:00+00:00"
+    assert combined.preferred_staff is None
+    assert combined.provider_id is None
+    assert combined.square_variation_id == "BASE"
+    assert [segment["service_variation_id"] for segment in combined.selected_slot["visit_segments"]] == [
+        "BASE",
+        "SCALP",
+        "FACIAL",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("change", "mutate"),
+    [
+        ("existing variation", lambda slot: slot["visit_segments"][1].update(service_variation_id="OTHER")),
+        ("existing version", lambda slot: slot["visit_segments"][1].update(service_variation_version=9)),
+        ("existing provider", lambda slot: slot["visit_segments"][1].update(team_member_id="OTHER")),
+        ("existing duration", lambda slot: slot["visit_segments"][1].update(duration_minutes=20)),
+        ("existing start", lambda slot: slot["visit_segments"][1].update(start="2026-10-10T18:40:00+00:00")),
+        ("existing end", lambda slot: slot["visit_segments"][1].update(end="2026-10-10T18:45:00+00:00")),
+        ("existing resources", lambda slot: slot["visit_segments"][1].update(resource_ids=["OTHER_ROOM"])),
+        ("existing buffer", lambda slot: slot["visit_segments"][1].update(intermission_minutes=0)),
+    ],
+)
+async def test_append_rejects_any_change_to_existing_visit_segment(change, mutate):
+    voice, routing, db, slot = setup_chained_append()
+    original = copy.deepcopy(get_draft(voice.session).to_dict())
+    mutate(slot)
+
+    assert await engine.prepare(db, voice.session, routing) is None, change
+    assert get_draft(voice.session).to_dict() == original
+    assert voice.session.entities[engine.KEY]["phase"] == "skipped"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("change", "mutate"),
+    [
+        ("different root start", lambda slot: slot.update(start="2026-10-10T17:45:00+00:00")),
+        ("different location", lambda slot: slot.update(location_id="OTHER")),
+        ("different base variation", lambda slot: slot["visit_segments"][0].update(service_variation_id="OTHER")),
+        ("different base version", lambda slot: slot["visit_segments"][0].update(service_variation_version=7)),
+        ("different massage therapist", lambda slot: slot["visit_segments"][0].update(team_member_id="OTHER")),
+        ("different target variation", lambda slot: slot["visit_segments"][1].update(service_variation_id="OTHER")),
+        ("different target version", lambda slot: slot["visit_segments"][1].update(service_variation_version=7)),
+        ("missing target provider", lambda slot: slot["visit_segments"][1].update(team_member_id=None)),
+        ("invalid shifted target start", lambda slot: slot["visit_segments"][1].update(start="2026-10-10T18:45:00+00:00")),
+        ("reversed services", lambda slot: slot["visit_segments"].reverse()),
+    ],
+)
+async def test_append_rejects_non_exact_or_non_adjacent_visit(change, mutate):
+    voice, routing, db, slot = setup_append()
+    original = copy.deepcopy(get_draft(voice.session).to_dict())
+    mutate(slot)
+
+    assert await engine.prepare(db, voice.session, routing) is None, change
+    assert get_draft(voice.session).to_dict() == original
+    assert voice.session.entities[engine.KEY]["phase"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_append_decline_preserves_original_visit_without_booking_consent():
+    voice, routing, db, _ = setup_append()
+    original = copy.deepcopy(get_draft(voice.session).to_dict())
+    await engine.prepare(db, voice.session, routing)
+
+    handled, line, event, resume = engine.respond(voice.session, "no thanks")
+
+    assert handled and event == "declined" and not resume
+    assert "original" in line
+    assert get_draft(voice.session).to_dict() == original
+    assert not offer_accepted(voice.session)
+
+
+@pytest.mark.asyncio
+async def test_append_two_step_acceptance_binds_complete_provider_visit():
+    voice, routing, db, slot = setup_append()
+    original = copy.deepcopy(get_draft(voice.session).to_dict())
+    await engine.prepare(db, voice.session, routing)
+
+    handled, line, event, resume = engine.respond(voice.session, "yes")
+    assert handled and event is None and not resume
+    assert "120.00 extra" in line and "60 additional minutes" in line
+    assert "220.00 total" in line and "book that addition" in line
+    assert get_draft(voice.session).to_dict() == original
+    assert not offer_accepted(voice.session)
+
+    handled, line, event, resume = engine.respond(voice.session, "yes please")
+    combined = get_draft(voice.session)
+    assert handled and line is None and event == "accepted" and resume
+    assert combined.service_description == "Massage 60 + European Facial 60"
+    assert combined.duration_minutes == 120
+    assert combined.start_iso == "2026-10-10T17:30:00+00:00"
+    assert combined.end_iso == "2026-10-10T19:30:00+00:00"
+    assert combined.selected_slot == slot
+    assert [segment["team_member_id"] for segment in combined.selected_slot["visit_segments"]] == [
+        "STAFF",
+        "ESTHETICIAN",
+    ]
+    assert combined.square_variation_id == "BASE"
+    assert combined.square_variation_version == 1
+    assert combined.provider_verified and offer_accepted(voice.session)
+    assert not combined.is_persisted and not combined.confirmation_authorized
+
+
+@pytest.mark.asyncio
+async def test_natural_price_question_keeps_verified_append_offer_pending():
+    voice, routing, db, _ = setup_append()
+    original = copy.deepcopy(get_draft(voice.session).to_dict())
+    await engine.prepare(db, voice.session, routing)
+
+    handled, line, event, resume = engine.respond(voice.session, "How much is it?")
+
+    assert handled and event is None and not resume
+    assert "120.00 extra" in line and "60 additional minutes" in line
+    assert voice.session.entities[engine.KEY]["phase"] == "price_confirmation"
+    assert get_draft(voice.session).to_dict() == original
+    assert not offer_accepted(voice.session)
+
 @pytest.mark.asyncio
 async def test_verified_offer_preserves_original_and_requires_two_explicit_responses():
     voice, routing, db = setup()

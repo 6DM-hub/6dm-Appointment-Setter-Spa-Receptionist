@@ -276,7 +276,9 @@ async def test_http_200_with_no_slots_is_unavailable_not_a_lookup_failure(monkey
     assert result.available is False
     assert result.lookup_failed is False
     assert "trouble checking" not in result.message.lower()
-    assert "do not invent" in result.message.lower()
+    assert "don't see a matching opening" in result.message.lower()
+    assert "do not invent" not in result.message.lower()
+    assert "tell the caller" not in result.message.lower()
 
 
 @pytest.mark.asyncio

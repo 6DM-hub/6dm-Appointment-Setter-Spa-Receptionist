@@ -339,6 +339,45 @@ async def test_stale_response_function_call_is_ignored_after_cancellation(
     assert availability_stub == [], "a stale/cancelled response's tool call must never reach the provider"
 
 
+async def test_cancelled_response_acknowledges_only_first_stale_tool_call(
+    voice_session, availability_stub, monkeypatch
+):
+    """A cancelled response must not be kept alive by an output loop.
+
+    xAI can deliver many already-queued tool calls after cancellation.  One
+    cancellation output is enough; later calls from that same dead response
+    are discarded without a provider lookup or another protocol output.
+    """
+    sent: list[dict] = []
+
+    async def capture(payload):
+        sent.append(payload)
+
+    monkeypatch.setattr(voice_session, "_send", capture)
+    await voice_session._dispatch(
+        {"type": "response.created", "response": {"id": "resp-cancel-burst"}}
+    )
+    await voice_session._cancel_active_response()
+
+    for index in range(5):
+        await voice_session._dispatch(
+            _call_done_event(
+                response_id="resp-cancel-burst",
+                call_id=f"call-stale-{index}",
+                start_iso="2026-09-24T10:15:00",
+            )
+        )
+
+    outputs = [
+        json.loads(item["item"]["output"])
+        for item in sent
+        if item.get("type") == "conversation.item.create"
+        and item.get("item", {}).get("type") == "function_call_output"
+    ]
+    assert outputs == [{"status": "cancelled", "message": "This request was superseded; do not act on it."}]
+    assert availability_stub == []
+
+
 async def test_response_cancel_is_not_sent_when_nothing_is_active(voice_session, monkeypatch):
     """The other reported symptom: 'Cancellation failed: no active response
     found'. Caused by sending response.cancel unconditionally. Guard it."""

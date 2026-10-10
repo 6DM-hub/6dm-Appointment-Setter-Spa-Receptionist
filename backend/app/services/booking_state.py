@@ -1184,6 +1184,74 @@ def contains_unauthorized_availability_claim(reply: str, session: Any, tz: Any) 
     return not any(signature in text for signature in authorized)
 
 
+_POST_MASSAGE_FACIAL_AVAILABILITY_CLAIM = re.compile(
+    r"(?:"
+    r"\b(?:our\s+)?esthetician\b.{0,70}\b(?:available|open|free)\b.{0,80}"
+    r"\b(?:after|following)\b.{0,40}\bmassage\b|"
+    r"\b(?:facial|esthetician)\b.{0,70}\b(?:available|open|free|room)\b.{0,80}"
+    r"\b(?:after|following)\b.{0,40}\bmassage\b|"
+    r"\b(?:add|fit\s+in)\b.{0,45}\bfacial\b.{0,55}"
+    r"\b(?:right\s+)?after\b.{0,35}\bmassage\b|"
+    r"\boption\s+is\s+open\b.{0,80}\bfacial\b"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def contains_unverified_post_massage_facial_offer(reply: str, session: Any) -> bool:
+    """Block a sequential facial availability claim without an atomic visit.
+
+    A separately available facial does not prove that it starts when the
+    massage ends or that the required esthetician/resource remains available.
+    Only the provider-returned ``visit_segments`` structure can authorize this
+    speech.
+    """
+    if not reply or not _POST_MASSAGE_FACIAL_AVAILABILITY_CLAIM.search(reply):
+        return False
+    if re.search(
+        r"\b(?:check|see|find\s+out)\b.{0,35}\b(?:whether|if)\b",
+        reply,
+        re.IGNORECASE,
+    ):
+        # Asking permission to perform the provider lookup is not an
+        # availability claim.
+        return False
+
+    draft = get_draft(session)
+    if not draft.provider_verified or not draft.selected_slot:
+        return True
+    segments = draft.selected_slot.get("visit_segments") or []
+    if len(segments) < 2:
+        return True
+
+    spoken = " ".join(re.findall(r"[a-z0-9]+", reply.casefold()))
+
+    def service_key(value: object) -> str:
+        label = re.sub(
+            r"\b(?:\d+|thirty|sixty|ninety)\s*(?:-|\s)*(?:minute|minutes|min|mins)\b",
+            " ",
+            str(value or "").casefold(),
+        )
+        return " ".join(re.findall(r"[a-z0-9]+", label))
+
+    for first, second in zip(segments, segments[1:]):
+        first_name = str(first.get("service_name") or "").casefold()
+        second_name = str(second.get("service_name") or "").casefold()
+        if "massage" not in first_name or "facial" not in second_name:
+            continue
+        first_end = _parse_provider_iso(first.get("end"))
+        second_start = _parse_provider_iso(second.get("start"))
+        if (
+            first_end is not None
+            and second_start is not None
+            and second_start >= first_end
+            and second.get("team_member_id")
+            and service_key(second.get("service_name")) in spoken
+        ):
+            return False
+    return True
+
+
 # Success-only booking claims. Do NOT match bare "booked"/"confirmed"/"scheduled":
 # after a calendar conflict the receptionist must be able to say "that time is
 # already booked" without having its audio cancelled mid-sentence.

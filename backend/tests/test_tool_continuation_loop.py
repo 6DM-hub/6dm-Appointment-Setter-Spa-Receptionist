@@ -214,6 +214,8 @@ async def test_duplicate_rejected_probe_in_one_turn_is_blocked_even_with_an_offs
     )
     assert availability_stub == []
     assert _outputs(sent)[1]["status"] == "duplicate_probe"
+    assert "do not" not in _outputs(sent)[1]["message"].casefold()
+    assert "caller" not in _outputs(sent)[1]["message"].casefold()
 
 
 # --------------------------------------------------------------------------- #
@@ -318,6 +320,7 @@ async def test_earliest_after_explicit_time_request_is_rejected_without_looping(
     )
     assert availability_stub == []
     assert _outputs(sent)[0]["status"] == "ungrounded_earliest"
+    assert _outputs(sent)[0]["message"] == "Which date and time would you prefer?"
     await voice_session._dispatch({"type": "response.done", "response": {"id": "resp-1"}})
     creates = _creates(sent)
     assert len(creates) == 1

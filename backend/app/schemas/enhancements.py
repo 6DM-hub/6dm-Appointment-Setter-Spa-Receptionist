@@ -1,4 +1,5 @@
 import re
+from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
 OFFER_WORDS = set("would you like to consider service as an optional upgrade could we also look at for your visit are interested in another option may i offer explore a treatment choose instead this what about trying perhaps how does sound enhancement hear more details".split())
@@ -20,6 +21,10 @@ class EnhancementRule(BaseModel):
     base_service: str = Field(min_length=1, max_length=255)
     target_service: str = Field(min_length=1, max_length=255)
     priority: int = Field(default=0, ge=0, le=100)
+    # replace upgrades one catalog variation to another; append performs a
+    # side-effect-free, atomic multi-service availability preview and adds the
+    # target only after the caller accepts it.
+    offer_type: Literal["replace", "append"] = "replace"
     # A provider-defined bundle or longer service, never separate partial writes.
     requires_resources: bool = False
     phrase_variants: list[str] = Field(default_factory=list, max_length=8)
@@ -37,3 +42,9 @@ class EnhancementSettings(BaseModel):
     excluded_services: list[str] = Field(default_factory=list, max_length=100)
     rules: list[EnhancementRule] = Field(default_factory=list, max_length=100)
     # Only catalog-priced promotions are executable; no unsupported discount writes.
+
+    @field_validator("excluded_services")
+    @classmethod
+    def normalize_excluded_services(cls, values: list[str]) -> list[str]:
+        cleaned = [str(value).strip() for value in values if str(value).strip()]
+        return list(dict.fromkeys(cleaned))

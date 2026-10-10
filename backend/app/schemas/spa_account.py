@@ -1,7 +1,7 @@
 import re
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -36,6 +36,41 @@ class SpaService(BaseModel):
     duration_minutes: int = Field(60, ge=5, le=600)
     price: str | None = Field(None, max_length=32)
     description: str | None = Field(None, max_length=1000)
+    # Safe, owner-editable metadata used for non-diagnostic service matching.
+    # These live in the existing services JSON column, so no database migration
+    # is needed and older accounts remain valid.
+    category: str | None = Field(None, max_length=64)
+    consultation_kind: Literal["facial", "massage"] | None = None
+    consultation_category: str | None = Field(None, max_length=64)
+    consultation_tags: list[str] = Field(default_factory=list, max_length=24)
+    aliases: list[str] = Field(default_factory=list, max_length=24)
+    service_family: str | None = Field(None, max_length=255)
+    approved_benefit: str | None = Field(None, max_length=500)
+    is_add_on: bool = False
+
+    @field_validator(
+        "square_variation_id",
+        "category",
+        "consultation_kind",
+        "consultation_category",
+        "service_family",
+        "approved_benefit",
+        mode="before",
+    )
+    @classmethod
+    def normalize_optional_service_text(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        cleaned = str(value).strip()
+        return cleaned or None
+
+    @field_validator("consultation_tags", "aliases")
+    @classmethod
+    def validate_consultation_labels(cls, values: list[str]) -> list[str]:
+        cleaned = [str(value).strip() for value in values if str(value).strip()]
+        if any(len(value) > 100 for value in cleaned):
+            raise ValueError("consultation tags and aliases must be at most 100 characters")
+        return list(dict.fromkeys(cleaned))
 
 
 class SpaStaffMember(BaseModel):

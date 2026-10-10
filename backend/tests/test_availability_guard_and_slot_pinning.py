@@ -30,6 +30,7 @@ from app.services.booking_adapters.base import BookingProviderError
 from app.services.booking_state import (
     arm_verified_proposal,
     contains_unauthorized_availability_claim,
+    contains_unverified_post_massage_facial_offer,
     get_draft,
     looks_like_unverified_booking_success,
     save_draft,
@@ -163,6 +164,92 @@ def test_guard_ignores_replies_with_no_clock_time_at_all():
 
     assert not contains_unauthorized_availability_claim(
         "We have availability that day.", session, tz
+    )
+
+
+def test_guard_blocks_post_massage_facial_claim_without_atomic_visit():
+    session = _session_with_provider()
+    draft = get_draft(session)
+    draft.provider_verified = True
+    draft.selected_slot = {
+        "start": "2026-09-24T19:00:00Z",
+        "service_name": "60 minute massage",
+    }
+    save_draft(session, draft)
+
+    assert contains_unverified_post_massage_facial_offer(
+        "Our esthetician is available right after your massage, so we could add a facial.",
+        session,
+    )
+
+
+def test_guard_allows_post_massage_facial_claim_for_adjacent_verified_visit():
+    session = _session_with_provider()
+    draft = get_draft(session)
+    draft.provider_verified = True
+    draft.selected_slot = {
+        "start": "2026-09-24T19:00:00Z",
+        "visit_segments": [
+            {
+                "service_name": "60 minute Swedish massage",
+                "start": "2026-09-24T19:00:00Z",
+                "end": "2026-09-24T20:00:00Z",
+                "team_member_id": "massage-provider",
+            },
+            {
+                "service_name": "60 minute European facial",
+                "start": "2026-09-24T20:00:00Z",
+                "end": "2026-09-24T21:00:00Z",
+                "team_member_id": "esthetician",
+            },
+        ],
+    }
+    save_draft(session, draft)
+
+    assert not contains_unverified_post_massage_facial_offer(
+        "Our esthetician is available right after your massage, so we could add the European facial.",
+        session,
+    )
+
+
+def test_guard_blocks_a_different_named_facial_than_provider_verified():
+    session = _session_with_provider()
+    draft = get_draft(session)
+    draft.provider_verified = True
+    draft.selected_slot = {
+        "start": "2026-09-24T19:00:00Z",
+        "visit_segments": [
+            {
+                "service_name": "60 minute Swedish massage",
+                "start": "2026-09-24T19:00:00Z",
+                "end": "2026-09-24T20:00:00Z",
+                "team_member_id": "massage-provider",
+            },
+            {
+                "service_name": "60 minute European facial",
+                "start": "2026-09-24T20:10:00Z",
+                "end": "2026-09-24T21:10:00Z",
+                "team_member_id": "esthetician",
+            },
+        ],
+    }
+    save_draft(session, draft)
+
+    assert contains_unverified_post_massage_facial_offer(
+        "Our esthetician is available after your massage, so we could add a Signature facial.",
+        session,
+    )
+    assert not contains_unverified_post_massage_facial_offer(
+        "Our esthetician is available after your massage, so we could add the European facial.",
+        session,
+    )
+
+
+def test_guard_allows_neutral_offer_to_check_sequential_availability():
+    session = _session_with_provider()
+    assert not contains_unverified_post_massage_facial_offer(
+        "Would you like me to check whether a facial is available after your massage?",
+        session,
     )
 
 

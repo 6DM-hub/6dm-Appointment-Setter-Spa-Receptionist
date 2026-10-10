@@ -10,6 +10,7 @@ from typing import Any
 
 from app.models.spa_account import SpaAccount
 from app.services.business_hours import describe_business_hours
+from app.services.service_consultation import facial_consultation, massage_consultation
 from app.services.truth_log import truth
 
 UNKNOWN = "I don't have that information available."
@@ -73,6 +74,18 @@ def dashboard_facts(spa: SpaAccount) -> dict[str, Any]:
             item["price"] = str(entry["price"])
         if entry.get("description"):
             item["description"] = str(entry["description"])
+        for key in (
+            "category",
+            "consultation_kind",
+            "consultation_category",
+            "consultation_tags",
+            "aliases",
+            "service_family",
+            "approved_benefit",
+            "is_add_on",
+        ):
+            if entry.get(key) not in (None, "", []):
+                item[key] = entry[key]
         services.append(item)
 
     hours = describe_business_hours(spa.business_hours, spa.timezone)
@@ -133,7 +146,7 @@ def configured_vip(packages: list[Any], identifier: str | None = None) -> dict[s
         return {
             "status": "unknown",
             "verified": False,
-            "message": "No VIP package is configured. Do not offer VIP benefits, credits, or a special provider.",
+            "message": "I don't have a verified VIP package available.",
         }
     wanted = (identifier or "").strip().casefold()
     if wanted:
@@ -152,7 +165,7 @@ def configured_vip(packages: list[Any], identifier: str | None = None) -> dict[s
         "status": "ok",
         "verified": bool(wanted),
         "packages": vip_rows,
-        "message": "Use only the VIP fields returned here. Do not add benefits, prices, staff, or credits.",
+        "message": "Here are the verified VIP package details.",
     }
 
 
@@ -230,6 +243,16 @@ async def lookup_spa_facts(
     service_name: str | None = None,
     location_query: str | None = None,
     vip_identifier: str | None = None,
+    consultation_kind: str | None = None,
+    main_concern: str | None = None,
+    skin_feel: str | None = None,
+    skin_flags: str | None = None,
+    massage_reason: str | None = None,
+    massage_areas: str | None = None,
+    pressure_preference: str | None = None,
+    selected_service_name: str | None = None,
+    selected_duration_minutes: int | None = None,
+    prior_consultation_category: str | None = None,
 ) -> dict[str, Any]:
     """Return only verified fields for the requested topic."""
     facts = dashboard_facts(spa)
@@ -327,6 +350,64 @@ async def lookup_spa_facts(
         "vip": configured_vip(facts["packages"]),
         "policies": policy_statement(facts),
     }
+
+    if topic == "consultation":
+        kind = str(consultation_kind or "").strip().casefold()
+        if kind == "facial":
+            consultation = facial_consultation(
+                facts["services"],
+                main_concern=main_concern,
+                skin_feel=skin_feel,
+                sensitivity=skin_flags,
+                selected_service_name=selected_service_name,
+                selected_duration_minutes=selected_duration_minutes,
+                category_hint=prior_consultation_category,
+            )
+        elif kind == "massage":
+            consultation = massage_consultation(
+                facts["services"],
+                facts["upsell_rules"],
+                reason=massage_reason,
+                areas=massage_areas,
+                pressure=pressure_preference,
+                selected_service_name=selected_service_name,
+                selected_duration_minutes=selected_duration_minutes,
+                category_hint=prior_consultation_category,
+            )
+            # Facial placement is owned by the provider-verified enhancement
+            # lookup. Do not expose speculative menu candidates here.
+            consultation["sequential_availability_verified"] = False
+        else:
+            payload.update(
+                status="needs_clarification",
+                message="Would you like help choosing a facial or a massage?",
+                consultation=None,
+            )
+            return payload
+
+        payload["consultation"] = consultation
+        payload["status"] = (
+            "needs_clarification"
+            if consultation.get("needs_clarification")
+            else "ok"
+        )
+        selected = consultation.get("service") or {}
+        payload["message"] = (
+            f"Based on what you shared, {selected.get('name')} is the closest match on our menu."
+            if selected
+            else (
+                "I couldn't find an exact match for those preferences on our menu. "
+                f"Would you like to hear the available {kind} options?"
+            )
+        )
+        truth(
+            "SERVICE_CONSULTATION_LOOKUP",
+            source="dashboard",
+            kind=kind,
+            category=consultation.get("category") or "unresolved",
+            matched=bool(selected),
+        )
+        return payload
 
     if topic in {"location", "address"}:
         truth("SPA_DETAIL_LOOKUP", source=address_source or "none", field="address")

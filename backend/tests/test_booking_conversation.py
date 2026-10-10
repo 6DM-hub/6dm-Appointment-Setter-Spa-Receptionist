@@ -4,7 +4,12 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app.services.booking_conversation import remember_offer, offer_accepted
-from app.services.booking_state import get_draft, save_draft, invalidate_booking_proposal
+from app.services.booking_state import (
+    get_draft,
+    save_draft,
+    invalidate_booking_proposal,
+    proposal_fingerprint,
+)
 from app.services.grok_service import build_realtime_instructions
 from tests.test_confirmation_pause import pending_voice
 from tests.test_square_timezone_and_staff import _ctx, _square_adapter, _FakeSquareTransport
@@ -42,6 +47,62 @@ async def test_selection_of_offered_time_is_consent(text):
     assert get_draft(voice.session).confirmation_authorized
     assert "card on file" in str(voice.spoken).lower()
     assert "would you like" not in str(voice.spoken).lower()
+
+
+@pytest.mark.asyncio
+async def test_alternative_selection_offers_enhancement_then_decline_resumes_without_reasking():
+    voice = pending_voice()
+    voice._tz = ZoneInfo("America/Chicago")
+    draft = get_draft(voice.session)
+    draft.selected_slot = None
+    draft.provider_verified = False
+    draft.read_back = False
+    draft.confirmation_authorized = False
+    offered = {
+        "start": "2026-10-10T17:30:00Z",
+        "duration_minutes": 90,
+        "service_variation_id": "massage-90",
+        "service_variation_version": 1,
+        "team_member_id": "therapist-1",
+        "location_id": "spa-1",
+    }
+    draft.alternative_slots = [offered]
+    save_draft(voice.session, draft)
+    voice.session.booking_status = "conflict"
+    voice.session.entities["spoken_booking_choices"] = {
+        "revision": draft.draft_revision,
+        "slots": [offered],
+    }
+
+    async def offer_enhancement():
+        current = get_draft(voice.session)
+        voice.session.entities["smart_enhancement"] = {
+            "phase": "offered",
+            "original_fingerprint": proposal_fingerprint(current),
+        }
+        return "A verified facial is available after your massage. Would you like details?"
+
+    async def no_record(*_args, **_kwargs):
+        return None
+
+    voice._maybe_enhancement = offer_enhancement
+    voice._record_enhancement = no_record
+
+    assert await voice._confirm_pending_booking_from_caller("12:30 PM works for me")
+    assert "verified facial" in str(voice.spoken).lower()
+    assert "card on file" not in str(voice.spoken).lower()
+    assert not offer_accepted(voice.session)
+    assert voice.session.entities["enhancement_base_time_accepted"] == proposal_fingerprint(
+        get_draft(voice.session)
+    )
+
+    voice.spoken.clear()
+    assert await voice._confirm_pending_booking_from_caller("no thanks")
+    assert offer_accepted(voice.session)
+    assert get_draft(voice.session).confirmation_authorized
+    assert "card on file" in str(voice.spoken).lower()
+    assert "would you like me to book" not in str(voice.spoken).lower()
+    assert "enhancement_base_time_accepted" not in voice.session.entities
 
 
 @pytest.mark.asyncio

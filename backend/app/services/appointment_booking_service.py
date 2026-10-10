@@ -222,22 +222,13 @@ def _clarification(verdict: Any) -> str | None:
 
     if code == _REASON_SERVICE_AMBIGUOUS:
         name = subject or "That service"
-        return (
-            f"'{name}' matches more than one service.{choices} Ask the caller which "
-            "one they mean before checking any times. Do NOT offer alternative "
-            "times yet, and do NOT say the time is unavailable."
-        )
+        return f"'{name}' matches more than one service.{choices} Which one would you like?"
     if code == "service_not_specified":
-        return (
-            "The caller has not said which service they want." + examples +
-            " Ask which service they would like, then check times. Do NOT offer "
-            "times yet, and do NOT say the time is unavailable."
-        )
+        return "Which service would you like?" + examples
     asked = f" '{subject}'" if subject and subject != "service_not_recognized" else ""
     return (
-        f"The requested service{asked} is not on the menu." + examples +
-        " Ask the caller which service they would like from the menu. Do not "
-        "guess a service and do not offer times yet."
+        f"I couldn't find{asked or ' that service'} on the menu." + examples +
+        " Which listed service would you like?"
     )
 
 
@@ -2356,13 +2347,10 @@ async def check_availability_only(
                 listed = ", ".join(labels[:-1]) + f", and {labels[-1]}"
             message = (
                 f"{requested} isn't available, but I have {listed}. "
-                "Offer only these Square times. Nothing is booked yet."
+                "Which time works best for you?"
             )
         else:
-            message = (
-                "Square confirmed there is no matching availability. "
-                "Tell the caller you do not see an opening then. Do not invent a time."
-            )
+            message = "I don't see a matching opening at that time. Would you like to try another day?"
         session.booking_status = "collecting_details"
         return AvailabilityResult(False, message)
     session.booking_status = "awaiting_selection"
@@ -2392,7 +2380,10 @@ async def check_availability_only(
             slot=verdict.slot.get("start"),
         )
     label = spoken_slot_time(start.isoformat(), tz) or start.isoformat()
-    return AvailabilityResult(True, f"{label} is available. Offer only this Square time. Nothing is booked yet.")
+    return AvailabilityResult(
+        True,
+        f"{label} is available. Nothing is booked yet. Would you like me to book that?",
+    )
 
 
 class AppointmentBookingService:
