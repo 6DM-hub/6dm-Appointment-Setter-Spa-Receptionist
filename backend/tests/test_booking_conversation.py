@@ -137,6 +137,34 @@ async def test_later_schedule_request_after_success_starts_separate_intent(monke
     assert get_draft(voice.session).booking_id != old.booking_id
 
 
+def test_caller_duration_overrides_mistaken_multiservice_tool_duration():
+    voice = pending_voice()
+    voice._remember_caller_service_durations(
+        "I want a 60 minute European Facial and 90 minute Deep Tissue Massage"
+    )
+    args = {
+        "requested_services": [
+            "60 minute European Facial",
+            "60 minute Deep Tissue Massage",
+        ]
+    }
+    voice._apply_caller_service_durations(args)
+    assert args["requested_services"] == [
+        "60 minute European Facial",
+        "90 minute Deep Tissue Massage",
+    ]
+
+
+def test_service_name_containing_and_is_not_split_by_duration_grounding():
+    voice = pending_voice()
+    voice._remember_caller_service_durations("Book a 75 minute Head and Neck Massage")
+    mentions = voice.session.entities["caller_grounded_service_durations"]
+    assert len(mentions) == 1
+    args = {"requested_services": ["60 minute Head and Neck Massage"]}
+    voice._apply_caller_service_durations(args)
+    assert args["requested_services"] == ["75 minute Head and Neck Massage"]
+
+
 @pytest.mark.asyncio
 async def test_square_new_intent_avoids_cancelled_replay_and_retry_key_is_stable():
     adapter = _square_adapter(make_spa(booking_provider=BookingProvider.SQUARE,

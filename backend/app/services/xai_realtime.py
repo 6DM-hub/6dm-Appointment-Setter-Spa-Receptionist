@@ -195,6 +195,18 @@ _RESCHEDULE_REQUEST_RE = re.compile(
     re.IGNORECASE,
 )
 
+_SERVICE_DURATION_MENTION_RE = re.compile(
+    r"\b(?P<minutes>\d{2,3})\s*(?:minutes?|mins?)\s+"
+    r"(?P<name>.+?)"
+    r"(?=(?:\s*(?:,|and|plus|\+)\s*)\d{2,3}\s*(?:minutes?|mins?)\b|$)",
+    re.IGNORECASE,
+)
+_SERVICE_MATCH_STOP_WORDS = {
+    "a", "an", "and", "appointment", "at", "book", "booking", "for",
+    "i", "like", "me", "minute", "minutes", "on", "please", "plus",
+    "schedule", "the", "to", "want", "with",
+}
+
 # A caller turn naming a DAY, as opposed to an hour. "3pm" alone establishes
 # no date; combining it with a date the caller never actually named would be
 # inventing one. Deliberately excludes "today"/"tonight" — treated as
@@ -1121,6 +1133,7 @@ class XAIVoiceSession:
         if history and history[-1]["role"] == "user" and history[-1]["content"] == text:
             return
         self.session.add_turn("user", text)
+        self._remember_caller_service_durations(text)
         # A genuinely new caller turn is what can ground the NEXT exact-time
         # availability probe — see `_is_time_grounded`.
         self._user_turn_count += 1
@@ -1170,6 +1183,55 @@ class XAIVoiceSession:
                     start = None
                 if start is not None and start > self._now():
                     self._remember_grounded_exact_time(start.isoformat())
+
+    @staticmethod
+    def _service_words(value: str) -> set[str]:
+        return {
+            word for word in re.findall(r"[a-z]+", (value or "").casefold())
+            if word not in _SERVICE_MATCH_STOP_WORDS
+        }
+
+    def _remember_caller_service_durations(self, utterance: str) -> None:
+        """Keep explicit caller durations attached to the named service.
+
+        Realtime tool arguments are model output and can occasionally turn a
+        caller's "90-minute deep tissue" into 60 minutes. These groundings come
+        only from caller transcript text and therefore may safely correct that
+        argument. The delimiter requires the next service to begin with its own
+        duration, so names such as "Head and Neck Massage" remain intact.
+        """
+        mentions = []
+        for match in _SERVICE_DURATION_MENTION_RE.finditer(utterance or ""):
+            words = self._service_words(match.group("name"))
+            if words:
+                mentions.append({"minutes": int(match.group("minutes")), "words": sorted(words)})
+        if mentions:
+            self.session.entities["caller_grounded_service_durations"] = mentions
+
+    def _apply_caller_service_durations(self, args: dict[str, Any]) -> None:
+        services = args.get("requested_services")
+        mentions = self.session.entities.get("caller_grounded_service_durations") or []
+        if not isinstance(services, list) or not mentions:
+            return
+        corrected: list[str] = []
+        for raw in services:
+            service = str(raw)
+            words = self._service_words(service)
+            candidates = []
+            for mention in mentions:
+                mention_words = set(mention.get("words") or [])
+                overlap = len(words & mention_words)
+                if overlap and overlap >= min(2, len(words), len(mention_words)):
+                    candidates.append((overlap, mention))
+            if candidates:
+                _, best = max(candidates, key=lambda item: item[0])
+                clean = re.sub(
+                    r"\b\d{2,3}\s*(?:minutes?|mins?)\b", "", service,
+                    count=1, flags=re.IGNORECASE,
+                ).strip(" -")
+                service = f"{int(best['minutes'])} minute {clean}"
+            corrected.append(service)
+        args["requested_services"] = corrected
 
     def _flush_agent_turn(self) -> None:
         """Commit the accumulated agent utterance as one history turn.
@@ -3002,6 +3064,7 @@ class XAIVoiceSession:
             return None
 
         self._booking_completed_turn = self._user_turn_count
+        self.session.entities.pop("caller_grounded_service_durations", None)
 
         confirmation_key = str(payload["external_booking_id"]) + ":" + str(self.session.confirmed_datetime)
         if self.session.entities.get("spoken_booking_confirmation") == confirmation_key:
@@ -3427,6 +3490,7 @@ class XAIVoiceSession:
                 parsed_args = json.loads(raw_args or "{}")
             except (TypeError, ValueError):
                 parsed_args = {}
+            self._apply_caller_service_durations(parsed_args)
             cancelled = self._cancelled_slot_reference()
             if parsed_args.get("requested_services"):
                 parsed_args["service_description"] = " + ".join(parsed_args["requested_services"])
