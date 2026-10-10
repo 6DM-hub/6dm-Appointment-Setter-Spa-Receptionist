@@ -51,7 +51,8 @@ def test_realtime_prompt_contains_grounded_consultation_flow():
     assert "For every massage booking request" in text
     assert "backend owns the full consultation" in text
     assert "never restart consultation through lookup_spa_facts" in text
-    assert "Offer both only when the tool confirms both" in text
+    assert "Offer both only when the backend confirms both" in text
+    assert "Do not independently look up or repeat an add-on offer" in text
     assert "qualified providers and any provider-managed transition time" in text
     assert text.index("Persona only.") < text.index("FACIAL AND MASSAGE CONSULTATION RULES")
 
