@@ -629,6 +629,7 @@ class SpaBookingAdapter(BookingAdapter):
         already mapped.
         """
         canonical_name = str(entry.get("name", "")).strip()
+        requested_minutes = _minutes_in(ctx.service_description or ctx.title)
         overrides: dict[str, Any] = {
             "title": canonical_name,
             "service_description": canonical_name,
@@ -639,6 +640,17 @@ class SpaBookingAdapter(BookingAdapter):
             version = entry.get("square_variation_version")
             if version is not None:
                 overrides["service_variation_version"] = version
+        elif requested_minutes:
+            # A generic dashboard entry such as "Deep Tissue" can map to
+            # several Square catalog variations.  Keep the duration the
+            # caller actually named so Square can select the 60- or 90-minute
+            # variation deterministically.  Replacing it with only the
+            # canonical menu name caused Square to return the same ambiguous
+            # result on every retry until the realtime tool-chain limit fired.
+            overrides["service_description"] = (
+                f"{canonical_name} {requested_minutes} minutes"
+            )
+            overrides["end"] = elapsed_end(ctx.start, requested_minutes)
         return replace(ctx, **overrides)
 
     def _canonicalize_ctx(self, ctx: BookingContext) -> tuple[BookingContext, str | None]:

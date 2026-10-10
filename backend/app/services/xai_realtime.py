@@ -47,6 +47,7 @@ from app.services.appointment_booking_service import (
     confirm_booking,
     search_day_part,
     stage_booking,
+    lookup_customer_history,
     lookup_upcoming_appointments,
     _parse_dt,
     _prepare,
@@ -102,7 +103,7 @@ from app.services.receptionist_identity import incoming_greeting
 
 logger = logging.getLogger(__name__)
 
-HOLD_ACK_TEXT = "Let me check that for you."
+HOLD_ACK_TEXT = "Hmm. Let me check that for you."
 AVAILABILITY_CACHE_SECONDS = 3
 
 _SESSION_RESTART_GREETING_RE = re.compile(
@@ -557,16 +558,18 @@ LOOKUP_APPOINTMENTS_TOOL: dict[str, Any] = {
     "type": "function",
     "name": "lookup_appointments",
     "description": (
-        "Read-only lookup of this caller's upcoming appointments. Use this for questions "
+        "Read-only lookup of this caller's verified appointment records. Use this for questions "
         "like 'when is my next appointment?' and before selecting among multiple appointments "
-        "for cancellation or rescheduling. This never books, moves, or cancels anything."
+        "for cancellation or rescheduling. Use purpose=history when the caller asks what they "
+        "booked last time. Never infer history from the conversation. This never books, moves, "
+        "or cancels anything."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "purpose": {
                 "type": "string",
-                "enum": ["lookup", "cancel", "reschedule"],
+                "enum": ["lookup", "cancel", "reschedule", "history"],
                 "description": "Why the appointments are being listed.",
             }
         },
@@ -2118,11 +2121,47 @@ class XAIVoiceSession:
         except json.JSONDecodeError:
             args = {}
         purpose = str(args.get("purpose") or "lookup").lower()
-        if purpose not in {"lookup", "cancel", "reschedule"}:
+        if purpose not in {"lookup", "cancel", "reschedule", "history"}:
             purpose = "lookup"
 
+        cancellation_policy = None
         async with AsyncSessionLocal() as db:
-            upcoming = await lookup_upcoming_appointments(db, self.session, limit=10)
+            appointments = (
+                await lookup_customer_history(db, self.session, limit=5)
+                if purpose == "history"
+                else await lookup_upcoming_appointments(db, self.session, limit=10)
+            )
+            if purpose == "cancel":
+                routing = await _prepare(db, self.session)
+                cancellation_policy = await lookup_spa_facts(
+                    routing.spa,
+                    topic="policies",
+                )
+
+        if purpose == "history":
+            history = [
+                {
+                    "start_iso": appt.start_time.isoformat(),
+                    "service": appt.title,
+                    "status": appt.status.value,
+                    "source": "verified_booking_record",
+                }
+                for appt in appointments
+            ]
+            return json.dumps({
+                "status": "found" if history else "not_found",
+                "read_only": True,
+                "purpose": "history",
+                "appointments": history,
+                "message": (
+                    "These are verified past appointment records for this caller, newest first. "
+                    "Answer only from these records."
+                    if history
+                    else "No verified past appointment record was found for this caller. Do not guess what they booked."
+                ),
+            })
+
+        upcoming = appointments
 
         draft = get_draft(self.session)
         draft.offered_appointment_ids = [str(appt.id) for appt in upcoming]
@@ -2145,8 +2184,9 @@ class XAIVoiceSession:
             "read_only": True,
             "purpose": purpose,
             "appointments": options,
+            "cancellation_policy": cancellation_policy,
             "message": (
-                "These are the caller's upcoming appointments, earliest first. For cancel/reschedule, use only an appointment_id from this list."
+                "These are the caller's upcoming appointments, earliest first. For cancel/reschedule, use only an appointment_id from this list. Before cancellation confirmation, quote only the cancellation_policy returned here."
                 if options
                 else "No upcoming appointment was found for this caller."
             ),
@@ -3326,6 +3366,54 @@ class XAIVoiceSession:
                 parsed_args.setdefault("service_description", cancelled.get("service"))
                 parsed_args["earliest"] = False
                 raw_args = json.dumps(parsed_args)
+
+            # A calendar day plus a service is enough to continue the
+            # conversation, but it is not permission for the model to invent
+            # one exact timestamp or to dump an entire day of results. Ask for
+            # the caller's preferred part of day, then perform one bounded
+            # provider search that returns at most three real openings.
+            utterance = self._last_user_utterance() or ""
+            approximate_hour = re.search(
+                rf"\b(?:around|about|near)\s+(?:[01]?\d|2[0-3]|{_TIME_WORD})\b",
+                utterance,
+                re.IGNORECASE,
+            )
+            no_spoken_time = (
+                _extract_clock_time(utterance) is None
+                and _extract_day_part(utterance) is None
+                and approximate_hour is None
+            )
+            pending_window = self.session.entities.get("requested_availability_window")
+            caller_named_day = bool(_DATE_MENTION_RE.search(utterance))
+            has_service = bool(
+                parsed_args.get("service_description")
+                or parsed_args.get("requested_services")
+                or get_draft(self.session).service_description
+            )
+            if no_spoken_time and has_service and (caller_named_day or pending_window):
+                if caller_named_day:
+                    now = self._now()
+                    named_date, source = self._spoken_date(utterance, now.date())
+                    if named_date is not None and source != "none":
+                        day_start = datetime.combine(named_date, dt_time.min, tzinfo=self._tz)
+                        day_end = datetime.combine(named_date + timedelta(days=1), dt_time.min, tzinfo=self._tz)
+                        self.session.entities["requested_availability_window"] = [
+                            max(day_start, now).isoformat(), day_end.isoformat()
+                        ]
+                await self._send_function_output(
+                    call_ref,
+                    json.dumps({
+                        "status": "missing_day_part",
+                        "available": False,
+                        "message": "Ask whether the caller prefers morning, afternoon, or evening. Do not offer or check an invented exact time.",
+                    }),
+                    nudge=False,
+                )
+                if self.session.entities.get("day_part_question_turn") != self._user_turn_count:
+                    self.session.entities["day_part_question_turn"] = self._user_turn_count
+                    await self._cancel_active_response()
+                    await self._send_force_message("Would you prefer morning, afternoon, or evening?")
+                return
             spoken_window = self._spoken_day_part_window()
             if spoken_window is not None and name in {
                 CHECK_AVAILABILITY_TOOL["name"],
@@ -3779,6 +3867,21 @@ class XAIVoiceSession:
                     )
             elif etype == "response.done":
                 event_response_id = self._response_id_of(data)
+                # The short hold response can finish after xAI has already
+                # declared a newer response active.  Process that completion
+                # before the stale-response guard so a completed Square lookup
+                # cannot remain buffered in silence indefinitely.
+                if (
+                    event_response_id
+                    and event_response_id == self._availability_hold_response_id
+                    and event_response_id != self._active_response_id
+                ):
+                    self._availability_hold_done = True
+                    pending_availability = self._pending_availability_speech
+                    self._pending_availability_speech = None
+                    if pending_availability and not self._availability_speech_interrupted:
+                        await self._speak_availability(pending_availability)
+                    return
                 if (event_response_id and self._active_response_id
                         and event_response_id != self._active_response_id):
                     return

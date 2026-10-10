@@ -56,6 +56,20 @@ async def test_old_response_done_does_not_close_newer_response():
     assert v._active_response_id == "new"
 
 
+async def test_late_hold_completion_releases_verified_availability_without_closing_new_response():
+    v = voice()
+    v._active_response_id = "new"
+    v._availability_hold_response_id = "hold"
+    v._pending_availability_speech = "Three PM is available."
+    v._speak_availability = AsyncMock()
+
+    await v._dispatch({"type": "response.done", "response": {"id": "hold"}})
+
+    assert v._active_response_id == "new"
+    assert v._pending_availability_speech is None
+    v._speak_availability.assert_awaited_once_with("Three PM is available.")
+
+
 async def test_cancel_race_does_not_replay_greeting_or_mutate_new_response():
     v = voice()
     v._active_response_id = "new"
@@ -97,6 +111,35 @@ async def test_voice_cache_invalidation_requires_successful_cancellation(monkeyp
     await v._run_cancel_appointment("{}")
     assert (not v._availability_recent) is cleared
     assert (not v._rejected_probe_signatures_this_turn) is cleared
+
+
+async def test_returning_customer_history_uses_only_verified_records(monkeypatch):
+    v = voice()
+    past = SimpleNamespace(
+        start_time=datetime(2026, 8, 4, 15, tzinfo=timezone.utc),
+        title="60 minute European facial",
+        status=SimpleNamespace(value="completed"),
+    )
+    monkeypatch.setattr(realtime, "lookup_customer_history", AsyncMock(return_value=[past]))
+    monkeypatch.setattr(realtime, "AsyncSessionLocal", lambda: _NullDBContext())
+
+    output = json.loads(await v._run_lookup_appointments('{"purpose":"history"}'))
+
+    assert output["status"] == "found"
+    assert output["appointments"] == [{
+        "start_iso": "2026-08-04T15:00:00+00:00",
+        "service": "60 minute European facial",
+        "status": "completed",
+        "source": "verified_booking_record",
+    }]
+
+
+class _NullDBContext:
+    async def __aenter__(self):
+        return SimpleNamespace()
+
+    async def __aexit__(self, *_args):
+        return None
 
 
 async def test_cancel_then_rebook_same_time_is_a_new_idempotent_booking(world):
@@ -142,6 +185,33 @@ async def test_day_query_asks_for_missing_service_without_provider_lookup(monkey
     assert result.outcome == booking.BookingOutcome.MISSING_INFO
     assert "service" in result.message
     prepare.assert_not_awaited()
+
+
+async def test_day_and_service_ask_for_day_part_before_any_provider_probe(monkeypatch):
+    v = voice()
+    v.session.add_turn("user", "Tomorrow for a 60 minute deep tissue massage")
+    v._user_turn_count = 1
+    v._send_function_output = AsyncMock()
+    v._send_force_message = AsyncMock()
+    v._cancel_active_response = AsyncMock()
+    v._run_propose_appointment = AsyncMock()
+
+    await v._handle_function_call({
+        "type": "response.function_call_arguments.done",
+        "name": "propose_appointment",
+        "call_id": "day-only",
+        "arguments": json.dumps({
+            "requested_start_iso": "2026-10-10T10:00:00",
+            "service_description": "60 minute deep tissue massage",
+        }),
+    })
+
+    v._run_propose_appointment.assert_not_awaited()
+    v._send_force_message.assert_awaited_once_with(
+        "Would you prefer morning, afternoon, or evening?"
+    )
+    output = json.loads(v._send_function_output.await_args.args[1])
+    assert output["status"] == "missing_day_part"
 
 
 def test_service_clarification_retains_requested_day():

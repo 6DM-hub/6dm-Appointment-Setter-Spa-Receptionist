@@ -160,7 +160,7 @@ async def test_4_hold_ack_is_not_a_greeting(monkeypatch):
         for p in sent
     ]
     assert HOLD_ACK_TEXT in texts
-    assert HOLD_ACK_TEXT == "Let me check that for you."
+    assert HOLD_ACK_TEXT == "Hmm. Let me check that for you."
     assert "thank you for calling" not in HOLD_ACK_TEXT.lower()
     assert len(_greeting_payloads(sent)) == before
 

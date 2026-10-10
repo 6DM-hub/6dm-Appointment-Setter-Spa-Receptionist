@@ -38,6 +38,54 @@ def _ctx(start: datetime = START, end: datetime = END) -> BookingContext:
     )
 
 
+def test_generic_menu_entry_preserves_explicit_duration_for_square_resolution():
+    spa = make_spa(
+        booking_provider=BookingProvider.SQUARE,
+        booking_config={"access_token": "token", "location_id": "loc_123"},
+        services=[{"name": "Deep Tissue", "duration_minutes": 60}],
+    )
+    adapter = SpaBookingAdapter(spa)
+    original = BookingContext(
+        start=START,
+        end=START + timedelta(minutes=60),
+        title="90 minute deep tissue massage",
+        service_description="90 minute deep tissue massage",
+        customer_phone="+15550001",
+    )
+
+    resolved, name = adapter._canonicalize_ctx(original)
+
+    assert name == "Deep Tissue"
+    assert resolved.title == "Deep Tissue"
+    assert resolved.service_description == "Deep Tissue 90 minutes"
+    assert resolved.end == START + timedelta(minutes=90)
+
+
+def test_pinned_square_variation_does_not_need_duration_in_provider_description():
+    spa = make_spa(
+        booking_provider=BookingProvider.SQUARE,
+        booking_config={"access_token": "token", "location_id": "loc_123"},
+        services=[{
+            "name": "Deep Tissue 60 Minutes",
+            "duration_minutes": 60,
+            "square_variation_id": "variation-60",
+        }],
+    )
+    adapter = SpaBookingAdapter(spa)
+    original = BookingContext(
+        start=START,
+        end=START + timedelta(minutes=60),
+        title="60 minute deep tissue massage",
+        service_description="60 minute deep tissue massage",
+        customer_phone="+15550001",
+    )
+
+    resolved, _ = adapter._canonicalize_ctx(original)
+
+    assert resolved.service_description == "Deep Tissue 60 Minutes"
+    assert resolved.service_variation_id == "variation-60"
+
+
 def test_outbound_sales_always_books_dominics_calendar():
     adapter = get_booking_adapter(is_outbound_sales=True, spa=None)
 

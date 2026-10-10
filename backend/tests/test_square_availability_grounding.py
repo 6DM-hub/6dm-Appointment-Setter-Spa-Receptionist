@@ -717,15 +717,15 @@ async def test_hold_phrase_is_audible_before_square_and_result_follows(monkeypat
         "arguments": '{"requested_start_iso":"2026-10-02T15:00:00","service_description":"Swedish"}',
     }))
     await asyncio.wait_for(started.wait(), timeout=2)
-    assert order == ["Let me check that for you."]
+    assert order == ["Hmm. Let me check that for you."]
     assert voice._muted_availability_response_id == "model-1"
     await voice._dispatch({"type": "response.created", "response": {"id": "hold-1"}})
     release.set()
     await task
-    assert order == ["Let me check that for you."]
+    assert order == ["Hmm. Let me check that for you."]
     assert voice._pending_availability_speech and "3 PM" in voice._pending_availability_speech
     await voice._dispatch({"type": "response.done", "response": {"id": "hold-1"}})
-    assert order[0] == "Let me check that for you."
+    assert order[0] == "Hmm. Let me check that for you."
     assert "3 PM is available" in order[-1]
 
 
@@ -939,14 +939,14 @@ async def test_time_change_proposal_is_spoken_by_the_server_then_books_once(monk
     calendar.block_next = True
     task = await _propose(voice, "2026-10-03T11:15:00")
     await asyncio.wait_for(calendar.started.wait(), timeout=2)
-    assert _texts(sent) == ["Let me check that for you."]
+    assert _texts(sent) == ["Hmm. Let me check that for you."]
     await voice._dispatch({"type": "response.created", "response": {"id": "hold-1"}})
     calendar.release.set()
     await task
     assert not any(item.get("type") == "response.create" for item in sent)
     await voice._dispatch({"type": "response.done", "response": {"id": "hold-1"}})
     spoken = _texts(sent)
-    assert spoken[0] == "Let me check that for you."
+    assert spoken[0] == "Hmm. Let me check that for you."
     # Collect a missing name before asking permission to book. Never append a
     # second question immediately after the booking approval question.
     assert "11:15 AM is available" in spoken[-1]

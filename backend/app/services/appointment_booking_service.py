@@ -615,6 +615,39 @@ async def lookup_upcoming_appointments(
     )
 
 
+async def lookup_customer_history(
+    db: AsyncSession, session: CallSession, limit: int = 5
+) -> list[Appointment]:
+    """Return verified, non-cancelled past appointments for this phone number.
+
+    This is deliberately read-only and tenant-scoped.  It reports only rows
+    that were actually saved by Cara's booking workflow; it never derives a
+    previous service from conversation text or from the current draft.
+    """
+    routing = await _prepare(db, session)
+    contact = await _find_contact_by_phone(db, routing.scope, session)
+    if contact is None:
+        return []
+    now = datetime.now(timezone.utc)
+    return (
+        await db.execute(
+            select(Appointment)
+            .where(
+                scope_filter(routing.scope, Appointment),
+                Appointment.contact_id == contact.id,
+                Appointment.status.in_([
+                    AppointmentStatus.SCHEDULED,
+                    AppointmentStatus.CONFIRMED,
+                    AppointmentStatus.COMPLETED,
+                ]),
+                Appointment.start_time < now,
+            )
+            .order_by(Appointment.start_time.desc())
+            .limit(max(1, min(limit, 20)))
+        )
+    ).scalars().all()
+
+
 async def _load_active_appointment(
     db: AsyncSession, scope: TenantScope, appointment_id: str | None
 ) -> Appointment | None:

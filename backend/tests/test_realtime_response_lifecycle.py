@@ -388,7 +388,7 @@ async def test_date_only_no_time_of_day_mentioned_is_refused_not_guessed(
         if item.get("type") == "conversation.item.create"
         and item["item"]["type"] == "function_call_output"
     ]
-    assert outputs[0]["status"] == "ungrounded_time"
+    assert outputs[0]["status"] == "missing_day_part"
 
 
 async def test_explicit_date_and_time_is_allowed(voice_session, availability_stub, monkeypatch):
