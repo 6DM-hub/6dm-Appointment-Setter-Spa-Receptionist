@@ -9,7 +9,7 @@ import pytest
 
 from app.services.booking_adapters.base import BookingContext, BookingProviderError, AvailabilityVerdict
 from app.services.booking_adapters.spa_router import SpaBookingAdapter
-from app.services.visit_booking import VisitPolicy, validate_sequence
+from app.services.visit_booking import VisitPolicy, resolve_specs, validate_sequence
 from app.services.grok_service import AppointmentIntent
 from tests.test_booking_intent_state import world, _confirm
 
@@ -102,6 +102,31 @@ async def test_two_treatments_different_staff_one_atomic_write(visit):
     writes = [kw['json'] for method, path, kw in state['calls'] if method == 'POST' and path == '/v2/bookings']
     assert len(writes) == 1 and len(writes[0]['booking']['appointment_segments']) == 2
     assert router.duration_for_service(ctx.service_description) == 150
+
+
+async def test_each_catalog_lookup_uses_its_service_duration_not_total_visit(visit):
+    router, ctx, _ = visit
+    observed = []
+
+    async def resolve(single):
+        minutes = round((single.end - single.start).total_seconds() / 60)
+        observed.append((single.title, minutes))
+        if "facial" in single.title.casefold() and minutes == 60:
+            return {"id": "facial", "version": 1}
+        if "deep tissue" in single.title.casefold() and minutes == 90:
+            return {"id": "massage", "version": 2}
+        raise BookingProviderError("needs_clarification: service_ambiguous")
+
+    router.delegate._resolve_service_variation = resolve
+    await resolve_specs(
+        router,
+        replace(
+            ctx,
+            service_description="60 minute European facial + 90 minute Deep tissue massage",
+        ),
+    )
+
+    assert [minutes for _name, minutes in observed] == [60, 90]
 
 
 @pytest.mark.parametrize('hour,minute,available', [(17,0,False),(15,30,True),(15,31,False)])

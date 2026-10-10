@@ -563,6 +563,11 @@ class SpaBookingAdapter(BookingAdapter):
         from app.services.visit_booking import parts
         return parts(self, description)
 
+    @staticmethod
+    def requested_duration_minutes(service_description: str | None) -> int | None:
+        """Return only a duration the caller explicitly attached to one service."""
+        return _minutes_in(service_description)
+
     def requires_visit_validation(self, ctx):
         if (ctx.selected_slot or {}).get("visit_segments") or len(self.requested_services(ctx.service_description or ctx.title)) > 1:
             return True

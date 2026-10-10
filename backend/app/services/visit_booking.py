@@ -144,8 +144,15 @@ async def resolve_specs(router, ctx):
         if resolution.status in {"ambiguous", "unspecified"}:
             raise BookingProviderError(router._clarification_reason(resolution), code="VISIT_SERVICE_CLARIFICATION")
         entry = resolution.entry if resolution.status == "resolved" else {}
+        configured_minutes = entry.get("duration_minutes") if entry else None
+        segment_minutes = (
+            router.requested_duration_minutes(name)
+            or (configured_minutes if isinstance(configured_minutes, int) and configured_minutes > 0 else None)
+            or router.duration_for_service(name)
+        )
         single = replace(ctx, title=name, service_description=name, selected_slot=None,
-                         service_variation_id=None, service_variation_version=None, provider_id=None)
+                         service_variation_id=None, service_variation_version=None, provider_id=None,
+                         end=elapsed_end(ctx.start, segment_minutes))
         if entry:
             single = router._apply_entry(single, entry)
         single, blocked = router._staff_context(single)

@@ -1,6 +1,7 @@
 import uuid
 from datetime import timedelta
 from unittest.mock import AsyncMock
+from zoneinfo import ZoneInfo
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
@@ -12,6 +13,13 @@ from app.models.base import Base
 from app.models import Appointment, AppointmentStatus, Contact, SpaAccount, User, UserRole
 from app.models.cara_manager import CaraDelivery
 from app.services import cara_manager as m
+
+
+def future_open_time(days=2):
+    """Keep real-clock tests inside the fixture's configured local hours."""
+    return (m.now_utc().astimezone(ZoneInfo("America/Chicago")) + timedelta(days=days)).replace(
+        hour=12, minute=0, second=0, microsecond=0
+    )
 
 
 @compiles(JSONB, "sqlite")
@@ -254,7 +262,7 @@ async def test_shared_pipeline_full_booking_and_confirmation(data):
     await m.execute_test(db, spa.id, owner.id, c.id)
     d = (await db.execute(select(CaraDelivery))).scalar_one()
     await m.reply_test(db, spa.id, owner.id, d.id, "YES")
-    selected = await pipeline.stage(db, spa.id, owner.id, d.id, m.now_utc()+timedelta(days=2), "Test Alice")
+    selected = await pipeline.stage(db, spa.id, owner.id, d.id, future_open_time(), "Test Alice")
     assert selected["status"] == "awaiting_customer_confirmation"
     assert not (await db.execute(select(Appointment).where(Appointment.status == AppointmentStatus.SCHEDULED))).first()
     with pytest.raises(HTTPException):
@@ -400,7 +408,7 @@ async def test_entire_flow_through_http_api(data):
             r = (await client.get(path+"/results")).json()
             delivery = "/api/v1/cara/deliveries/" + r["deliveries"][0]["id"]
             assert (await client.post(delivery+"/reply-test", json={"message": "YES"})).status_code == 200
-            staged = await client.post(delivery+"/stage-test-booking", json={"start": (m.now_utc()+timedelta(days=2)).isoformat(), "customer_name": "Test Alice"})
+            staged = await client.post(delivery+"/stage-test-booking", json={"start": future_open_time().isoformat(), "customer_name": "Test Alice"})
             assert staged.status_code == 200, staged.text
             booked = await client.post(delivery+"/confirm-test-booking", json={"expected_fingerprint": staged.json()["fingerprint"], "confirmation": "YES"})
             assert booked.status_code == 200, booked.text
