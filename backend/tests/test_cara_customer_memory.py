@@ -108,6 +108,7 @@ async def test_remember_only_explicit_non_sensitive_caller_spoken_preference(mon
     contact = _contact(session)
     session.add_turn("user", "My name is Jane Doe.")
     monkeypatch.setattr(cm, "_resolve_profile", AsyncMock(return_value=(contact, "Jane Doe", "verified")))
+    monkeypatch.setattr(cm, "_recent_treatments", AsyncMock(return_value=[]))
     db = SimpleNamespace(commit=AsyncMock())
     found = await cm.customer_profile_action(db, session, caller_name="Jane Doe")
     assert found["status"] == "found"
@@ -216,6 +217,7 @@ async def test_forget_saved_preferences_and_feedback(monkeypatch):
     }
     session.add_turn("user", "Jane Doe")
     monkeypatch.setattr(cm, "_resolve_profile", AsyncMock(return_value=(contact, "Jane Doe", "verified")))
+    monkeypatch.setattr(cm, "_recent_treatments", AsyncMock(return_value=[]))
     db = SimpleNamespace(commit=AsyncMock())
     await cm.customer_profile_action(db, session, caller_name="Jane Doe")
     session.add_turn("user", "Please forget all my saved preferences and feedback.")
