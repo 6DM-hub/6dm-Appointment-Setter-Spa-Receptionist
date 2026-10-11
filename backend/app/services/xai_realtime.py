@@ -3207,14 +3207,136 @@ class XAIVoiceSession:
 
     @staticmethod
     def _spoken_duration_choice(text: str) -> int | None:
-        match = re.search(
-            r"\b(30|60|thirty|sixty)\s*(?:-?\s*(?:minute|minutes|min|mins))?\b",
-            text or "",
+        value = str(text or "").strip()
+        if not value:
+            return None
+
+        # A clock time such as ``2:30`` is an appointment-time selection, not
+        # a request to change the service to 30 minutes.  Require duration
+        # units in a sentence; continue accepting a bare ``30`` or ``60`` when
+        # it is the whole answer to the backend-owned duration question.
+        explicit = re.search(
+            r"\b(30|60|thirty|sixty)\s*-?\s*(?:minute|minutes|min|mins)\b",
+            value,
             re.IGNORECASE,
         )
-        if match is None:
+        if explicit is not None:
+            return 30 if explicit.group(1).casefold() in {"30", "thirty"} else 60
+
+        normalized = " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
+        bare = re.fullmatch(
+            r"(?:the\s+)?(30|60|thirty|sixty)(?:\s+(?:minute|option|one))?"
+            r"(?:\s+please)?",
+            normalized,
+        )
+        if bare is not None:
+            return 30 if bare.group(1) in {"30", "thirty"} else 60
+        if re.search(r"\b(?:longer|full hour|hour long)\b", normalized):
+            return 60
+        if re.search(r"\b(?:shorter|express|petite)\b", normalized):
+            return 30
+        return None
+
+    @staticmethod
+    def _consultation_choice_from_caller(
+        state: dict[str, Any], caller_text: str
+    ) -> int | None:
+        """Return a caller-grounded 30/60 choice from a pending offer.
+
+        Besides direct duration wording, accept a configured option's distinct
+        menu name (for example ``European Facial``).  Generic words shared by
+        both choices never count as a selection.
+        """
+        chosen = XAIVoiceSession._spoken_duration_choice(caller_text)
+        if chosen is not None:
+            return chosen
+        normalized = " ".join(re.findall(r"[a-z0-9]+", str(caller_text or "").casefold()))
+        if not normalized:
             return None
-        return 30 if match.group(1).casefold() in {"30", "thirty"} else 60
+        choices = state.get("duration_choices") or []
+        for choice in choices:
+            name = " ".join(
+                re.findall(
+                    r"[a-z]+",
+                    re.sub(
+                        r"\b(?:30|60|thirty|sixty)\s*(?:minutes?|mins?)?\b",
+                        " ",
+                        str(choice.get("service_name") or ""),
+                        flags=re.IGNORECASE,
+                    ).casefold(),
+                )
+            )
+            distinctive = [
+                word for word in name.split()
+                if word not in {"facial", "massage", "minute", "minutes"}
+            ]
+            if distinctive and all(
+                re.search(rf"\b{re.escape(word)}\b", normalized)
+                for word in distinctive
+            ):
+                try:
+                    return int(choice.get("minutes"))
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    def _stabilize_completed_consultations(self, args: dict[str, Any]) -> None:
+        """Keep completed caller choices authoritative on later tool calls.
+
+        Realtime models may resend an older service while asking for a date or
+        time.  Once the caller completed the consultation, only a new explicit
+        caller duration/menu choice may replace the selected service.
+        """
+        states = self.session.entities.get("consultation_states")
+        if not isinstance(states, dict):
+            return
+        completed = {
+            str(value)
+            for value in self.session.entities.get("consultation_completed_kinds", [])
+            if str(value)
+        }
+        if not completed:
+            return
+        caller_text = self._last_user_utterance() or ""
+        active_states = {
+            kind: states.get(kind)
+            for kind in completed
+            if isinstance(states.get(kind), dict)
+            and states[kind].get("selected_service_name")
+        }
+        mentioned_kinds = {
+            kind
+            for kind in active_states
+            if re.search(rf"\b{re.escape(kind)}s?\b", caller_text, re.IGNORECASE)
+        }
+        for kind in completed:
+            state = states.get(kind)
+            if not isinstance(state, dict) or not state.get("selected_service_name"):
+                continue
+            # A bare "30" or "60" is safe only when one completed treatment
+            # is active. In a facial-plus-massage visit, scope a change to the
+            # modality the caller actually named so one edit cannot alter both.
+            choice_is_scoped = (
+                len(active_states) == 1
+                or (len(mentioned_kinds) == 1 and kind in mentioned_kinds)
+            )
+            chosen = (
+                self._consultation_choice_from_caller(state, caller_text)
+                if choice_is_scoped
+                else None
+            )
+            if chosen is not None and chosen != state.get("selected_duration_minutes"):
+                try:
+                    state = record_duration_selection(
+                        state, selected_duration_minutes=chosen
+                    )
+                except ValueError:
+                    # A model-supplied name cannot expand the allow-listed
+                    # choices. Keep the prior caller-grounded selection.
+                    pass
+                states[kind] = state
+            self._apply_consultation_selection(args, kind, state)
+        self.session.entities["consultation_states"] = states
 
     @staticmethod
     def _caller_declines_optional_item(text: str) -> bool:
@@ -3315,6 +3437,11 @@ class XAIVoiceSession:
         self._restore_consultation_booking_request(args)
         self._apply_caller_service_durations(args)
         self._coalesce_service_arguments(args)
+        # A completed caller-grounded consultation outranks stale model tool
+        # arguments on later date/time turns. Apply it before remembering the
+        # request so an old 30-minute argument cannot overwrite a selected
+        # 60-minute treatment.
+        self._stabilize_completed_consultations(args)
         self._remember_consultation_booking_request(args)
         services, upsell_rules = await self._consultation_catalog()
         if self._consultation_catalog_available is False:
@@ -3355,6 +3482,9 @@ class XAIVoiceSession:
         duration_turns = self.session.entities.get("consultation_duration_offer_turns")
         if not isinstance(duration_turns, dict):
             duration_turns = {}
+        duration_attempts = self.session.entities.get("consultation_duration_attempts")
+        if not isinstance(duration_attempts, dict):
+            duration_attempts = {}
         addon_pending = self.session.entities.get("consultation_addon_pending")
         if not isinstance(addon_pending, dict):
             addon_pending = {}
@@ -3362,11 +3492,46 @@ class XAIVoiceSession:
 
         for kind, requested_service in kinds:
             prior = states.get(kind)
-            state = initialize_consultation(
-                requested_service,
-                services=services,
-                prior_state=prior if isinstance(prior, dict) else None,
-            )
+            if kind in completed and isinstance(prior, dict):
+                # The stabilizer above has already applied any explicit caller
+                # change. Never reopen optional questions or the duration offer
+                # merely because xAI emitted an older same-modality service.
+                state = prior
+                states[kind] = state
+                self.session.entities["consultation_state"] = state
+                self._apply_consultation_selection(args, kind, state)
+                self._remember_consultation_booking_request(args)
+                continue
+
+            pending_duration_turn = duration_turns.get(kind)
+            if isinstance(pending_duration_turn, int) and (
+                self._user_turn_count <= pending_duration_turn
+            ):
+                # A tool continuation in the same caller turn is not a second
+                # answer. Return a silent wait marker instead of replaying the
+                # 30/60 question.
+                await self._send_function_output(
+                    call_ref,
+                    json.dumps({
+                        "status": "awaiting_duration_selection",
+                        "available": False,
+                        "booked": False,
+                    }),
+                    nudge=False,
+                )
+                return True
+
+            if isinstance(pending_duration_turn, int) and isinstance(prior, dict):
+                # Process the answer against the exact choices that the server
+                # offered. A model-emitted catalog name must not reset them
+                # before the caller's reply is interpreted.
+                state = prior
+            else:
+                state = initialize_consultation(
+                    requested_service,
+                    services=services,
+                    prior_state=prior if isinstance(prior, dict) else None,
+                )
             if state is None:
                 continue
 
@@ -3585,7 +3750,7 @@ class XAIVoiceSession:
             # selection when the caller says to keep it.
             offer_turn = duration_turns.get(kind)
             if isinstance(offer_turn, int) and self._user_turn_count > offer_turn:
-                chosen = self._spoken_duration_choice(caller_text)
+                chosen = self._consultation_choice_from_caller(state, caller_text)
                 if chosen is not None:
                     try:
                         state = record_duration_selection(
@@ -3602,7 +3767,61 @@ class XAIVoiceSession:
                             spoken=f"I have {choices}-minute options. Which would you prefer?",
                         )
                         return True
-                duration_turns.pop(kind, None)
+                    duration_turns.pop(kind, None)
+                    duration_attempts.pop(kind, None)
+                else:
+                    keeps_selected = bool(state.get("selected_service_name")) and bool(
+                        is_affirmative(caller_text)
+                        or re.search(
+                            r"\b(?:keep|same|original|what i asked for)\b",
+                            caller_text,
+                            re.IGNORECASE,
+                        )
+                        or _extract_clock_time(caller_text) is not None
+                        or _extract_day_part(caller_text) is not None
+                    )
+                    if keeps_selected:
+                        duration_turns.pop(kind, None)
+                        duration_attempts.pop(kind, None)
+                    else:
+                        attempts = int(duration_attempts.get(kind) or 0) + 1
+                        duration_attempts[kind] = attempts
+                        duration_turns[kind] = self._user_turn_count
+                        self.session.entities[
+                            "consultation_duration_offer_turns"
+                        ] = duration_turns
+                        self.session.entities[
+                            "consultation_duration_attempts"
+                        ] = duration_attempts
+                        if attempts >= 2:
+                            await self._send_function_output(
+                                call_ref,
+                                json.dumps({
+                                    "status": "needs_staff_help",
+                                    "available": False,
+                                    "booked": False,
+                                    "message": (
+                                        "The treatment length still needs clarification. "
+                                        "Nothing has been booked."
+                                    ),
+                                }),
+                                nudge=False,
+                            )
+                            await self._offer_staff_callback()
+                        else:
+                            choices = " or ".join(
+                                str(item.get("minutes"))
+                                for item in state.get("duration_choices") or []
+                                if item.get("minutes")
+                            )
+                            await self._speak_consultation_gate(
+                                call_ref,
+                                status="duration_selection_required",
+                                spoken=(
+                                    f"Would you prefer the {choices}-minute option?"
+                                ),
+                            )
+                        return True
 
             generic_request = re.sub(
                 r"\b(?:30|60|thirty|sixty)\s*(?:minutes?|mins?)?\b",
@@ -3628,7 +3847,9 @@ class XAIVoiceSession:
             self.session.entities["consultation_states"] = states
             if duration["status"] == "offer_duration":
                 duration_turns[kind] = self._user_turn_count
+                duration_attempts.pop(kind, None)
                 self.session.entities["consultation_duration_offer_turns"] = duration_turns
+                self.session.entities["consultation_duration_attempts"] = duration_attempts
                 await self._speak_consultation_gate(
                     call_ref,
                     status="duration_options",
@@ -3656,6 +3877,8 @@ class XAIVoiceSession:
                     status="duration_selection_required",
                     spoken=f"Would you prefer the {wording}-minute option?",
                 )
+                duration_turns[kind] = self._user_turn_count
+                self.session.entities["consultation_duration_offer_turns"] = duration_turns
                 return True
 
             if kind == "massage":
@@ -3774,6 +3997,7 @@ class XAIVoiceSession:
         self.session.entities["consultation_permission_turns"] = permission_turns
         self.session.entities["consultation_permission_attempts"] = permission_attempts
         self.session.entities["consultation_duration_offer_turns"] = duration_turns
+        self.session.entities["consultation_duration_attempts"] = duration_attempts
         self._restore_consultation_booking_request(args)
         # Apply every completed selection again after restoring the original
         # multi-service request, then remember the grounded, final version.

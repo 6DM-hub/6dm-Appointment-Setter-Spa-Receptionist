@@ -669,6 +669,7 @@ def start_new_intent(session: Any) -> BookingDraft:
         "consultation_permission_turns",
         "consultation_permission_attempts",
         "consultation_duration_offer_turns",
+        "consultation_duration_attempts",
         "caller_grounded_service_durations",
         "caller_grounded_exact_times",
         "requested_availability_window",
