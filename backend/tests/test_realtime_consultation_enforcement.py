@@ -332,7 +332,7 @@ async def test_duration_offer_duplicate_waits_silently_and_selection_survives_to
     args = {"requested_services": ["60 Minute Custom Facial"]}
     assert await result._enforce_service_consultation("same-turn", args) is True
     assert result._speak_consultation_gate.await_count == 0
-    state = result.session.entities["consultation_states"]["Custom Facial"]
+    state = result.session.entities["consultation_states"]["facial"]
     assert state["duration_offer_presented"] is True
     assert len(state["duration_choices"]) == 2
 
@@ -340,10 +340,10 @@ async def test_duration_offer_duplicate_waits_silently_and_selection_survives_to
     args = {"requested_services": ["60 Minute Custom Facial"]}
     assert await result._enforce_service_consultation("duration-answer", args) is False
     assert args["requested_services"] == ["60 Minute Custom Facial"]
-    state = result.session.entities["consultation_states"]["Custom Facial"]
+    state = result.session.entities["consultation_states"]["facial"]
     assert state["selected_duration_minutes"] == 60
     assert state["selected_service_name"] == "60 Minute Custom Facial"
-    assert result.session.entities["consultation_completed_kinds"] == ["Custom Facial"]
+    assert result.session.entities["consultation_completed_kinds"] == ["facial"]
 
 
 @pytest.mark.asyncio
@@ -368,7 +368,7 @@ async def test_duration_clarification_keeps_pending_latch_for_the_next_valid_ans
     assert await result._enforce_service_consultation(
         "duration-clarification", {"requested_services": ["60 Minute Custom Facial"]}
     ) is True
-    assert result.session.entities["consultation_duration_offer_turns"]["Custom Facial"] == (
+    assert result.session.entities["consultation_duration_offer_turns"]["facial"] == (
         result._user_turn_count
     )
 
@@ -376,7 +376,7 @@ async def test_duration_clarification_keeps_pending_latch_for_the_next_valid_ans
     args = {"requested_services": ["60 Minute Custom Facial"]}
     assert await result._enforce_service_consultation("duration-final", args) is False
     assert args["requested_services"] == ["60 Minute Custom Facial"]
-    assert result.session.entities["consultation_states"]["Custom Facial"][
+    assert result.session.entities["consultation_states"]["facial"][
         "selected_duration_minutes"
     ] == 60
 
@@ -394,7 +394,7 @@ async def test_completed_facial_choice_ignores_stale_tool_service_and_clock_minu
         {
             "consultation_state": state,
             "consultation_states": {"facial": state},
-            "consultation_completed_kinds": ["Custom Facial"],
+            "consultation_completed_kinds": ["facial"],
             "consultation_booking_request": {
                 "requested_services": ["60 Minute Custom Facial"],
                 "service_description": "60 Minute Custom Facial",
@@ -409,7 +409,7 @@ async def test_completed_facial_choice_ignores_stale_tool_service_and_clock_minu
     assert args["requested_services"] == ["60 Minute Custom Facial"]
     remembered = result.session.entities["consultation_booking_request"]
     assert remembered["requested_services"] == ["60 Minute Custom Facial"]
-    state = result.session.entities["consultation_states"]["Custom Facial"]
+    state = result.session.entities["consultation_states"]["facial"]
     assert state["selected_duration_minutes"] == 60
 
 
@@ -426,7 +426,7 @@ async def test_completed_facial_allows_an_explicit_caller_duration_change():
         {
             "consultation_state": state,
             "consultation_states": {"facial": state},
-            "consultation_completed_kinds": ["Custom Facial"],
+            "consultation_completed_kinds": ["facial"],
             "consultation_booking_request": {
                 "requested_services": ["60 Minute Custom Facial"]
             },
@@ -439,7 +439,7 @@ async def test_completed_facial_allows_an_explicit_caller_duration_change():
     assert args["requested_services"] == ["30 Minute Custom Facial"]
     remembered = result.session.entities["consultation_booking_request"]
     assert remembered["requested_services"] == ["30 Minute Custom Facial"]
-    state = result.session.entities["consultation_states"]["Custom Facial"]
+    state = result.session.entities["consultation_states"]["facial"]
     assert state["selected_duration_minutes"] == 30
 
 
