@@ -17,7 +17,9 @@ from app.services.consultation_gate import (
     availability_gate,
     initialize_consultation,
     record_consultation_answer,
+    record_pending_answer,
     record_duration_selection,
+    take_next_question,
     take_duration_offer,
     take_massage_addon_offer,
 )
@@ -140,8 +142,7 @@ async def test_exact_live_massage_call_skips_reask_and_reaches_availability():
     assert "main reason" in v._speak_consultation_gate.await_args.kwargs["spoken"]
 
     for utterance, expected in (
-        ("My back and legs are sore.", "particular areas"),
-        ("My back and my legs, like I said.", "pressure"),
+        ("My back and legs are sore.", "pressure"),
         ("Medium to deep.", "injuries"),
     ):
         caller_says(v, utterance)
@@ -208,3 +209,23 @@ async def test_other_family_does_not_inherit_duration_before_name_change():
     assert v._caller_grounded_consultation_duration(
         "massage", "Sports Massage", DUPLICATE_NAME_MENU
     ) is None
+
+
+def test_volunteered_back_and_leg_areas_are_not_asked_twice():
+    state = initialize_consultation(
+        "60 Minute Swedish Massage", services=DUPLICATE_NAME_MENU
+    )
+    assert state is not None
+    first = take_next_question(state)
+    assert first["awaiting_field"] == "massage_reason"
+    answered = record_pending_answer(
+        first["state"], caller_utterance="My back and legs are sore."
+    )
+    assert answered["status"] == "answer_recorded"
+    assert {"massage_reason", "massage_areas"}.issubset(
+        set(answered["state"]["answered_fields"])
+    )
+    next_question = take_next_question(answered["state"])
+    assert next_question["awaiting_field"] == "pressure_preference"
+    # No raw caller health details should be copied into state.
+    assert "my back and legs are sore" not in str(answered["state"]).lower()
