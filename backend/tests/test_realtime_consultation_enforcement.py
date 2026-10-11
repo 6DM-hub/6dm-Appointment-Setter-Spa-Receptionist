@@ -187,10 +187,9 @@ async def test_massage_consultation_is_enforced_and_original_request_survives():
 
     caller_says(result, "No injuries or areas to avoid.")
     partial = {"requested_services": ["Swedish Massage"]}
-    assert await result._enforce_service_consultation("tool-duration", partial) is True
-    duration_line = result._speak_consultation_gate.await_args.kwargs["spoken"]
-    assert "30-minute" in duration_line
-    assert "60-minute" in duration_line
+    # The caller selected an exact 60-minute menu treatment up front, so
+    # do not force a redundant duration comparison.
+    assert await result._enforce_service_consultation("tool-duration", partial) is False
 
     caller_says(result, "Keep the 60-minute option.")
     final_args = {"requested_services": ["Swedish Massage"]}
@@ -204,7 +203,7 @@ async def test_massage_consultation_is_enforced_and_original_request_survives():
 
 
 @pytest.mark.asyncio
-async def test_facial_questions_and_soft_duration_offer_cannot_be_skipped():
+async def test_facial_questions_keep_a_named_treatment_without_reoffering_duration():
     result = voice()
     result._consultation_catalog = AsyncMock(return_value=(FACIAL_SERVICES, []))
     caller_says(result, "I'd like a 30-minute facial next Wednesday morning.")
@@ -238,11 +237,8 @@ async def test_facial_questions_and_soft_duration_offer_cannot_be_skipped():
     caller_says(result, "I've had facials before and like gentle hydration.")
     assert await result._enforce_service_consultation(
         "f-duration", {"requested_services": ["Petite Facial"]}
-    ) is True
-    offer = result._speak_consultation_gate.await_args.kwargs["spoken"]
-    assert "focused start" in offer
-    assert "more time to target your concern" in offer
-    assert "Would you prefer the 60-minute or the 30-minute?" in offer
+    ) is False
+    assert "30-minute" not in result._speak_consultation_gate.await_args.kwargs["spoken"]
 
     caller_says(result, "Stay with 30 minutes.")
     final_args = {"requested_services": ["facial"]}

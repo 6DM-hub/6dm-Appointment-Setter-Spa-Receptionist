@@ -314,13 +314,10 @@ def test_duration_offer_fills_missing_family_duration_from_same_modality():
         state, FACIAL_SERVICES, recommended_service=FACIAL_SERVICES[0]
     )
 
-    assert result["status"] == "offer_duration"
-    assert result["offer"]["choices"] == [
-        {"minutes": 30, "service_name": "Petite Facial"},
-        {"minutes": 60, "service_name": "European Facial"},
-    ]
-    assert "focused start" in result["offer"]["text"]
-    assert "more time to target your concern" in result["offer"]["text"]
+    assert result["status"] == "selection_preserved"
+    assert result["offer"] is None
+    assert result["state"]["selected_service_name"] == "Petite Facial"
+    assert result["state"]["selected_duration_minutes"] == 30
 
 
 def test_duration_offer_never_invents_missing_catalog_duration():
@@ -338,10 +335,11 @@ def test_duration_offer_never_invents_missing_catalog_duration():
     )
     result = take_duration_offer(state, services)
 
-    assert result["offer"]["choices"] == [
+    assert result["status"] == "selection_preserved"
+    assert result["offer"] is None
+    assert result["state"]["duration_choices"] == [
         {"minutes": 60, "service_name": "European Facial"}
     ]
-    assert "30-minute" not in result["offer"]["text"]
 
 
 def test_same_family_duration_options_win_over_other_same_modality_services():
@@ -364,8 +362,9 @@ def test_same_family_duration_options_win_over_other_same_modality_services():
     )
     result = take_duration_offer(state, services)
 
-    assert result["offer"]["choices"][0]["service_name"] == "30 Minute Swedish Massage"
-    assert result["offer"]["choices"][1]["service_name"] == "60 Minute Swedish Massage"
+    assert result["status"] == "selection_preserved"
+    assert result["offer"] is None
+    assert result["state"]["selected_service_name"] == "60 Minute Swedish Massage"
 
 
 def test_duration_offer_is_returned_once_and_preserves_explicit_request():
@@ -423,10 +422,9 @@ def test_explicit_named_service_wins_when_classification_recommends_another():
     assert state["category"] == "deeper_pressure_sports"
     assert result["state"]["selected_service_name"] == "60 Minute Swedish Massage"
     assert result["state"]["selected_duration_minutes"] == 60
-    assert [choice["service_name"] for choice in result["offer"]["choices"]] == [
-        "30 Minute Swedish Massage",
-        "60 Minute Swedish Massage",
-    ]
+    assert result["status"] == "selection_preserved"
+    assert result["offer"] is None
+    assert result["state"]["selected_service_name"] == "60 Minute Swedish Massage"
 
 
 def test_duration_selection_must_come_from_grounded_offer():
