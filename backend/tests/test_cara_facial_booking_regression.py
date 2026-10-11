@@ -151,3 +151,143 @@ def test_time_before_date_is_caller_grounded_and_never_requires_repeated_am_pm()
     assert result._is_time_grounded("2026-10-14T14:30:00")
     assert not result._is_time_grounded("2026-10-14T15:00:00")
     assert not result._is_time_grounded("2026-10-15T14:30:00")
+
+
+@pytest.mark.parametrize("utterance", [
+    "Let's switch to the Clarifying Facial.",
+    "Let's switch to the Acne Clarifying Facial.",
+    "The recommended treatment.",
+    "Switch.",
+    "Let's switch.",
+    "The clarifying facial.",
+    "I want the clarifying facial.",
+    "I'll go with the recommended treatment.",
+    "Yes, I'd like to change.",
+    "Yes, that sounds good.",
+])
+def test_recommendation_accepts_actual_live_caller_wording(utterance):
+    from app.services.xai_realtime import XAIVoiceSession
+
+    assert XAIVoiceSession._caller_recommendation_decision(
+        utterance,
+        recommended_name="Acne Clarifying Facial",
+        original_name="European Facial",
+    ) == "accepted"
+
+
+@pytest.mark.parametrize("utterance", [
+    "No, let's keep the European Facial.",
+    "Keep my original service.",
+    "No thanks.",
+    "Don't switch.",
+    "I want to stay with the European Facial.",
+])
+def test_recommendation_decline_preserves_original(utterance):
+    from app.services.xai_realtime import XAIVoiceSession
+
+    assert XAIVoiceSession._caller_recommendation_decision(
+        utterance,
+        recommended_name="Acne Clarifying Facial",
+        original_name="European Facial",
+    ) == "declined"
+
+
+@pytest.mark.parametrize("utterance", [
+    "What's the Clarifying Facial?",
+    "How much is the European Facial?",
+    "Should I switch to the Clarifying Facial?",
+    "Tell me about the Clarifying Facial.",
+])
+def test_recommendation_information_questions_are_not_consent(utterance):
+    from app.services.xai_realtime import XAIVoiceSession
+
+    assert XAIVoiceSession._caller_recommendation_decision(
+        utterance,
+        recommended_name="Acne Clarifying Facial",
+        original_name="European Facial",
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_live_recommendation_questions_then_explicit_switch_continue_to_booking():
+    """Actual screenshot sequence: ask about each treatment, then say switch."""
+    v = voice()
+    await _reach_recommendation(v)
+    original = _original_args()
+    original["requested_start_iso"] = "2026-10-14T14:30:00"
+
+    caller_says(v, "What's the Clarifying Facial?")
+    assert await v._enforce_service_consultation("ask-clarifying", original) is True
+    assert v.session.entities["consultation_recommendation_pending"]["facial"]["name"] == "Acne Clarifying Facial"
+    assert v._speak_consultation_gate.await_args.kwargs["status"] == "service_recommendation"
+
+    caller_says(v, "How much is the European Facial?")
+    assert await v._enforce_service_consultation("ask-price", _original_args()) is True
+    assert v.session.entities["consultation_recommendation_pending"]["facial"]["name"] == "Acne Clarifying Facial"
+
+    # This exact wording used to cause repeated questions and no appointment.
+    caller_says(v, "Let's switch to the clarifying facial.")
+    args = _original_args()
+    assert await v._enforce_service_consultation("accept", args) is False
+    assert args["requested_services"] == ["Acne Clarifying Facial"]
+    assert args["requested_start_iso"] == "2026-10-14T14:30:00"
+    assert v.session.entities["consultation_recommendation_pending"] == {}
+    assert v.session.entities["consultation_states"]["facial"]["recommendation_status"] == "accepted"
+    assert "facial" in v.session.entities["consultation_completed_kinds"]
+    assert v.session.entities["consultation_states"]["facial"]["selected_duration_minutes"] == 60
+    # No appointment is falsely declared successful merely for selecting a service.
+    assert v.session.booking_status not in {"booked", "rescheduled"}
+
+    # Stale model tool arguments cannot resurrect the old service or loop.
+    caller_says(v, "The recommended treatment.")
+    later = _original_args()
+    assert await v._enforce_service_consultation("same", later) is False
+    assert later["requested_services"] == ["Acne Clarifying Facial"]
+
+
+@pytest.mark.asyncio
+async def test_bare_switch_advances_without_repeating_recommendation_question():
+    v = voice()
+    await _reach_recommendation(v)
+    prompts = v._speak_consultation_gate.await_count
+    caller_says(v, "Switch.")
+    args = _original_args()
+    assert await v._enforce_service_consultation("switch", args) is False
+    assert v._speak_consultation_gate.await_count == prompts
+    assert args["requested_services"] == ["Acne Clarifying Facial"]
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_recommendation_answer_is_bounded_and_keeps_original():
+    v = voice()
+    await _reach_recommendation(v)
+    caller_says(v, "Maybe.")
+    assert await v._enforce_service_consultation("clarify-once", _original_args()) is True
+    assert v._speak_consultation_gate.await_args.kwargs["status"] == "recommendation_clarification"
+    caller_says(v, "Hmm.")
+    args = _original_args()
+    assert await v._enforce_service_consultation("fallback-original", args) is False
+    assert args["requested_services"] == ["European Facial"]
+    assert v.session.entities["consultation_recommendation_pending"] == {}
+    assert v.session.entities["consultation_states"]["facial"]["recommendation_status"] == "declined"
+
+
+def test_ungrounded_staff_name_from_model_is_removed_not_sent_to_calendar():
+    v = voice()
+    caller_says(v, "I want to set up a 60-minute European Facial for 2:30 on Wednesday.")
+    args = {
+        "service_description": "60 minute European facial",
+        "requested_start_iso": "2026-10-14T14:30:00",
+        "preferred_staff": "SIX",
+    }
+    v._guard_staff_preference(args)
+    assert "preferred_staff" not in args
+    assert args["requested_start_iso"] == "2026-10-14T14:30:00"
+
+
+def test_real_caller_requested_staff_remains_intact():
+    v = voice()
+    caller_says(v, "I'd like to book my facial with Jordan on Wednesday.")
+    args = {"preferred_staff": "Jordan"}
+    v._guard_staff_preference(args)
+    assert args["preferred_staff"] == "Jordan"
