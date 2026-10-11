@@ -161,6 +161,56 @@ export interface ManagedService {
   updated_at: string;
 }
 
+export type SquareCatalogSyncAction = "add" | "update" | "conflict" | "unchanged";
+export type SquareCatalogApplyAction = "add" | "update" | "skip";
+
+export interface SquareCatalogFieldChange {
+  field: string;
+  current: string | number | boolean | null;
+  square: string | number | boolean | null;
+}
+
+export interface SquareCatalogPreviewItem {
+  square_item_id: string;
+  square_variation_id: string;
+  square_version: number | null;
+  name: string;
+  category_name: string | null;
+  duration_minutes: number;
+  price: string | null;
+  action: SquareCatalogSyncAction;
+  existing_service_id: string | null;
+  changes: SquareCatalogFieldChange[];
+  conflict_reason: string | null;
+}
+
+export interface SquareCatalogPreview {
+  preview_token: string | null;
+  connected: boolean;
+  location_name: string | null;
+  generated_at: string;
+  summary: {
+    additions: number;
+    updates: number;
+    conflicts: number;
+    unchanged: number;
+  };
+  items: SquareCatalogPreviewItem[];
+}
+
+export interface SquareCatalogSelection {
+  square_variation_id: string;
+  action: SquareCatalogApplyAction;
+  category_id?: string;
+}
+
+export interface SquareCatalogApplyResult {
+  created: number;
+  updated: number;
+  skipped: number;
+  conflicts: number;
+}
+
 export interface SpaStaffMember {
   provider_id?: string;
   hours?: Record<string, BusinessHoursWindow[]>;
@@ -542,6 +592,26 @@ export const bulkDeleteManagedServices = async (payload: {
   const { data } = await apiClient.post<{ deleted: number }>(
     "/api/v1/services/bulk-delete",
     payload,
+  );
+  return data;
+};
+
+export const previewSquareCatalogSync = async (): Promise<SquareCatalogPreview> => {
+  const { data } = await apiClient.get<SquareCatalogPreview>(
+    "/api/v1/services/square-catalog/preview",
+    { timeout: 30000 },
+  );
+  return data;
+};
+
+export const applySquareCatalogSync = async (payload: {
+  preview_token: string;
+  selections: SquareCatalogSelection[];
+}): Promise<SquareCatalogApplyResult> => {
+  const { data } = await apiClient.post<SquareCatalogApplyResult>(
+    "/api/v1/services/square-catalog/apply",
+    payload,
+    { timeout: 30000 },
   );
   return data;
 };

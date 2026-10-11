@@ -12,6 +12,7 @@ import {
   X,
 } from "lucide-react";
 import {
+  applySquareCatalogSync,
   createManagedService,
   bulkDeleteManagedServices,
   createServiceCategory,
@@ -19,15 +20,23 @@ import {
   fetchManagedServices,
   fetchServiceCategories,
   getApiErrorMessage,
+  previewSquareCatalogSync,
   updateManagedService,
   updateServiceCategory,
   type ManagedService,
   type ServiceCategory,
   type ServicePayload,
+  type SquareCatalogApplyAction,
+  type SquareCatalogPreview,
 } from "../../api/client";
 import { useAuth } from "../../auth/AuthContext";
 import { canEditSpaSettings } from "../../auth/roles";
 import { PageHeader, Panel, StateBlock } from "../../components/ui/Primitives";
+import {
+  buildSquareCatalogApplyPlan,
+  includeOmittedSquareCatalogResults,
+  type SquareCatalogChoice,
+} from "./squareCatalogApply";
 
 const emptyService = (categoryId = ""): ServicePayload => ({
   category_id: categoryId,
@@ -111,6 +120,11 @@ const displayPrice = (value: string | null): string => {
   return value.trim().startsWith("$") ? value.trim() : `$${value.trim()}`;
 };
 
+const displayCatalogValue = (value: string | number | boolean | null): string => {
+  if (value === null || value === "") return "Not set";
+  return String(value);
+};
+
 export default function SpaServices() {
   const { role } = useAuth();
   const editable = canEditSpaSettings(role);
@@ -148,6 +162,16 @@ export default function SpaServices() {
   const [importError, setImportError] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
   const importInputRef = useRef<HTMLInputElement>(null);
+  const [squareCatalogOpen, setSquareCatalogOpen] = useState(false);
+  const [squareCatalogPreview, setSquareCatalogPreview] =
+    useState<SquareCatalogPreview | null>(null);
+  const [squareCatalogChoices, setSquareCatalogChoices] = useState<
+    Record<string, SquareCatalogChoice>
+  >({});
+  const [squareCatalogLoading, setSquareCatalogLoading] = useState(false);
+  const [squareCatalogApplying, setSquareCatalogApplying] = useState(false);
+  const [squareCatalogApproved, setSquareCatalogApproved] = useState(false);
+  const [squareCatalogError, setSquareCatalogError] = useState<string | null>(null);
 
   const load = async () => {
     setLoading(true);
@@ -389,6 +413,128 @@ export default function SpaServices() {
     }
   };
 
+  const openSquareCatalogPreview = async () => {
+    setSquareCatalogOpen(true);
+    setSquareCatalogPreview(null);
+    setSquareCatalogChoices({});
+    setSquareCatalogApproved(false);
+    setSquareCatalogError(null);
+    setSquareCatalogLoading(true);
+    try {
+      const preview = await previewSquareCatalogSync();
+      setSquareCatalogPreview(preview);
+      const categoryByName = new Map(
+        categories.map((category) => [category.name.trim().toLowerCase(), category.id]),
+      );
+      setSquareCatalogChoices(
+        Object.fromEntries(
+          preview.items.map((item) => {
+            const action: SquareCatalogApplyAction =
+              item.action === "add"
+                ? "add"
+                : item.action === "update"
+                  ? "update"
+                  : "skip";
+            return [
+              item.square_variation_id,
+              {
+                action,
+                categoryId:
+                  action === "add"
+                    ? (categoryByName.get(
+                        item.category_name?.trim().toLowerCase() ?? "",
+                      ) ?? "")
+                    : "",
+              },
+            ];
+          }),
+        ),
+      );
+    } catch (err: unknown) {
+      setSquareCatalogError(
+        getApiErrorMessage(
+          err,
+          "Cara could not read the Square catalog. Check the Square connection and try again.",
+        ),
+      );
+    } finally {
+      setSquareCatalogLoading(false);
+    }
+  };
+
+  const updateSquareCatalogChoice = (
+    variationId: string,
+    update: Partial<SquareCatalogChoice>,
+  ) => {
+    setSquareCatalogApproved(false);
+    setSquareCatalogChoices((choices) => ({
+      ...choices,
+      [variationId]: {
+        action: choices[variationId]?.action ?? "skip",
+        categoryId: choices[variationId]?.categoryId ?? "",
+        ...update,
+      },
+    }));
+  };
+
+  const squareCatalogApplyPlan = buildSquareCatalogApplyPlan(
+    squareCatalogPreview?.items ?? [],
+    squareCatalogChoices,
+  );
+  const selectedSquareCatalogIds = new Set(
+    squareCatalogApplyPlan.selections.map((selection) => selection.square_variation_id),
+  );
+  const selectedSquareCatalogItems =
+    squareCatalogPreview?.items.filter((item) =>
+      selectedSquareCatalogIds.has(item.square_variation_id),
+    ) ?? [];
+  const squareCatalogMissingCategories = selectedSquareCatalogItems.filter(
+    (item) =>
+      squareCatalogChoices[item.square_variation_id]?.action === "add" &&
+      !squareCatalogChoices[item.square_variation_id]?.categoryId,
+  );
+
+  const confirmSquareCatalogSync = async () => {
+    if (
+      !squareCatalogPreview ||
+      !squareCatalogPreview.preview_token ||
+      !squareCatalogApproved ||
+      !selectedSquareCatalogItems.length ||
+      squareCatalogMissingCategories.length
+    )
+      return;
+    setSquareCatalogApplying(true);
+    setSquareCatalogError(null);
+    try {
+      const result = await applySquareCatalogSync({
+        preview_token: squareCatalogPreview.preview_token,
+        selections: squareCatalogApplyPlan.selections,
+      });
+      const displayedResult = includeOmittedSquareCatalogResults(
+        result,
+        squareCatalogApplyPlan,
+      );
+      await load();
+      setSquareCatalogOpen(false);
+      setSquareCatalogPreview(null);
+      setSquareCatalogChoices({});
+      setSquareCatalogApproved(false);
+      setSuccess(
+        `Square catalog synced: ${displayedResult.created} added, ${displayedResult.updated} updated, ${displayedResult.skipped} skipped${displayedResult.conflicts ? `, ${displayedResult.conflicts} conflicts remaining` : ""}.`,
+      );
+    } catch (err: unknown) {
+      setSquareCatalogApproved(false);
+      setSquareCatalogError(
+        getApiErrorMessage(
+          err,
+          "The Square catalog was not applied. Refresh the preview before trying again.",
+        ),
+      );
+    } finally {
+      setSquareCatalogApplying(false);
+    }
+  };
+
   const saveService = async () => {
     if (!editing || !editing.name.trim() || !editing.category_id) return;
     setBusy(true);
@@ -599,6 +745,12 @@ export default function SpaServices() {
         actions={
           editable ? (
             <div className="flex flex-wrap gap-2">
+              <button
+                onClick={() => void openSquareCatalogPreview()}
+                className="inline-flex items-center gap-2 rounded-xl border border-emerald-400/30 px-4 py-2.5 text-xs font-bold text-emerald-300 hover:bg-emerald-400/5"
+              >
+                <RefreshCw size={15} /> Import from Square
+              </button>
               <button
                 onClick={() => {
                   setImportOpen(true);
@@ -1130,6 +1282,301 @@ export default function SpaServices() {
                 {categoryModal === "edit" ? "Save Category" : "Create Category"}
               </button>
             </div>
+          </div>
+        </div>
+      )}
+      {squareCatalogOpen && (
+        <div className="fixed inset-0 z-40 grid place-items-center bg-slate-950/75 p-4">
+          <div className="max-h-[92vh] w-full max-w-6xl overflow-y-auto rounded-2xl border border-slate-700 bg-[#091525] p-5 shadow-2xl">
+            <div className="mb-4 flex items-start justify-between gap-4">
+              <div>
+                <h2 className="font-semibold text-white">Import or refresh from Square</h2>
+                <p className="mt-1 max-w-2xl text-[11px] leading-5 text-slate-400">
+                  Review Square's appointment services before changing Cara's menu. Nothing is
+                  saved until you select the changes, approve them below, and apply the sync.
+                </p>
+              </div>
+              <button
+                onClick={() => !squareCatalogApplying && setSquareCatalogOpen(false)}
+                disabled={squareCatalogApplying}
+                className="text-slate-500 hover:text-slate-300 disabled:opacity-40"
+                aria-label="Close Square catalog preview"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            {squareCatalogLoading && (
+              <div className="grid min-h-48 place-items-center rounded-xl border border-slate-800 bg-[#07111f]">
+                <div className="flex items-center gap-2 text-xs text-slate-300">
+                  <RefreshCw size={16} className="animate-spin text-emerald-300" />
+                  Reading the Square catalog…
+                </div>
+              </div>
+            )}
+
+            {squareCatalogError && (
+              <div className="rounded-xl border border-rose-400/20 bg-rose-400/5 px-4 py-3 text-xs text-rose-300">
+                {squareCatalogError}
+              </div>
+            )}
+
+            {!squareCatalogLoading && squareCatalogPreview && (
+              <>
+                <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-800 bg-[#07111f] p-4">
+                  <div>
+                    <p className="text-xs font-semibold text-slate-200">
+                      {squareCatalogPreview.location_name || "Connected Square location"}
+                    </p>
+                    <p className="mt-1 text-[10px] text-slate-500">
+                      Preview generated {new Date(squareCatalogPreview.generated_at).toLocaleString()}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => void openSquareCatalogPreview()}
+                    disabled={squareCatalogApplying}
+                    className="inline-flex items-center gap-2 rounded-lg border border-slate-700 px-3 py-2 text-[11px] font-semibold text-slate-300 hover:border-emerald-400/40 hover:text-emerald-300 disabled:opacity-40"
+                  >
+                    <RefreshCw size={13} /> Refresh preview
+                  </button>
+                </div>
+
+                {!squareCatalogPreview.connected ? (
+                  <div className="rounded-xl border border-amber-400/20 bg-amber-400/5 px-4 py-4 text-xs text-amber-200">
+                    Square is not connected for this business. Connect the business's Square
+                    account before importing its catalog.
+                  </div>
+                ) : (
+                  <>
+                    <div className="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
+                      {(
+                        [
+                          ["Additions", squareCatalogPreview.summary.additions, "text-emerald-300"],
+                          ["Updates", squareCatalogPreview.summary.updates, "text-cyan-300"],
+                          ["Conflicts", squareCatalogPreview.summary.conflicts, "text-amber-300"],
+                          ["Unchanged", squareCatalogPreview.summary.unchanged, "text-slate-400"],
+                        ] as const
+                      ).map(([label, count, color]) => (
+                        <div key={label} className="rounded-xl border border-slate-800 bg-[#07111f] p-3">
+                          <p className="text-[10px] font-bold uppercase tracking-wide text-slate-600">
+                            {label}
+                          </p>
+                          <p className={`mt-1 text-xl font-semibold ${color}`}>{count}</p>
+                        </div>
+                      ))}
+                    </div>
+
+                    {squareCatalogPreview.items.length ? (
+                      <div className="overflow-x-auto rounded-xl border border-slate-800">
+                        <table className="w-full min-w-[940px] text-left text-[11px]">
+                          <thead className="bg-[#07111f] text-[9px] font-bold uppercase tracking-wide text-slate-500">
+                            <tr>
+                              <th className="p-3">Square service</th>
+                              <th className="p-3">Duration</th>
+                              <th className="p-3">Price</th>
+                              <th className="p-3">Difference</th>
+                              <th className="p-3">Cara category</th>
+                              <th className="p-3">Decision</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-800">
+                            {squareCatalogPreview.items.map((item) => {
+                              const choice = squareCatalogChoices[item.square_variation_id] ?? {
+                                action: "skip" as const,
+                                categoryId: "",
+                              };
+                              const needsCategory = choice.action === "add" && !choice.categoryId;
+                              return (
+                                <tr key={item.square_variation_id} className="align-top text-slate-300">
+                                  <td className="p-3">
+                                    <p className="font-semibold text-white">{item.name}</p>
+                                    <p className="mt-1 text-[10px] text-slate-500">
+                                      Suggested Cara category: {item.category_name || "None"}
+                                    </p>
+                                    <details className="mt-1 text-[9px] text-slate-600">
+                                      <summary className="cursor-pointer hover:text-slate-400">
+                                        Square IDs
+                                      </summary>
+                                      <div className="mt-1 max-w-64 space-y-1 break-all font-mono text-slate-500">
+                                        <p>Item: {item.square_item_id}</p>
+                                        <p>Variation: {item.square_variation_id}</p>
+                                        <p>Version: {item.square_version ?? "Not provided"}</p>
+                                      </div>
+                                    </details>
+                                    <span
+                                      className={`mt-2 inline-flex rounded-full border px-2 py-0.5 text-[9px] font-bold uppercase tracking-wide ${
+                                        item.action === "add"
+                                          ? "border-emerald-400/30 text-emerald-300"
+                                          : item.action === "update"
+                                            ? "border-cyan-400/30 text-cyan-300"
+                                            : item.action === "conflict"
+                                              ? "border-amber-400/30 text-amber-300"
+                                              : "border-slate-700 text-slate-500"
+                                      }`}
+                                    >
+                                      {item.action}
+                                    </span>
+                                  </td>
+                                  <td className="p-3 font-medium text-slate-200">
+                                    {item.duration_minutes} min
+                                  </td>
+                                  <td className="p-3 font-medium text-slate-200">
+                                    {displayPrice(item.price)}
+                                  </td>
+                                  <td className="max-w-xs p-3">
+                                    {item.conflict_reason && (
+                                      <p className="mb-2 rounded border border-amber-400/20 bg-amber-400/5 px-2 py-1.5 text-amber-200">
+                                        {item.conflict_reason}
+                                      </p>
+                                    )}
+                                    {item.changes?.length ? (
+                                      <ul className="space-y-1 text-[10px] text-slate-400">
+                                        {item.changes.map((change) => (
+                                          <li key={change.field}>
+                                            <span className="font-semibold text-slate-300">
+                                              {change.field.replace(/_/g, " ")}:
+                                            </span>{" "}
+                                            {displayCatalogValue(change.current)} →{" "}
+                                            <span className="text-slate-200">
+                                              {displayCatalogValue(change.square)}
+                                            </span>
+                                          </li>
+                                        ))}
+                                      </ul>
+                                    ) : (
+                                      <span className="text-[10px] text-slate-600">No changes</span>
+                                    )}
+                                  </td>
+                                  <td className="p-3">
+                                    {item.action === "add" ? (
+                                      <>
+                                        <select
+                                          value={choice.categoryId}
+                                          onChange={(event) =>
+                                            updateSquareCatalogChoice(item.square_variation_id, {
+                                              categoryId: event.target.value,
+                                            })
+                                          }
+                                          disabled={choice.action === "skip"}
+                                          className={`w-full rounded border bg-[#07111f] px-2 py-2 text-[10px] text-slate-200 disabled:opacity-40 ${
+                                            needsCategory ? "border-rose-400/50" : "border-slate-700"
+                                          }`}
+                                        >
+                                          <option value="">Choose category</option>
+                                          {categories.map((category) => (
+                                            <option key={category.id} value={category.id}>
+                                              {category.name}
+                                            </option>
+                                          ))}
+                                        </select>
+                                        {needsCategory && (
+                                          <p className="mt-1 text-[9px] text-rose-300">
+                                            Required for a new service
+                                          </p>
+                                        )}
+                                      </>
+                                    ) : item.action === "conflict" ? (
+                                      <span className="text-[10px] leading-4 text-amber-300">
+                                        Resolve this match manually in Cara before importing it.
+                                      </span>
+                                    ) : (
+                                      <span className="text-[10px] text-slate-500">
+                                        Existing Cara category stays unchanged
+                                      </span>
+                                    )}
+                                  </td>
+                                  <td className="p-3">
+                                    <select
+                                      value={choice.action}
+                                      onChange={(event) =>
+                                        updateSquareCatalogChoice(item.square_variation_id, {
+                                          action: event.target.value as SquareCatalogApplyAction,
+                                        })
+                                      }
+                                      disabled={
+                                        item.action === "unchanged" || item.action === "conflict"
+                                      }
+                                      className="w-full rounded border border-slate-700 bg-[#07111f] px-2 py-2 text-[10px] text-slate-200 disabled:opacity-40"
+                                    >
+                                      {item.action === "add" && <option value="add">Add to Cara</option>}
+                                      {item.action === "update" && (
+                                        <option value="update">Apply Square update</option>
+                                      )}
+                                      <option value="skip">
+                                        {item.action === "unchanged"
+                                          ? "No change needed"
+                                          : item.action === "conflict"
+                                            ? "Resolve manually in Cara"
+                                            : "Skip"}
+                                      </option>
+                                    </select>
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <div className="rounded-xl border border-slate-800 bg-[#07111f] px-4 py-8 text-center text-xs text-slate-500">
+                        Square returned no appointment services for this location.
+                      </div>
+                    )}
+
+                    <div className="mt-4 rounded-xl border border-slate-800 bg-[#07111f] p-4">
+                      <label className="flex items-start gap-3 text-xs text-slate-300">
+                        <input
+                          type="checkbox"
+                          checked={squareCatalogApproved}
+                          onChange={(event) => setSquareCatalogApproved(event.target.checked)}
+                          disabled={
+                            !selectedSquareCatalogItems.length ||
+                            squareCatalogMissingCategories.length > 0 ||
+                            squareCatalogApplying
+                          }
+                          className="mt-0.5 h-4 w-4 rounded border-slate-600 bg-transparent accent-cyan-400"
+                        />
+                        <span>
+                          I reviewed these changes and approve adding or updating the selected
+                          services in Cara. Square remains the source for the linked variation IDs.
+                        </span>
+                      </label>
+                      <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
+                        <p className="text-[10px] text-slate-500">
+                          {selectedSquareCatalogItems.length} selected ·{" "}
+                          {squareCatalogMissingCategories.length
+                            ? `${squareCatalogMissingCategories.length} need a category`
+                            : "ready for approval"}
+                        </p>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => setSquareCatalogOpen(false)}
+                            disabled={squareCatalogApplying}
+                            className="rounded-lg border border-slate-700 px-4 py-2 text-xs font-semibold text-slate-300 disabled:opacity-40"
+                          >
+                            Cancel
+                          </button>
+                          <button
+                            onClick={() => void confirmSquareCatalogSync()}
+                            disabled={
+                              squareCatalogApplying ||
+                              !squareCatalogApproved ||
+                              !selectedSquareCatalogItems.length ||
+                              squareCatalogMissingCategories.length > 0
+                            }
+                            className="rounded-lg bg-cyan-400 px-4 py-2 text-xs font-bold text-slate-950 disabled:cursor-not-allowed disabled:opacity-40"
+                          >
+                            {squareCatalogApplying
+                              ? "Applying approved changes…"
+                              : `Apply ${selectedSquareCatalogItems.length} Approved Change${selectedSquareCatalogItems.length === 1 ? "" : "s"}`}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </>
+                )}
+              </>
+            )}
           </div>
         </div>
       )}
