@@ -836,12 +836,15 @@ CUSTOMER_PROFILE_TOOL: dict[str, Any] = {
         "a preference from a consultation. Use action=remember only when the "
         "caller explicitly asks Cara to save a preference, action=forget only "
         "when explicitly asked, and action=lookup when they want their profile "
-        "or usual treatment. Do not read payment or health details."
+        "or usual treatment. AFTER handling the main customer request, optionally "
+        "use feedback_invite once to ask how the last visit went; call "
+        "feedback_save only AFTER the customer answers. Never fabricate feedback. "
+        "Do not read payment or health details."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["lookup", "remember", "forget"]},
+            "action": {"type": "string", "enum": ["lookup", "remember", "forget", "feedback_invite", "feedback_save"]},
             "caller_name": {
                 "type": "string",
                 "description": "Full name explicitly spoken by this caller, never guessed from caller ID.",
@@ -856,6 +859,10 @@ CUSTOMER_PROFILE_TOOL: dict[str, Any] = {
             "preference_value": {
                 "type": "string",
                 "description": "A short non-sensitive preference literally spoken by the caller; never invent it.",
+            },
+            "feedback_text": {
+                "type": "string",
+                "description": "The brief feedback the caller actually spoke after Cara offered to hear feedback; never invent or paraphrase.",
             },
         },
         "required": ["action"],
@@ -2115,12 +2122,15 @@ class XAIVoiceSession:
         )
         instructions += self._booking_write_protocol_instructions()
         known_contact = self.session.entities.get("known_contact")
-        if known_contact and known_contact.get("name") not in {None, "Unknown"}:
+        if known_contact:
+            # Caller ID is not proof of identity; never preload a name
+            # that the wrong person on a shared line could be addressed by.
             instructions += (
-                f"\nKNOWN PROFILE: {known_contact['name']}. Caller ID already provides their "
-                "phone number; do not ask for the phone again unless they request a different "
-                "callback number. This profile is not the name for the booking. Ask for the "
-                "caller's name unless caller_name is already stored from this call."
+                "\nRETURNING NUMBER: A spa customer record exists for this number, "
+                "but the caller's name is not yet verified. Welcome them without "
+                "using a name or revealing appointment history. Ask for the "
+                "account name before using customer_profile; still collect "
+                "caller_name for the current booking."
             )
         requested_voice = resolve_xai_voice(
             self.session.entities.get("xai_voice") or settings.XAI_VOICE_ID
@@ -2723,6 +2733,7 @@ class XAIVoiceSession:
                     caller_name=args.get("caller_name"),
                     preference_key=args.get("preference_key"),
                     preference_value=args.get("preference_value"),
+                    feedback_text=args.get("feedback_text"),
                 )
         except Exception:
             logger.exception("call %s: customer profile tool failed", self.call_id)
