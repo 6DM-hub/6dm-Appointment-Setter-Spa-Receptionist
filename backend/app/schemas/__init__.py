@@ -41,6 +41,9 @@ from app.schemas.service import (
     ServiceCreate,
     ServiceRead,
     ServiceUpdate,
+    SquareCatalogApply,
+    SquareCatalogApplyResult,
+    SquareCatalogPreview,
 )
 
 __all__ = [
@@ -54,4 +57,5 @@ __all__ = [
     "AnalyticsSummary", "BookingVolume", "CallVolume", "SentimentBreakdown",
     "ServiceCategoryCreate", "ServiceCategoryRead", "ServiceCategoryUpdate",
     "ServiceCreate", "ServiceRead", "ServiceUpdate",
+    "SquareCatalogApply", "SquareCatalogApplyResult", "SquareCatalogPreview",
 ]

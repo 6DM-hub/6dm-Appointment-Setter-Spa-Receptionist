@@ -30,6 +30,7 @@ class SpaService(BaseModel):
     preparation_buffer_minutes: int = Field(0, ge=0, le=180)
     transition_buffer_minutes: int = Field(0, ge=0, le=180)
     cleanup_buffer_minutes: int = Field(0, ge=0, le=180)
+    square_item_id: str | None = Field(None, max_length=255)
     square_variation_id: str | None = Field(None, max_length=255)
     square_variation_version: int | None = None
     name: str = Field(..., max_length=255)
@@ -50,6 +51,7 @@ class SpaService(BaseModel):
 
     @field_validator(
         "square_variation_id",
+        "square_item_id",
         "category",
         "consultation_kind",
         "consultation_category",
