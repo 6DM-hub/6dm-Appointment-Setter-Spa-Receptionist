@@ -130,7 +130,7 @@ HOLD_ACK_TEXT = HOLD_ACK_TEXTS[0]
 AVAILABILITY_CACHE_SECONDS = 3
 BOOKING_CONFIRMATION_TEXT_QUESTION = (
     "It looks like I'm having trouble on my end. "
-    "The confirmation text can take up to ten seconds to arrive. "
+    "The confirmation text usually takes about five to ten seconds to arrive. "
     "I'll wait while you check. "
     "Did you receive a confirmation text for your appointment?"
 )
