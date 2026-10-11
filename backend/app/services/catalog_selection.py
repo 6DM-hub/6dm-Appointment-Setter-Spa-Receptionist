@@ -60,6 +60,16 @@ def _aliases(service: Mapping[str, Any]) -> list[str]:
     return [normalized(alias) for alias in aliases if normalized(alias)]
 
 
+def _family_key(value: object) -> tuple[str, ...]:
+    """Compare complete family words, independent of catalog display order.
+
+    Square category-first labels ("Massage - Swedish") and caller phrases
+    ("Swedish massage") identify the same family. Keep every modifier so
+    couples, mat and other treatments never become substitutes.
+    """
+    return tuple(sorted(base_name(value).split()))
+
+
 def exact_catalog_service(
     services: Sequence[Mapping[str, Any]], requested: object
 ) -> Mapping[str, Any] | None:
@@ -92,14 +102,14 @@ def exact_catalog_service(
             and configured_duration(service) == requested_minutes
         ]
         return filtered[0] if len(filtered) == 1 else None
-    requested_family = base_name(requested)
+    requested_family = _family_key(requested)
     if not requested_family:
         return None
     matching = [
         service for service in services
-        if requested_family == service_family(service)
-        or requested_family == base_name(service.get("name"))
-        or requested_family in _aliases(service)
+        if requested_family == _family_key(service_family(service))
+        or requested_family == _family_key(service.get("name"))
+        or requested_family in [_family_key(alias) for alias in _aliases(service)]
     ]
     if requested_minutes is not None:
         matching = [
@@ -130,7 +140,8 @@ def family_variations(
     choices = [
         service for service in services
         if not service.get("is_add_on")
-        and (service_family(service) == family or base_name(service.get("name")) == family)
+        and (_family_key(service_family(service)) == _family_key(family)
+             or _family_key(service.get("name")) == _family_key(family))
         and configured_duration(service) is not None
     ]
     by_duration: dict[int, Mapping[str, Any]] = {}
