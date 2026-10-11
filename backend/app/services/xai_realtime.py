@@ -4397,6 +4397,20 @@ class XAIVoiceSession:
 
             if kind == "massage":
                 pending = addon_pending.get(kind)
+                if isinstance(pending, dict) and self._user_turn_count <= int(
+                    pending.get("turn", self._user_turn_count)
+                ):
+                    # An optional add-on is not accepted by a model's second
+                    # tool call in the SAME caller turn. Wait for the person.
+                    await self._send_function_output(
+                        call_ref,
+                        json.dumps({
+                            "status": "awaiting_massage_addon_answer",
+                            "available": False, "booked": False,
+                        }),
+                        nudge=False,
+                    )
+                    return True
                 if isinstance(pending, dict) and self._user_turn_count > int(
                     pending.get("turn", self._user_turn_count)
                 ):
@@ -4423,19 +4437,24 @@ class XAIVoiceSession:
                         and is_affirmative(caller_text)
                         and len(offered) > 1
                     ):
-                        await self._speak_consultation_gate(
-                            call_ref,
-                            status="addon_selection_required",
-                            spoken=(
-                                "Which would you prefer: "
-                                + ", or ".join(offered)
-                                + "?"
-                            ),
-                        )
-                        pending["turn"] = self._user_turn_count
-                        addon_pending[kind] = pending
-                        self.session.entities["consultation_addon_pending"] = addon_pending
-                        return True
+                        attempts = int(pending.get("attempts") or 0) + 1
+                        if attempts < 2:
+                            pending["attempts"] = attempts
+                            pending["turn"] = self._user_turn_count
+                            addon_pending[kind] = pending
+                            self.session.entities["consultation_addon_pending"] = addon_pending
+                            await self._speak_consultation_gate(
+                                call_ref,
+                                status="addon_selection_required",
+                                spoken=(
+                                    "Which add-on would you like: "
+                                    + ", or ".join(offered)
+                                    + "? You can also skip the add-ons."
+                                ),
+                            )
+                            return True
+                        # Another unspecified yes is not agreement to either
+                        # add-on. Continue only with the originally booked item.
                     if chosen_addons:
                         current = self._consultation_service_candidates(args)
                         for addon in chosen_addons:
@@ -4445,19 +4464,49 @@ class XAIVoiceSession:
                         args["service_description"] = " + ".join(current)
                         self._remember_consultation_booking_request(args)
                     elif not self._caller_declines_optional_item(caller_text):
-                        await self._speak_consultation_gate(
-                            call_ref,
-                            status="addon_selection_required",
-                            spoken=(
-                                "Would you like "
-                                + ", or ".join(offered)
-                                + ", or would you prefer no add-on?"
-                            ),
-                        )
-                        pending["turn"] = self._user_turn_count
-                        addon_pending[kind] = pending
-                        self.session.entities["consultation_addon_pending"] = addon_pending
-                        return True
+                        if re.search(
+                            r"\b(?:price|cost|how much|what is|what's|tell me|explain)\b",
+                            caller_text,
+                            re.IGNORECASE,
+                        ) or "?" in caller_text:
+                            # Informational question isn't consent or a new
+                            # add-on offer. Answer from real menu facts, then
+                            # wait for a selection without repeating the pitch.
+                            pending["turn"] = self._user_turn_count
+                            addon_pending[kind] = pending
+                            self.session.entities["consultation_addon_pending"] = addon_pending
+                            await self._send_function_output(
+                                call_ref,
+                                json.dumps({
+                                    "status": "addon_information_requested",
+                                    "available": False, "booked": False,
+                                    "message": (
+                                        "Answer the add-on question using only "
+                                        "verified menu facts. Do not add an "
+                                        "item, repeat the sales offer, or "
+                                        "claim anything is booked."
+                                    ),
+                                }),
+                            )
+                            return True
+                        attempts = int(pending.get("attempts") or 0) + 1
+                        if attempts < 2:
+                            pending["attempts"] = attempts
+                            pending["turn"] = self._user_turn_count
+                            addon_pending[kind] = pending
+                            self.session.entities["consultation_addon_pending"] = addon_pending
+                            await self._speak_consultation_gate(
+                                call_ref,
+                                status="addon_selection_required",
+                                spoken=(
+                                    "Which add-on would you like: "
+                                    + ", or ".join(offered)
+                                    + "? You can also skip the add-ons."
+                                ),
+                            )
+                            return True
+                        # This was an optional enhancement, so do not trap the
+                        # caller: no selection means original massage only.
                     addon_pending.pop(kind, None)
                     self.session.entities["consultation_addon_pending"] = addon_pending
 
