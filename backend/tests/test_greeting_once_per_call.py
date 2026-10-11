@@ -266,3 +266,22 @@ async def test_model_restart_greeting_is_cancelled_mid_call(monkeypatch):
     assert voice._pending_agent == ""
     assistant = [t for t in voice.session.history if t["role"] == "assistant"]
     assert all("how can i help you today" not in t["content"].lower() for t in assistant[1:])
+
+
+def test_preloaded_and_spoken_greeting_typography_not_duplicated_in_transcript():
+    session = _session("call-greeting-normalized")
+    session.history = [
+        {
+            "role": "assistant",
+            "content": "Welcome back to Your Day Spa. I’m Cara, your AI receptionist. How may I help you today?",
+        }
+    ]
+    voice = XAIVoiceSession("call-greeting-normalized", session)
+    voice._pending_agent = "Welcome back to Your Day Spa. I'm Cara, your AI receptionist. How may I help you today?"
+    voice._flush_agent_turn()
+    assert len(session.history) == 1
+
+    session.add_turn("user", "I'd like a facial.")
+    voice._pending_agent = "Of course, which facial were you thinking of?"
+    voice._flush_agent_turn()
+    assert len(session.history) == 3

@@ -1515,8 +1515,22 @@ class XAIVoiceSession:
             )
             return
         history = self.session.history
-        if history and history[-1]["role"] == "assistant" and history[-1]["content"] == text:
-            return
+        if history and history[-1]["role"] == "assistant":
+            previous = history[-1]["content"]
+            if previous == text:
+                return
+            # The first greeting is preloaded in history before xAI speaks.
+            # Its spoken transcript can normalize curly apostrophes ("I'm"
+            # vs "I’m"), which created two apparently identical greetings in
+            # the dashboard even when the media logs sent only one greeting.
+            # Only collapse these before any caller turn; later utterances
+            # remain intact so the real conversation is not hidden.
+            if not any(turn.get("role") == "user" for turn in history):
+                normalize = lambda value: " ".join(
+                    re.findall(r"[a-z0-9]+", str(value or "").casefold())
+                )
+                if normalize(previous) == normalize(text):
+                    return
         self.session.add_turn("assistant", text)
 
     async def _persist_session(self) -> None:
@@ -2415,6 +2429,38 @@ class XAIVoiceSession:
             ),
         })
 
+    def _caller_named_preferred_staff(self, staff_name: str) -> bool:
+        """Require a caller-spoken staff request, not a model-invented name.
+
+        The realtime model incorrectly emitted "SIX" when the caller asked
+        for a "60-minute facial". Without this guard Square may reject an
+        otherwise valid appointment on an imaginary staff assignment.
+        """
+        name = " ".join(str(staff_name or "").strip().split())
+        if not name or len(name) > 90:
+            return False
+        escaped = re.escape(name).replace(r"\ ", r"\s+")
+        pattern = re.compile(
+            rf"\b(?:with|by|see|therapist|esthetician|"
+            rf"prefer|preferred|request|requested|staff member)\b"
+            rf"[\w\s,.'-]{{0,45}}\b{escaped}\b",
+            re.IGNORECASE,
+        )
+        return any(
+            bool(pattern.search(turn.get("content") or ""))
+            for turn in self.session.history
+            if turn.get("role") == "user"
+        )
+
+    def _guard_staff_preference(self, args: dict[str, Any]) -> None:
+        staff = str(args.get("preferred_staff") or "").strip()
+        if staff and not self._caller_named_preferred_staff(staff):
+            logger.info(
+                "call %s: removing ungrounded preferred_staff from model tool arguments",
+                self.call_id,
+            )
+            args.pop("preferred_staff", None)
+
     async def _run_propose_appointment(self, raw_arguments: str) -> str:
         """Stage a new booking or move an explicitly selected existing one."""
         try:
@@ -2425,6 +2471,7 @@ class XAIVoiceSession:
         for field in ("guest_name", "caller_name", "caller_email", "preferred_staff"):
             if str(args.get(field) or "").strip().casefold() in {"", "none", "null", "undefined"}:
                 args.pop(field, None)
+        self._guard_staff_preference(args)
         operation = str(args.pop("operation", "") or "").lower()
         appointment_id = args.pop("appointment_id", None)
         if operation not in {"schedule", "reschedule"}:
@@ -3052,6 +3099,7 @@ class XAIVoiceSession:
             return cached
         try:
             args = json.loads(raw_arguments or "{}")
+            self._guard_staff_preference(args)
             intent = AppointmentIntent(confidence=1.0, intent="inquiry", **args)
         except Exception:
             return json.dumps({"status": "failed", "available": False, "message": "Invalid date or time."})
@@ -3461,6 +3509,109 @@ class XAIVoiceSession:
         return yes_prefixed and not asks_before_answering
 
     @staticmethod
+    def _caller_recommendation_decision(
+        text: str, *, recommended_name: str, original_name: str
+    ) -> str | None:
+        """Resolve a *caller-spoken* response to a specific service offer.
+
+        Accept natural spoken selections ("let's switch", "the recommended
+        treatment") as well as yes/no. Questions about prices or treatments
+        are not consent. Only the pending offer, not a model tool argument,
+        can establish the candidate treatment.
+        """
+        utterance = " ".join(re.findall(r"[a-z0-9]+", str(text or "").casefold()))
+        if not utterance:
+            return None
+        if "?" in str(text or "") or re.search(
+            r"\b(?:how much|how long|what is|what s|what does|tell me|"
+            r"can you explain|is there|do you|should i|why|price|cost)\b",
+            utterance,
+        ):
+            return None
+
+        recommended = " ".join(
+            re.findall(r"[a-z0-9]+", str(recommended_name or "").casefold())
+        )
+        original = " ".join(
+            re.findall(r"[a-z0-9]+", str(original_name or "").casefold())
+        )
+        mentions_recommended = bool(
+            recommended and recommended in utterance
+        )
+        mentions_original = bool(original and original in utterance)
+        # Shortened names are natural after hearing "Clarifying Facial";
+        # avoid accepting generic "facial" or shared words.
+        distinctive = [
+            word for word in recommended.split()
+            if word not in {"facial", "massage", "minute", "minutes", "treatment", "service"}
+            and (not original or word not in original.split())
+        ]
+        if distinctive and any(
+            re.search(rf"\b{re.escape(word)}\b", utterance)
+            for word in distinctive
+        ):
+            mentions_recommended = True
+
+        negated_switch = bool(re.search(
+            r"\b(?:don t|do not|never|not|no)\s+(?:want to |wanna |)"
+            r"(?:switch|change|swap)\b", utterance
+        ))
+        original_choice = bool(
+            re.search(
+                r"\b(?:keep|stay|stick)\b.*\b"
+                r"(?:original|first|european)\b|\b(?:the original|"
+                r"what i (?:asked for|requested)|same one)\b",
+                utterance,
+            )
+            or (mentions_original and not mentions_recommended)
+        )
+        if negated_switch or original_choice:
+            return "declined"
+        if re.search(r"\b(?:no|nope|nah|neither|skip|no thanks)\b", utterance):
+            return "declined"
+
+        explicit_change = bool(re.search(
+            r"\b(?:switch|switching|change|changing|swap|"
+            r"take|choose|pick|book|go with|let s do|i ll do|"
+            r"i want|i d like|i would like)\b",
+            utterance,
+        ))
+        recommended_reference = bool(re.search(
+            r"\b(?:recommended (?:treatment|service|one)|"
+            r"the recommendation|the other one|that one|"
+            r"the clarifying (?:facial|one|treatment)|"
+            r"the acne (?:facial|one|treatment))\b",
+            utterance,
+        ))
+        if mentions_recommended and (
+            explicit_change or utterance in {recommended, "the " + recommended}
+        ):
+            return "accepted"
+        if explicit_change and (
+            recommended_reference
+            or re.fullmatch(
+                r"(?:let s |i d like to |i want to |please |"
+                r"yes |yeah |ok |okay )?"
+                r"(?:switch|change|swap)(?: please| to that| to it)?",
+                utterance,
+            )
+        ):
+            return "accepted"
+        if recommended_reference and (
+            utterance in {
+                "the recommended treatment", "recommended treatment",
+                "the recommended service", "the recommendation",
+                "the other one", "that one", "the clarifying facial",
+                "the clarifying one", "the acne facial",
+            }
+            or utterance.startswith(("yes ", "yeah ", "okay ", "sure "))
+        ):
+            return "accepted"
+        if XAIVoiceSession._caller_accepts_consultation_invitation(text):
+            return "accepted"
+        return None
+
+    @staticmethod
     def _caller_declines_consultation_invitation(text: str) -> bool:
         value = str(text or "").strip()
         if re.fullmatch(
@@ -3848,22 +3999,70 @@ class XAIVoiceSession:
                         call_ref, json.dumps({"status": "awaiting_recommendation_answer", "available": False, "booked": False}), nudge=False,
                     )
                     return True
-                if self._caller_declines_optional_item(caller_text):
+                decision = self._caller_recommendation_decision(
+                    caller_text,
+                    recommended_name=str(pending_recommendation.get("name") or ""),
+                    original_name=str(state.get("requested_service_name") or ""),
+                )
+                if decision == "declined":
                     state["recommendation_status"] = "declined"
                     recommendation_pending.pop(kind, None)
-                elif self._caller_accepts_consultation_invitation(caller_text):
+                elif decision == "accepted":
                     state["recommendation_status"] = "accepted"
                     state["recommended_service_name"] = str(pending_recommendation["name"])
                     recommendation_pending.pop(kind, None)
+                    self.session.entities["consultation_recommendation_accepted"] = True
                 else:
-                    pending_recommendation["turn"] = self._user_turn_count
-                    recommendation_pending[kind] = pending_recommendation
-                    self.session.entities["consultation_recommendation_pending"] = recommendation_pending
-                    await self._speak_consultation_gate(
-                        call_ref, status="recommendation_clarification",
-                        spoken="Would you like to switch to the recommended treatment, or keep your original choice?",
-                    )
-                    return True
+                    # Questions about prices/details aren't answers to the
+                    # switch offer. Let the model query the verified spa menu
+                    # without playing another switch-or-keep question.
+                    if "?" in caller_text or re.search(
+                        r"\b(?:how much|how long|what is|what's|tell me|"
+                        r"cost|price|explain)\b",
+                        caller_text,
+                        re.IGNORECASE,
+                    ):
+                        pending_recommendation["turn"] = self._user_turn_count
+                        recommendation_pending[kind] = pending_recommendation
+                        self.session.entities["consultation_recommendation_pending"] = recommendation_pending
+                        await self._send_function_output(
+                            call_ref,
+                            json.dumps({
+                                "status": "recommendation_information_requested",
+                                "available": False,
+                                "booked": False,
+                                "message": (
+                                    "The caller asked about the treatments. Answer "
+                                    "their question using lookup_spa_facts for "
+                                    "verified service descriptions and prices. "
+                                    "Do not repeat the switch question now; "
+                                    "the original service stays selected until "
+                                    "the caller explicitly accepts the alternative."
+                                ),
+                            }),
+                        )
+                        return True
+                    # Unclear replies cannot trigger a switch or an endless
+                    # repeat. Clarify once, then keep the original treatment
+                    # and continue toward booking.
+                    attempts = int(pending_recommendation.get("attempts") or 0) + 1
+                    if attempts >= 2:
+                        state["recommendation_status"] = "declined"
+                        recommendation_pending.pop(kind, None)
+                    else:
+                        pending_recommendation["attempts"] = attempts
+                        pending_recommendation["turn"] = self._user_turn_count
+                        recommendation_pending[kind] = pending_recommendation
+                        self.session.entities["consultation_recommendation_pending"] = recommendation_pending
+                        await self._speak_consultation_gate(
+                            call_ref,
+                            status="recommendation_clarification",
+                            spoken=(
+                                "I can keep your original treatment, or you can "
+                                "say 'switch' to try the recommended one. Which do you prefer?"
+                            ),
+                        )
+                        return True
                 self.session.entities["consultation_recommendation_pending"] = recommendation_pending
             elif kind == "facial" and state.get("recommendation_status") is None:
                 # Menu-grounded advice only; never auto-switch or make up a service.
