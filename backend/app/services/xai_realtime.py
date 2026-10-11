@@ -2415,6 +2415,38 @@ class XAIVoiceSession:
             ),
         })
 
+    def _caller_named_preferred_staff(self, staff_name: str) -> bool:
+        """Require a caller-spoken staff request, not a model-invented name.
+
+        The realtime model incorrectly emitted "SIX" when the caller asked
+        for a "60-minute facial". Without this guard Square may reject an
+        otherwise valid appointment on an imaginary staff assignment.
+        """
+        name = " ".join(str(staff_name or "").strip().split())
+        if not name or len(name) > 90:
+            return False
+        escaped = re.escape(name).replace(r"\ ", r"\s+")
+        pattern = re.compile(
+            rf"\b(?:with|by|see|therapist|esthetician|"
+            rf"prefer|preferred|request|requested|staff member)\b"
+            rf"[\w\s,.'-]{{0,45}}\b{escaped}\b",
+            re.IGNORECASE,
+        )
+        return any(
+            bool(pattern.search(turn.get("content") or ""))
+            for turn in self.session.history
+            if turn.get("role") == "user"
+        )
+
+    def _guard_staff_preference(self, args: dict[str, Any]) -> None:
+        staff = str(args.get("preferred_staff") or "").strip()
+        if staff and not self._caller_named_preferred_staff(staff):
+            logger.info(
+                "call %s: removing ungrounded preferred_staff from model tool arguments",
+                self.call_id,
+            )
+            args.pop("preferred_staff", None)
+
     async def _run_propose_appointment(self, raw_arguments: str) -> str:
         """Stage a new booking or move an explicitly selected existing one."""
         try:
@@ -2425,6 +2457,7 @@ class XAIVoiceSession:
         for field in ("guest_name", "caller_name", "caller_email", "preferred_staff"):
             if str(args.get(field) or "").strip().casefold() in {"", "none", "null", "undefined"}:
                 args.pop(field, None)
+        self._guard_staff_preference(args)
         operation = str(args.pop("operation", "") or "").lower()
         appointment_id = args.pop("appointment_id", None)
         if operation not in {"schedule", "reschedule"}:
@@ -3052,6 +3085,7 @@ class XAIVoiceSession:
             return cached
         try:
             args = json.loads(raw_arguments or "{}")
+            self._guard_staff_preference(args)
             intent = AppointmentIntent(confidence=1.0, intent="inquiry", **args)
         except Exception:
             return json.dumps({"status": "failed", "available": False, "message": "Invalid date or time."})
@@ -3510,7 +3544,7 @@ class XAIVoiceSession:
         ))
         original_choice = bool(
             re.search(
-                r"\b(?:keep|stay|stick|prefer|want|choose|book)\b.*\b"
+                r"\b(?:keep|stay|stick)\b.*\b"
                 r"(?:original|first|european)\b|\b(?:the original|"
                 r"what i (?:asked for|requested)|same one)\b",
                 utterance,
@@ -3965,10 +3999,38 @@ class XAIVoiceSession:
                     recommendation_pending.pop(kind, None)
                     self.session.entities["consultation_recommendation_accepted"] = True
                 else:
-                    # Questions are not consent. Do not repeat the same
-                    # switch-or-keep wording endlessly; after one brief
-                    # clarification default to the *original*, never to the
-                    # recommended alternative, and continue the booking.
+                    # Questions about prices/details aren't answers to the
+                    # switch offer. Let the model query the verified spa menu
+                    # without playing another switch-or-keep question.
+                    if "?" in caller_text or re.search(
+                        r"\b(?:how much|how long|what is|what's|tell me|"
+                        r"cost|price|explain)\b",
+                        caller_text,
+                        re.IGNORECASE,
+                    ):
+                        pending_recommendation["turn"] = self._user_turn_count
+                        recommendation_pending[kind] = pending_recommendation
+                        self.session.entities["consultation_recommendation_pending"] = recommendation_pending
+                        await self._send_function_output(
+                            call_ref,
+                            json.dumps({
+                                "status": "recommendation_information_requested",
+                                "available": False,
+                                "booked": False,
+                                "message": (
+                                    "The caller asked about the treatments. Answer "
+                                    "their question using lookup_spa_facts for "
+                                    "verified service descriptions and prices. "
+                                    "Do not repeat the switch question now; "
+                                    "the original service stays selected until "
+                                    "the caller explicitly accepts the alternative."
+                                ),
+                            }),
+                        )
+                        return True
+                    # Unclear replies cannot trigger a switch or an endless
+                    # repeat. Clarify once, then keep the original treatment
+                    # and continue toward booking.
                     attempts = int(pending_recommendation.get("attempts") or 0) + 1
                     if attempts >= 2:
                         state["recommendation_status"] = "declined"
