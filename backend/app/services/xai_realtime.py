@@ -1515,8 +1515,22 @@ class XAIVoiceSession:
             )
             return
         history = self.session.history
-        if history and history[-1]["role"] == "assistant" and history[-1]["content"] == text:
-            return
+        if history and history[-1]["role"] == "assistant":
+            previous = history[-1]["content"]
+            if previous == text:
+                return
+            # The first greeting is preloaded in history before xAI speaks.
+            # Its spoken transcript can normalize curly apostrophes ("I'm"
+            # vs "I’m"), which created two apparently identical greetings in
+            # the dashboard even when the media logs sent only one greeting.
+            # Only collapse these before any caller turn; later utterances
+            # remain intact so the real conversation is not hidden.
+            if not any(turn.get("role") == "user" for turn in history):
+                normalize = lambda value: " ".join(
+                    re.findall(r"[a-z0-9]+", str(value or "").casefold())
+                )
+                if normalize(previous) == normalize(text):
+                    return
         self.session.add_turn("assistant", text)
 
     async def _persist_session(self) -> None:
