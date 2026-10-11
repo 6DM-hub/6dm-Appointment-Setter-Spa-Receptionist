@@ -75,7 +75,7 @@ def _claimed_name_grounded(session: CallSession, claimed_name: str) -> bool:
     name = _norm(claimed_name)
     if not utterance or not name or len(name.split()) < 2:
         return False
-    if utterance == name and session.entities.get("awaiting_customer_profile_name"):
+    if utterance == name:
         return True
     raw = _last_caller_turn(session)
     for prefix in _NAME_PREFIX.finditer(raw):
@@ -162,10 +162,10 @@ async def _resolve_profile(
     ).scalar_one_or_none()
     if spa is None:
         return None, None, "not_found"
-    adapter = SpaBookingAdapter(spa)
-    if not adapter.supports_customer_lookup:
-        return None, None, "not_found"
     try:
+        adapter = SpaBookingAdapter(spa)
+        if not adapter.supports_customer_lookup:
+            return None, None, "not_found"
         result = await asyncio.wait_for(
             adapter.find_customers_by_phone(phone), timeout=4.0
         )
@@ -464,6 +464,22 @@ async def customer_profile_action(
         prefs = _saved_preferences(contact)
         if preference_key == "all":
             prefs.clear()
+            _update_preferences(contact, prefs)
+            meta = dict(contact.extra_metadata or {})
+            store = dict(meta.get(MEMORY_KEY) or {})
+            store.pop("visit_feedback", None)
+            meta[MEMORY_KEY] = store
+            contact.extra_metadata = meta
+            await db.commit()
+            return {"status": "forgotten", "message": "I've cleared your saved preferences and feedback."}
+        elif preference_key == "feedback":
+            meta = dict(contact.extra_metadata or {})
+            store = dict(meta.get(MEMORY_KEY) or {})
+            store.pop("visit_feedback", None)
+            meta[MEMORY_KEY] = store
+            contact.extra_metadata = meta
+            await db.commit()
+            return {"status": "forgotten", "message": "I've cleared your saved feedback."}
         elif preference_key in PREFERENCE_KEYS:
             prefs.pop(preference_key, None)
         else:
