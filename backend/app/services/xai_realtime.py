@@ -3538,6 +3538,10 @@ class XAIVoiceSession:
                 # before the caller's reply is interpreted.
                 state = prior
             else:
+                # Pending recommendation is tied to the original service;
+                # a model-emitted suggested service cannot silently reset it.
+                if isinstance(recommendation_pending.get(kind), dict) and isinstance(prior, dict):
+                    requested_service = str(prior.get("requested_service_name") or requested_service)
                 state = initialize_consultation(
                     requested_service,
                     services=services,
