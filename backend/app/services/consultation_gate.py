@@ -1064,7 +1064,9 @@ def record_duration_selection(
         return result
     choices = result.get("duration_choices") or []
     matching = [choice for choice in choices if choice.get("minutes") == minutes]
-    if choices and not matching:
+    if not matching:
+        # A bare duration cannot select a treatment when no catalog family
+        # was offered, nor select an unoffered length from another family.
         raise ValueError("selected duration was not in the grounded catalog offer")
     result["requested_duration_minutes"] = minutes
     result["selected_duration_minutes"] = minutes
