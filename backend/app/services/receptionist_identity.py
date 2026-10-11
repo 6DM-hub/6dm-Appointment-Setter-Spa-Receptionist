@@ -1,7 +1,14 @@
 """Shared spoken identity, independent of the selected synthesis voice."""
 
 
-def incoming_greeting(business_name: str) -> str:
+def incoming_greeting(business_name: str, *, returning: bool = False) -> str:
+    # Caller ID is only a hint. A neutral welcome-back does not disclose
+    # someone's name, treatment history, or private profile information.
+    if returning:
+        return (
+            f"Welcome back to {business_name}. "
+            "I’m Cara, your AI receptionist. How may I help you today?"
+        )
     return (
         f"Thank you for calling {business_name}. "
         "I’m Cara, your AI receptionist. May I help you reserve an appointment today?"
