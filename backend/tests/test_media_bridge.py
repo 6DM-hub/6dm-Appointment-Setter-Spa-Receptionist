@@ -114,6 +114,7 @@ async def test_session_update_carries_the_tenant_persona(bridge):
         "propose_appointment",
         "confirm_appointment",
         "lookup_appointments",
+        "customer_profile",
         "cancel_appointment",
         "start_new_appointment",
         "request_callback",
