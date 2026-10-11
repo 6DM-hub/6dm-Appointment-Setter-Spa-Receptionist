@@ -336,6 +336,6 @@ async def test_esthetician_summary_and_grounded_recommendation_precede_availabil
     assert "60-minute" in recommendation
     assert "30-minute 30 Minute" not in recommendation
     assert "60-minute 60 Minute" not in recommendation
-    assert "Would you prefer the 60-minute or the 30-minute?" in recommendation
+    assert "Which length would you like: 30-minute or 60-minute?" in recommendation
     assert result.session.entities.get("consultation_completed_kinds") in (None, [])
 

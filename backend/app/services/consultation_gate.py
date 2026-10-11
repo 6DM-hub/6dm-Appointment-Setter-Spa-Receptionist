@@ -19,6 +19,12 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from app.services.catalog_selection import (
+    base_name,
+    configured_duration,
+    exact_catalog_service,
+    family_variations,
+)
 from app.services.service_consultation import (
     classify_massage_need,
     configured_duration_choices,
@@ -79,7 +85,7 @@ REQUIRED_QUESTIONS: dict[str, tuple[tuple[str, str], ...]] = {
 }
 
 _DURATION_RE = re.compile(
-    r"\b(?P<minutes>30|60|thirty|sixty)\s*(?:-|\s)*(?:minute|minutes|min|mins)\b",
+    r"\b(?P<minutes>\d{1,3}|thirty|sixty|ninety)\s*[- ]*\s*(?:minutes?|mins?)\b",
     re.IGNORECASE,
 )
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -383,17 +389,7 @@ def _service_name(service: Mapping[str, Any]) -> str:
 
 
 def _duration_minutes(service: Mapping[str, Any] | str | None) -> int | None:
-    if isinstance(service, Mapping):
-        value = service.get("duration_minutes")
-        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-            return value
-        text = _service_name(service)
-    else:
-        text = str(service or "")
-    match = _DURATION_RE.search(text)
-    if not match:
-        return None
-    return 30 if match.group("minutes").casefold() in {"30", "thirty"} else 60
+    return configured_duration(service)
 
 
 def _service_kind(service: Mapping[str, Any] | str | None) -> str | None:
@@ -434,11 +430,8 @@ def infer_consultation_kind(
     )
     if not wanted:
         return None
-    catalog_matches = [
-        service
-        for service in services
-        if _normalized(_service_name(service)) == wanted
-    ]
+    matched = exact_catalog_service(services, requested_service)
+    catalog_matches = [matched] if matched is not None else []
     kinds = {_service_kind(service) for service in catalog_matches}
     kinds.discard(None)
     return kinds.pop() if len(kinds) == 1 else None
@@ -553,7 +546,7 @@ def _safe_duration_choices(value: object) -> list[dict[str, Any]]:
             continue
         minutes = _positive_int(item.get("minutes"))
         name = str(item.get("service_name") or "").strip()
-        if minutes not in {30, 60} or not name or minutes in seen:
+        if minutes is None or minutes > 480 or not name or minutes in seen:
             continue
         result.append({"minutes": minutes, "service_name": name})
         seen.add(minutes)
@@ -920,26 +913,7 @@ def consultation_complete(state: Mapping[str, Any]) -> bool:
 def _catalog_service(
     services: Sequence[Mapping[str, Any]], name: object
 ) -> Mapping[str, Any] | None:
-    wanted = _normalized(name)
-    if not wanted:
-        return None
-    exact = [service for service in services if _normalized(_service_name(service)) == wanted]
-    if len(exact) == 1:
-        return exact[0]
-    # A caller may say "60-minute European Facial" while the configured menu
-    # name is "European Facial" with duration_minutes=60. Match only a unique
-    # duration-compatible service after removing the duration phrase.
-    duration_match = _DURATION_RE.search(str(name or ""))
-    if duration_match is None:
-        return None
-    wanted_base = _normalized(_DURATION_RE.sub(" ", str(name), count=1))
-    wanted_minutes = _duration_minutes(str(name))
-    matches = [
-        service for service in services
-        if _normalized(_DURATION_RE.sub(" ", _service_name(service), count=1)) == wanted_base
-        and _duration_minutes(service) == wanted_minutes
-    ]
-    return matches[0] if len(matches) == 1 else None
+    return exact_catalog_service(services, name)
 
 
 def _duration_options(
@@ -947,67 +921,58 @@ def _duration_options(
     services: Sequence[Mapping[str, Any]],
     recommended_service: Mapping[str, Any] | str | None,
 ) -> list[dict[str, Any]]:
-    kind = str(state.get("kind") or "")
+    """Only variations within one caller-selected or recommended menu family.
+
+    Do not pick an unrelated same-modality 30/60 treatment to fill missing
+    lengths. A broad treatment request needs a menu choice before duration.
+    """
+    requested_name = str(state.get("requested_service_name") or "")
     anchors: list[Mapping[str, Any] | str] = []
-    requested_name = state.get("requested_service_name")
     if requested_name:
-        anchors.append(str(requested_name))
-    if recommended_service:
+        anchors.append(requested_name)
+    if recommended_service is not None:
         anchors.append(recommended_service)
 
-    choices_by_duration: dict[int, dict[str, Any]] = {}
     for anchor in anchors:
-        anchored = configured_duration_choices(services, anchor)
-        for choice in anchored.get("choices") or []:
-            minutes = _positive_int(choice.get("minutes"))
-            service = choice.get("service")
-            if minutes in {30, 60} and isinstance(service, Mapping):
-                choices_by_duration.setdefault(
-                    minutes,
-                    {"minutes": minutes, "service": dict(service)},
-                )
-
-    # Prefer the same menu family, then fill a missing duration using another
-    # real service of the same modality.  Catalog order is the deterministic
-    # tiebreaker; actual service names remain visible in the structured result.
-    for service in services:
-        if service.get("is_add_on") or _service_kind(service) != kind:
+        variants = family_variations(services, anchor)
+        if not variants:
             continue
-        minutes = _duration_minutes(service)
-        if minutes in {30, 60}:
-            choices_by_duration.setdefault(
-                minutes,
-                {"minutes": minutes, "service": dict(service)},
-            )
-    return [choices_by_duration[m] for m in (30, 60) if m in choices_by_duration]
+        return [
+            {"minutes": _duration_minutes(service), "service": dict(service)}
+            for service in variants
+            if _duration_minutes(service) is not None
+        ]
+    return []
 
 
 def _duration_offer_text(kind: str, choices: Sequence[Mapping[str, Any]]) -> str:
-    by_minutes = {int(choice["minutes"]): choice for choice in choices}
+    """Explain real offered durations without suggesting unavailable lengths."""
     parts: list[str] = []
-    if 30 in by_minutes:
-        name = _service_name(by_minutes[30]["service"])
-        name = " ".join(_DURATION_RE.sub("", name, count=1).strip(" -").split()) or name
-        benefit = (
-            "is a focused start"
-            if kind == FACIAL
-            else "can focus well on specific areas"
-        )
-        parts.append(f"The 30-minute {name} {benefit}.")
-    if 60 in by_minutes:
-        name = _service_name(by_minutes[60]["service"])
-        name = " ".join(_DURATION_RE.sub("", name, count=1).strip(" -").split()) or name
-        benefit = (
-            "gives us more time to target your concern so the results can last longer"
-            if kind == FACIAL
-            else "gives the therapist time to work more thoroughly for longer-lasting relief"
-        )
-        parts.append(f"The 60-minute {name} {benefit}.")
-    if len(by_minutes) == 2:
-        parts.append("Would you prefer the 60-minute or the 30-minute?")
-    elif by_minutes:
-        only = next(iter(by_minutes))
-        parts.append(f"Would you like the {only}-minute option?")
+    durations: list[int] = []
+    for choice in choices:
+        minutes = int(choice["minutes"])
+        durations.append(minutes)
+        name = _service_name(choice["service"])
+        name = " ".join(_DURATION_RE.sub(" ", name, count=1).split()) or name
+        if minutes == 30:
+            benefit = (
+                "is a focused start" if kind == FACIAL
+                else "can focus on specific areas"
+            )
+            parts.append(f"The 30-minute {name} {benefit}.")
+        elif minutes == 60:
+            benefit = (
+                "allows more time for the treatment" if kind == FACIAL
+                else "gives the therapist more time to work thoroughly"
+            )
+            parts.append(f"The 60-minute {name} {benefit}.")
+        else:
+            parts.append(f"We also have a {minutes}-minute {name}.")
+    lengths = " or ".join(f"{minutes}-minute" for minutes in durations)
+    if len(durations) > 1:
+        parts.append(f"Which length would you like: {lengths}?")
+    elif durations:
+        parts.append(f"Would you like the {lengths} treatment?")
     return " ".join(parts)
 
 
@@ -1099,7 +1064,9 @@ def record_duration_selection(
         return result
     choices = result.get("duration_choices") or []
     matching = [choice for choice in choices if choice.get("minutes") == minutes]
-    if choices and not matching:
+    if not matching:
+        # A bare duration cannot select a treatment when no catalog family
+        # was offered, nor select an unoffered length from another family.
         raise ValueError("selected duration was not in the grounded catalog offer")
     result["requested_duration_minutes"] = minutes
     result["selected_duration_minutes"] = minutes

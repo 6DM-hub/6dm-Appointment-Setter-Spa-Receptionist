@@ -13,6 +13,10 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
+from app.services.catalog_selection import (
+    base_name, configured_duration, exact_catalog_service, family_variations,
+)
+
 
 FACIAL_SERVICE_TERMS: dict[str, tuple[str, ...]] = {
     "acne_clarifying": ("acne", "clarifying", "purifying", "deep cleansing"),
@@ -128,7 +132,7 @@ _MASSAGE_CATEGORY_ADD_ON_SIGNAL: dict[str, str] = {
 }
 
 _DURATION_RE = re.compile(
-    r"\b(?:30|60|thirty|sixty)\s*(?:-|\s)*(?:minute|minutes|min|mins)\b",
+    r"\b(?:\d{1,3}|thirty|sixty|ninety)\s*[- ]*\s*(?:minutes?|mins?)\b",
     re.IGNORECASE,
 )
 
@@ -311,25 +315,17 @@ def configured_service_for_category(
 
 
 def _duration_minutes(service: Mapping[str, Any]) -> int | None:
-    value = service.get("duration_minutes")
-    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-        return value
-    match = _DURATION_RE.search(_service_name(service))
-    if not match:
-        return None
-    token = match.group(0).casefold()
-    return 30 if "30" in token or "thirty" in token else 60
+    return configured_duration(service)
 
 
 def _family(service: Mapping[str, Any]) -> str:
+    # Keep owner-supplied base_service as a legacy family alias for upsells.
     explicit = (
         service.get("service_family")
         or service.get("family")
         or service.get("base_service")
     )
-    if explicit:
-        return _normalized(explicit)
-    return _normalized(_DURATION_RE.sub(" ", _service_name(service)))
+    return _normalized(explicit) if explicit else base_name(_service_name(service))
 
 
 def _consultation_kind(service: Mapping[str, Any]) -> str | None:
@@ -356,42 +352,22 @@ def configured_duration_choices(
     services: Sequence[Mapping[str, Any]],
     selected_service: Mapping[str, Any] | str | None,
 ) -> dict[str, Any]:
-    """Return only real 30/60-minute entries and name missing durations."""
+    """Offer only configured variations of the SAME treatment family.
 
-    if isinstance(selected_service, Mapping):
-        selected = selected_service
-    else:
-        wanted = _normalized(selected_service)
-        selected = next(
-            (service for service in services if _normalized(_service_name(service)) == wanted),
-            None,
-        )
-    if not selected or selected.get("is_add_on"):
-        return {"choices": [], "missing_minutes": [30, 60]}
-
-    family = _family(selected)
-    selected_kind = _consultation_kind(selected)
-    matches = []
-    for service in services:
-        if service.get("is_add_on") or _family(service) != family:
-            continue
-        candidate_kind = _consultation_kind(service)
-        if selected_kind and candidate_kind and candidate_kind != selected_kind:
-            continue
-        matches.append(service)
-    by_duration: dict[int, Mapping[str, Any]] = {}
-    for service in matches:
-        minutes = _duration_minutes(service)
-        if minutes in {30, 60} and minutes not in by_duration:
-            by_duration[minutes] = service
+    Durations are menu-driven (including 45, 75, 90 minutes), not assumed to
+    be 30/60. A generic 'massage' must not pick an unrelated first service.
+    """
+    variants = family_variations(services, selected_service)
     choices = [
-        {"minutes": minutes, "service": _copy_service(by_duration[minutes])}
-        for minutes in (30, 60)
-        if minutes in by_duration
+        {"minutes": _duration_minutes(service), "service": _copy_service(service)}
+        for service in variants
+        if _duration_minutes(service) is not None
     ]
+    available = {item["minutes"] for item in choices}
     return {
         "choices": choices,
-        "missing_minutes": [minutes for minutes in (30, 60) if minutes not in by_duration],
+        # Kept for existing UI/tests; does not create hypothetical offerings.
+        "missing_minutes": [m for m in (30, 60) if m not in available],
     }
 
 
