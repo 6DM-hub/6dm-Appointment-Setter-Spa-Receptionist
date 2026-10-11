@@ -577,7 +577,9 @@ async def voice_inbound(
     if contact:
         session.entities["known_contact"] = {"id": str(contact.id), "name": contact.full_name}
 
-    greeting = incoming_greeting(session.business_name)
+    greeting = incoming_greeting(
+        session.business_name, returning=bool(session.entities.get("known_contact"))
+    )
 
     session.add_turn("assistant", greeting)
     await state.create(session)

@@ -824,12 +824,58 @@ REQUEST_CALLBACK_TOOL: dict[str, Any] = {
     },
 }
 
+CUSTOMER_PROFILE_TOOL: dict[str, Any] = {
+    "type": "function",
+    "name": "customer_profile",
+    "description": (
+        "Read this spa's returning customer's saved preferences and recent "
+        "verified treatments, or remember/forget an explicitly requested "
+        "non-sensitive preference. Identity verification requires the caller "
+        "to state the full name on the account; caller ID alone is not proof. "
+        "Never invent customer history, reuse data from another spa, or infer "
+        "a preference from a consultation. Use action=remember only when the "
+        "caller explicitly asks Cara to save a preference, action=forget only "
+        "when explicitly asked, and action=lookup when they want their profile "
+        "or usual treatment. AFTER handling the main customer request, optionally "
+        "use feedback_invite once to ask how the last visit went; call "
+        "feedback_save only AFTER the customer answers. Never fabricate feedback. "
+        "Do not read payment or health details."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["lookup", "remember", "forget", "feedback_invite", "feedback_save"]},
+            "caller_name": {
+                "type": "string",
+                "description": "Full name explicitly spoken by this caller, never guessed from caller ID.",
+            },
+            "preference_key": {
+                "type": "string",
+                "enum": [
+                    "favorite_service", "preferred_staff", "preferred_time",
+                    "treatment_style", "feedback", "all",
+                ],
+            },
+            "preference_value": {
+                "type": "string",
+                "description": "A short non-sensitive preference literally spoken by the caller; never invent it.",
+            },
+            "feedback_text": {
+                "type": "string",
+                "description": "The brief feedback the caller actually spoke after Cara offered to hear feedback; never invent or paraphrase.",
+            },
+        },
+        "required": ["action"],
+    },
+}
+
 VOICE_TOOLS: list[dict[str, Any]] = [
     LOOKUP_SPA_FACTS_TOOL,
     CHECK_AVAILABILITY_TOOL,
     PROPOSE_APPOINTMENT_TOOL,
     CONFIRM_APPOINTMENT_TOOL,
     LOOKUP_APPOINTMENTS_TOOL,
+    CUSTOMER_PROFILE_TOOL,
     CANCEL_APPOINTMENT_TOOL,
     NEW_APPOINTMENT_TOOL,
     REQUEST_CALLBACK_TOOL,
@@ -2076,12 +2122,15 @@ class XAIVoiceSession:
         )
         instructions += self._booking_write_protocol_instructions()
         known_contact = self.session.entities.get("known_contact")
-        if known_contact and known_contact.get("name") not in {None, "Unknown"}:
+        if known_contact:
+            # Caller ID is not proof of identity; never preload a name
+            # that the wrong person on a shared line could be addressed by.
             instructions += (
-                f"\nKNOWN PROFILE: {known_contact['name']}. Caller ID already provides their "
-                "phone number; do not ask for the phone again unless they request a different "
-                "callback number. This profile is not the name for the booking. Ask for the "
-                "caller's name unless caller_name is already stored from this call."
+                "\nRETURNING NUMBER: A spa customer record exists for this number, "
+                "but the caller's name is not yet verified. Welcome them without "
+                "using a name or revealing appointment history. Ask for the "
+                "account name before using customer_profile; still collect "
+                "caller_name for the current booking."
             )
         requested_voice = resolve_xai_voice(
             self.session.entities.get("xai_voice") or settings.XAI_VOICE_ID
@@ -2261,7 +2310,10 @@ class XAIVoiceSession:
             return
         greeting = None
         if self.session.direction == "inbound":
-            greeting = incoming_greeting(self.session.business_name)
+            greeting = incoming_greeting(
+                self.session.business_name,
+                returning=bool(self.session.entities.get("known_contact")),
+            )
         elif self.session.history:
             first = self.session.history[0]
             if first.get("role") == "assistant":
@@ -2662,6 +2714,34 @@ class XAIVoiceSession:
             "card_sms": result.card_sms,
             "message": result.message,
         })
+
+    async def _run_customer_profile(self, raw_arguments: str = "") -> str:
+        """Verified caller profile access; no provider customer mutations."""
+        from app.services.customer_memory import customer_profile_action
+
+        try:
+            args = json.loads(raw_arguments or "{}")
+        except (TypeError, json.JSONDecodeError):
+            args = {}
+        if not isinstance(args, dict):
+            args = {}
+        try:
+            async with AsyncSessionLocal() as db:
+                result = await customer_profile_action(
+                    db, self.session,
+                    action=str(args.get("action") or "lookup"),
+                    caller_name=args.get("caller_name"),
+                    preference_key=args.get("preference_key"),
+                    preference_value=args.get("preference_value"),
+                    feedback_text=args.get("feedback_text"),
+                )
+        except Exception:
+            logger.exception("call %s: customer profile tool failed", self.call_id)
+            return json.dumps({
+                "status": "lookup_unavailable",
+                "message": "I couldn't retrieve that profile right now, but we can still book your appointment.",
+            })
+        return json.dumps(result)
 
     async def _run_lookup_appointments(self, raw_arguments: str = "") -> str:
         """Read-only appointment lookup; no Contact or calendar mutation."""
@@ -5612,6 +5692,7 @@ class XAIVoiceSession:
             PROPOSE_APPOINTMENT_TOOL["name"]: self._run_propose_appointment,
             CONFIRM_APPOINTMENT_TOOL["name"]: self._run_confirm_appointment,
             LOOKUP_APPOINTMENTS_TOOL["name"]: self._run_lookup_appointments,
+            CUSTOMER_PROFILE_TOOL["name"]: self._run_customer_profile,
             CANCEL_APPOINTMENT_TOOL["name"]: self._run_cancel_appointment,
             NEW_APPOINTMENT_TOOL["name"]: self._run_start_new_appointment,
             MANAGE_APPOINTMENT_TOOL["name"]: self._run_manage_appointment,

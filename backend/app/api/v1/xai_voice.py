@@ -174,13 +174,10 @@ async def xai_incoming_call(
     await db.commit()
 
     business_name = spa.name if spa else settings.APP_NAME
-    if contact and contact.first_name:
-        greeting = (
-            f"Hello {contact.first_name}, thanks for calling back. "
-            "How may I assist you today?"
-        )
-    else:
-        greeting = f"Thank you for calling {business_name}. How may I assist you today?"
+    # Caller ID can be shared. Never address a named person before they
+    # identify themselves on this call.
+    from app.services.receptionist_identity import incoming_greeting
+    greeting = incoming_greeting(business_name, returning=bool(contact))
 
     session = CallSession(
         call_sid=call_id,

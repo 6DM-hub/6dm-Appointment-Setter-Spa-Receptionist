@@ -7,6 +7,62 @@ interface ContactManagerProps {
   onContactAdded: () => void;
 }
 
+type SavedVisitComment = {
+  feedback?: unknown;
+  captured_at?: unknown;
+  service?: unknown;
+  visit_date?: unknown;
+  verified_visit?: unknown;
+};
+
+function CustomerInsights({ contact }: { contact: Contact }) {
+  const raw = contact.extra_metadata?.cara_preferences_v1;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const memory = raw as Record<string, unknown>;
+  const savedPrefs = memory.preferences && typeof memory.preferences === "object" &&
+    !Array.isArray(memory.preferences)
+      ? memory.preferences as Record<string, unknown>
+      : {};
+  const prefs = Object.entries(savedPrefs).filter(
+    ([key, value]) =>
+      ["favorite_service", "preferred_staff", "preferred_time", "treatment_style"].includes(key) &&
+      typeof value === "string" && value.length > 0
+  );
+  const entries = Array.isArray(memory.visit_feedback) ? memory.visit_feedback : [];
+  const latest = entries.length > 0 ? entries[entries.length - 1] as SavedVisitComment : null;
+  const feedback = latest && typeof latest.feedback === "string" ? latest.feedback : null;
+  if (!prefs.length && !feedback) return null;
+  const labels: Record<string, string> = {
+    favorite_service: "Usual service",
+    preferred_staff: "Preferred therapist",
+    preferred_time: "Preferred time",
+    treatment_style: "Treatment style",
+  };
+  return (
+    <details className="mt-3 w-full border-t border-slate-800 pt-2 text-xs text-slate-300">
+      <summary className="cursor-pointer text-indigo-300 font-medium">
+        Saved preferences &amp; visit feedback
+      </summary>
+      <div className="mt-2 space-y-1 pl-2">
+        {prefs.map(([key, value]) => (
+          <div key={key}><span className="text-slate-400">{labels[key]}:</span> {String(value)}</div>
+        ))}
+        {feedback && (
+          <div className="pt-2">
+            <div className="font-medium text-slate-200">Latest feedback</div>
+            <div className="text-slate-400">
+              {latest?.verified_visit === true ? "Matched to a recorded visit" : "Customer-reported visit"}
+              {typeof latest?.visit_date === "string" && " · " + latest.visit_date}
+              {typeof latest?.service === "string" && " · " + latest.service}
+            </div>
+            <p className="mt-1 whitespace-pre-wrap break-words">{feedback}</p>
+          </div>
+        )}
+      </div>
+    </details>
+  );
+}
+
 export const ContactManager: React.FC<ContactManagerProps> = ({ contacts, onContactAdded }) => {
   const [fullName, setFullName] = useState("");
   const [phoneNumber, setPhoneNumber] = useState("");
@@ -110,7 +166,7 @@ export const ContactManager: React.FC<ContactManagerProps> = ({ contacts, onCont
             contacts.map((contact) => (
               <div
                 key={contact.id}
-                className="flex items-center justify-between bg-slate-950 p-3.5 border border-slate-800 rounded-lg"
+                className="bg-slate-950 p-3.5 border border-slate-800 rounded-lg"
               >
                 <div className="flex items-center gap-3">
                   <div className="w-10 h-10 bg-slate-800 rounded-full flex items-center justify-center">
@@ -130,6 +186,7 @@ export const ContactManager: React.FC<ContactManagerProps> = ({ contacts, onCont
                     </div>
                   </div>
                 </div>
+                <CustomerInsights contact={contact} />
               </div>
             ))
           )}

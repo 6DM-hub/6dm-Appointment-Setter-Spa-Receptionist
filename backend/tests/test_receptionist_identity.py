@@ -15,3 +15,13 @@ def test_business_name_and_private_pronunciation():
     assert "CARE-uh" in instructions
     assert "wait for the caller's response" in instructions
     assert "rescheduling, cancellation" in instructions
+
+
+def test_returning_call_welcomes_without_leaking_a_name():
+    spoken = incoming_greeting("YourDaySpa", returning=True)
+    assert spoken == (
+        "Welcome back to YourDaySpa. "
+        "I’m Cara, your AI receptionist. How may I help you today?"
+    )
+    assert "Jane" not in spoken
+    assert "booked last time" not in spoken.lower()
