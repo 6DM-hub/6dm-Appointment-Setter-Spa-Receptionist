@@ -77,11 +77,21 @@ def exact_catalog_service(
         service for service in services
         if normalized(service.get("name")) == text or text in _aliases(service)
     ]
-    if len(exact) == 1:
-        return exact[0]
-    if len(exact) > 1:
-        return None
     requested_minutes = duration_from_name(requested)
+    if len(exact) == 1:
+        # A single exact match still must not change an explicitly requested
+        # duration to a differently configured variation.
+        only = exact[0]
+        if requested_minutes is None or configured_duration(only) == requested_minutes:
+            return only
+        return None
+    if len(exact) > 1:
+        filtered = [
+            service for service in exact
+            if requested_minutes is not None
+            and configured_duration(service) == requested_minutes
+        ]
+        return filtered[0] if len(filtered) == 1 else None
     requested_family = base_name(requested)
     if not requested_family:
         return None
