@@ -671,6 +671,7 @@ def start_new_intent(session: Any) -> BookingDraft:
         "consultation_duration_offer_turns",
         "consultation_duration_attempts",
         "consultation_recommendation_pending",
+        "consultation_menu_choice_pending",
         "caller_grounded_requested_time",
         "caller_grounded_service_durations",
         "caller_grounded_exact_times",
