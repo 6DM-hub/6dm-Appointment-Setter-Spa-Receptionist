@@ -26,7 +26,7 @@ from redis.asyncio import Redis
 
 from app.api.deps import get_current_user, get_db, get_redis, get_super_admin, get_tenant_manager
 from app.core.config import settings
-from app.models import BookingProvider, SpaAccount, User, UserRole
+from app.models import BookingProvider, ServiceCategory, SpaAccount, User, UserRole
 from app.models.google_calendar_connection import GoogleCalendarConnection
 from app.schemas import (
     Page,
@@ -58,6 +58,14 @@ logger = logging.getLogger(__name__)
 # Fields a spa_admin may not change on their own tenant. Moving your own
 # inbound number would let you hijack another spa's routing.
 TENANT_LOCKED_FIELDS = {"twilio_phone_number", "is_active", "voice_engine"}
+DEFAULT_SERVICE_CATEGORIES = (
+    "Facial",
+    "Massage",
+    "MedSpa",
+    "Wellness Treatment",
+    "Waxing",
+    "Spa Packages",
+)
 
 
 class GoogleCalendarSelection(BaseModel):
@@ -149,6 +157,12 @@ async def create_spa_account(
     )
     spa = SpaAccount(**values)
     db.add(spa)
+    # Provision defaults as part of this explicit super-admin write. Service
+    # and category GET routes stay strictly read-only for spa staff.
+    await db.flush()
+    db.add_all(
+        [ServiceCategory(spa_id=spa.id, name=name) for name in DEFAULT_SERVICE_CATEGORIES]
+    )
     await db.commit()
     await db.refresh(spa)
     return _to_read(spa)
