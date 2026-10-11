@@ -63,6 +63,7 @@ from app.services.consultation_gate import (
     record_duration_selection,
     record_pending_answer,
     record_volunteered_facial_details,
+    _catalog_service,
     take_duration_offer,
     take_massage_addon_offer,
     take_next_question,
@@ -1194,6 +1195,7 @@ class XAIVoiceSession:
         self.session.add_turn("user", text)
         self._remember_caller_service_durations(text)
         self._remember_caller_requested_date(text)
+        self._remember_caller_requested_time(text)
         # A genuinely new caller turn is what can ground the NEXT exact-time
         # availability probe — see `_is_time_grounded`.
         self._user_turn_count += 1
@@ -1322,6 +1324,12 @@ class XAIVoiceSession:
             # resurrect it while we wait for a new caller-provided date.
             self._clear_caller_requested_date()
             self.session.entities.pop("requested_availability_window", None)
+
+    def _remember_caller_requested_time(self, utterance: str) -> None:
+        """Retain the caller-spoken time even when the date comes later."""
+        clock = _extract_clock_time(utterance)
+        if clock is not None:
+            self.session.entities["caller_grounded_requested_time"] = clock.isoformat()
 
     def _clear_caller_requested_date(self) -> None:
         self.session.entities["caller_grounded_requested_date"] = {
@@ -3485,6 +3493,9 @@ class XAIVoiceSession:
         duration_attempts = self.session.entities.get("consultation_duration_attempts")
         if not isinstance(duration_attempts, dict):
             duration_attempts = {}
+        recommendation_pending = self.session.entities.get("consultation_recommendation_pending")
+        if not isinstance(recommendation_pending, dict):
+            recommendation_pending = {}
         addon_pending = self.session.entities.get("consultation_addon_pending")
         if not isinstance(addon_pending, dict):
             addon_pending = {}
@@ -3745,6 +3756,57 @@ class XAIVoiceSession:
                 )
                 return True
 
+            # The caller decides whether to switch to a recommended treatment.
+            pending_recommendation = recommendation_pending.get(kind)
+            if isinstance(pending_recommendation, dict):
+                if self._user_turn_count <= pending_recommendation.get("turn", self._user_turn_count):
+                    await self._send_function_output(
+                        call_ref, json.dumps({"status": "awaiting_recommendation_answer", "available": False, "booked": False}), nudge=False,
+                    )
+                    return True
+                if self._caller_declines_optional_item(caller_text):
+                    state["recommendation_status"] = "declined"
+                    recommendation_pending.pop(kind, None)
+                elif self._caller_accepts_consultation_invitation(caller_text):
+                    state["recommendation_status"] = "accepted"
+                    state["recommended_service_name"] = str(pending_recommendation["name"])
+                    recommendation_pending.pop(kind, None)
+                else:
+                    pending_recommendation["turn"] = self._user_turn_count
+                    recommendation_pending[kind] = pending_recommendation
+                    self.session.entities["consultation_recommendation_pending"] = recommendation_pending
+                    await self._speak_consultation_gate(
+                        call_ref, status="recommendation_clarification",
+                        spoken="Would you like to switch to the recommended treatment, or keep your original choice?",
+                    )
+                    return True
+                self.session.entities["consultation_recommendation_pending"] = recommendation_pending
+            elif kind == "facial" and state.get("recommendation_status") is None:
+                # Menu-grounded advice only; never auto-switch or make up a service.
+                suggested = configured_service_for_category(
+                    services, category=state.get("category"), service_kind=kind,
+                )
+                original = _catalog_service(services, state.get("requested_service_name"))
+                if suggested and original and suggested["name"].casefold() != original["name"].casefold():
+                    recommended_name = str(suggested["name"])
+                    recommendation_pending[kind] = {
+                        "name": recommended_name, "turn": self._user_turn_count,
+                    }
+                    self.session.entities["consultation_recommendation_pending"] = recommendation_pending
+                    states[kind] = state
+                    self.session.entities["consultation_state"] = state
+                    self.session.entities["consultation_states"] = states
+                    await self._speak_consultation_gate(
+                        call_ref, status="service_recommendation",
+                        spoken=(
+                            f"Since you mentioned {('breakouts' if state.get('category') == 'acne_clarifying' else 'your skin concerns')}, "
+                            f"we also offer the {recommended_name}. Would you like to switch to that, "
+                            f"or stay with your {original['name']}?"
+                        ),
+                    )
+                    return True
+                state["recommendation_status"] = "declined"
+
             # If the duration comparison was spoken on a prior turn, accept a
             # grounded 30/60 change. An explicit original duration remains the
             # selection when the caller says to keep it.
@@ -3998,6 +4060,7 @@ class XAIVoiceSession:
         self.session.entities["consultation_permission_attempts"] = permission_attempts
         self.session.entities["consultation_duration_offer_turns"] = duration_turns
         self.session.entities["consultation_duration_attempts"] = duration_attempts
+        self.session.entities["consultation_recommendation_pending"] = recommendation_pending
         self._restore_consultation_booking_request(args)
         # Apply every completed selection again after restoring the original
         # multi-service request, then remember the grounded, final version.
@@ -4487,6 +4550,21 @@ class XAIVoiceSession:
                 if active_date is not None and active_date == target.date():
                     return True
 
+        # The customer may say "2:30 PM" before "Friday". Combine only a
+        # caller-spoken time with a newly caller-spoken date, never a guessed day.
+        if self._user_turn_count > self._last_probe_turn_count:
+            utterance = self._last_user_utterance() or ""
+            if _DATE_MENTION_RE.search(utterance):
+                raw_time = self.session.entities.get("caller_grounded_requested_time")
+                active_day = self._active_established_date()
+                if isinstance(raw_time, str) and active_day is not None:
+                    try:
+                        grounded_clock = dt_time.fromisoformat(raw_time)
+                        local_target = target.astimezone(self._tz)
+                        if local_target.date() == active_day and local_target.time().replace(tzinfo=None) == grounded_clock:
+                            return True
+                    except ValueError:
+                        pass
         return False
 
     def _remember_grounded_exact_time(self, requested_start_iso: str | None) -> None:
@@ -5484,7 +5562,10 @@ class XAIVoiceSession:
                         "status": "ungrounded_time",
                         "available": False,
                         "message": (
-                            "Which date and time would you like? Please include AM or PM."
+                            "Which day would you like to come in? I have your time already."
+                            if self.session.entities.get("caller_grounded_requested_time")
+                            and self._active_established_date() is None
+                            else "Which date and time would you like? Please include AM or PM."
                         ),
                     }),
                     restrict_continuation=True,
