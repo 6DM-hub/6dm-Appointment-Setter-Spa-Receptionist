@@ -224,3 +224,52 @@ async def test_generic_massage_unmatched_category_requires_actual_menu_choice():
     assert await v._enforce_service_consultation("duration", args) is False
     assert args["requested_services"] == ["90 Minute Swedish Massage"]
     assert args["requested_start_iso"] == "2026-10-14T14:30:00"
+
+
+@pytest.mark.asyncio
+async def test_explicit_change_from_named_60_min_massage_to_real_90_min_variation():
+    v = voice()
+    v._consultation_catalog_cache = (SERVICES, [])
+    v._consultation_catalog = AsyncMock(return_value=(SERVICES, []))
+    state = _answered_massage("60 Minute Swedish Massage")
+    state = take_duration_offer(state, SERVICES)["state"]
+    state["addon_offer_presented"] = True
+    v.session.entities.update({
+        "consultation_states": {"massage": state},
+        "consultation_state": state,
+        "consultation_completed_kinds": ["massage"],
+        "consultation_booking_request": {
+            "requested_services": ["60 Minute Swedish Massage"],
+            "requested_start_iso": "2026-10-14T14:30:00",
+        },
+    })
+    caller_says(v, "Actually make it a 90-minute Swedish massage.")
+    args = {"requested_services": ["60 Minute Swedish Massage"]}
+    assert await v._enforce_service_consultation("length-change", args) is False
+    assert args["requested_services"] == ["90 Minute Swedish Massage"]
+    assert args["requested_start_iso"] == "2026-10-14T14:30:00"
+    assert v.session.entities["consultation_states"]["massage"]["selected_duration_minutes"] == 90
+
+
+@pytest.mark.asyncio
+async def test_rejects_caller_duration_not_configured_for_named_treatment():
+    v = voice()
+    v._consultation_catalog_cache = (SERVICES, [])
+    v._consultation_catalog = AsyncMock(return_value=(SERVICES, []))
+    state = _answered_massage("60 Minute Swedish Massage")
+    state = take_duration_offer(state, SERVICES)["state"]
+    state["addon_offer_presented"] = True
+    v.session.entities.update({
+        "consultation_states": {"massage": state},
+        "consultation_state": state,
+        "consultation_completed_kinds": ["massage"],
+        "consultation_booking_request": {
+            "requested_services": ["60 Minute Swedish Massage"],
+            "requested_start_iso": "2026-10-14T14:30:00",
+        },
+    })
+    caller_says(v, "Change it to a 75-minute Swedish massage.")
+    args = {"requested_services": ["75 Minute Swedish Massage"]}
+    assert await v._enforce_service_consultation("invalid-length", args) is False
+    assert args["requested_services"] == ["60 Minute Swedish Massage"]
+    assert v.session.entities["consultation_states"]["massage"]["selected_duration_minutes"] == 60
