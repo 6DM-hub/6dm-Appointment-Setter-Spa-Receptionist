@@ -23,6 +23,11 @@ from app.services.booking_adapters.providers.vagaro import VagaroAdapter
 from app.services.booking_adapters.providers.zenoti import ZenotiAdapter
 from app.services.booking_adapters.spa_router import SpaBookingAdapter
 from app.services.call_state import CallSession
+from app.services.consultation_gate import (
+    initialize_consultation,
+    record_consultation_answer,
+    record_consultation_permission,
+)
 from app.services.caller_identity import persist_caller_identity
 from app.services.customer_links import (
     external_customer_link_statement,
@@ -416,6 +421,46 @@ def test_booking_context_keeps_guest_off_the_caller_profile():
     assert ctx.customer_phone == "+14152345678"
 
 
+def test_booking_context_relays_consented_structured_facial_summary():
+    start = datetime(2026, 9, 24, 19, 0, tzinfo=timezone.utc)
+    session = CallSession(
+        "CA-facial",
+        "inbound",
+        "+14152345678",
+        "+15550000001",
+        timezone="America/Los_Angeles",
+    )
+    state = initialize_consultation("60 Minute Hydrating Facial")
+    assert state is not None
+    state = record_consultation_permission(state, accepted=True)
+    state = record_consultation_answer(
+        state, field="main_concern", answer="dry and dull"
+    )
+    state = record_consultation_answer(
+        state, field="skin_feel", answer="dry and tight"
+    )
+    session.entities["consultation_states"] = {"facial": state}
+    intent = SimpleNamespace(
+        service_description="60 Minute Hydrating Facial",
+        caller_name="Jane Smith",
+        caller_email=None,
+        guest_name=None,
+        preferred_staff=None,
+    )
+
+    ctx = _context(
+        GoogleCalendarAdapter(timezone_name="America/Los_Angeles"),
+        session,
+        intent,
+        start,
+        start + timedelta(hours=1),
+    )
+
+    assert "Facial consultation" in (ctx.notes or "")
+    assert "concerns: dryness, dullness" in (ctx.notes or "")
+    assert "skin feel: dry, tight" in (ctx.notes or "")
+
+
 @pytest.mark.asyncio
 async def test_ambiguous_customer_asks_for_a_name_instead_of_a_provider_outage():
     session = CallSession("CA1", "inbound", "+15551234567", "+15550000001")
@@ -767,6 +812,30 @@ async def test_existing_booking_note_is_kept_when_the_caller_name_differs(monkey
     )
     assert _creates(transport) == []
     assert _puts(transport) == []
+
+
+@pytest.mark.asyncio
+async def test_square_keeps_facial_consultation_note_without_name_mismatch(monkeypatch):
+    transport = _FakeTransport()
+    _arm_booking(transport)
+    transport.customer_search_results = [[_customer("jane_square", "Jane", "Smith")]]
+    adapter = _adapter(monkeypatch, transport)
+
+    await adapter.create_booking(
+        _ctx(
+            caller_name="Jane Smith",
+            customer_name="Jane Smith",
+            customer_phone="+15551111111",
+            notes=(
+                "Booked by the AI agent during call CA-facial. "
+                "Facial consultation - concerns: dryness; skin feel: dry."
+            ),
+        )
+    )
+
+    assert _note(transport) == (
+        "Facial consultation - concerns: dryness; skin feel: dry."
+    )
 
 
 @pytest.mark.asyncio

@@ -140,18 +140,22 @@ def _square_customer_note(
     guest = _guest_booking_note(ctx)
     raw = (ctx.notes or "").strip()
     if raw.startswith("Booked by the AI agent during call "):
-        raw = ""
-    if mismatch is None:
-        return guest, False
+        # Remove only the internal call stamp. Keep any bounded staff-facing
+        # consultation note that follows it.
+        raw = re.sub(
+            r"^Booked by the AI agent during call [^.]+\.\s*",
+            "",
+            raw,
+            count=1,
+        ).strip()
     pieces: list[str] = []
     if raw:
         pieces.append(raw)
     if guest and guest not in raw:
         pieces.append(guest)
-    line = mismatch
-    if line not in pieces:
-        pieces.append(line)
-    return "\n".join(pieces), True
+    if mismatch and mismatch not in pieces:
+        pieces.append(mismatch)
+    return "\n".join(pieces) or None, mismatch is not None
 
 
 class SquareAdapter(VerticalProviderAdapter):

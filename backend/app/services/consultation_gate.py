@@ -7,8 +7,10 @@ existing call-session entity bag.
 
 Free-form consultation answers are used only during the current function call.
 They are reduced to an answered-field marker and a broad cosmetic/wellness
-category.  In particular, injury and area-to-avoid text is never copied into
-the returned state.
+category.  Facial answers also produce a small allow-listed summary that can
+be shared with the esthetician in the booking note.  In particular, raw
+answers, injury details, and area-to-avoid text are never copied into the
+returned state.
 """
 
 from __future__ import annotations
@@ -18,7 +20,6 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from app.services.service_consultation import (
-    classify_facial_need,
     classify_massage_need,
     configured_duration_choices,
     relevant_configured_addons,
@@ -29,6 +30,11 @@ FACIAL = "facial"
 MASSAGE = "massage"
 CONSULTATION_KINDS = frozenset({FACIAL, MASSAGE})
 
+FACIAL_PERMISSION_PROMPT = (
+    "Of course. May I ask you a few quick questions about your skin so I can "
+    "relay the details to your esthetician for your appointment?"
+)
+
 REQUIRED_QUESTIONS: dict[str, tuple[tuple[str, str], ...]] = {
     FACIAL: (
         (
@@ -37,11 +43,19 @@ REQUIRED_QUESTIONS: dict[str, tuple[tuple[str, str], ...]] = {
         ),
         (
             "skin_feel",
-            "How does your skin usually feel by midday or the end of the day—oily, dry, combination, or balanced?",
+            "How does your skin usually feel by the middle of the day, or even at the end of the day? Is it more oily? Is it dry? Does it feel tight? Combination? Or pretty balanced?",
         ),
         (
-            "skin_flags",
-            "Do you have any breakouts, sensitivity, or redness?",
+            "active_breakouts",
+            "Are you dealing with any active breakouts right now?",
+        ),
+        (
+            "skin_sensitivity",
+            "Do you have any sensitivity or redness, or are there products that tend to irritate your skin?",
+        ),
+        (
+            "facial_history",
+            "Have you had facials before, and is there anything you especially liked or did not like?",
         ),
     ),
     MASSAGE: (
@@ -70,6 +84,51 @@ _DURATION_RE = re.compile(
 )
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
+_FACIAL_CONCERN_TERMS: dict[str, tuple[str, ...]] = {
+    "acne": ("acne",),
+    "breakouts": ("breakout", "breakouts", "pimple", "pimples"),
+    "oiliness": ("oily", "oiliness", "greasy"),
+    "dryness": ("dry", "dryness", "dehydrated", "dehydration", "flaky"),
+    "dullness": ("dull", "dullness"),
+    "sensitivity": ("sensitive", "sensitivity", "reactive"),
+    "redness": ("red", "redness"),
+    "aging or fine lines": (
+        "aging",
+        "ageing",
+        "fine line",
+        "fine lines",
+        "wrinkle",
+        "wrinkles",
+    ),
+    "clogged pores": ("clogged pore", "clogged pores", "congested", "congestion"),
+    "uneven tone": ("uneven tone", "dark spot", "dark spots", "pigmentation"),
+}
+_SKIN_FEEL_TERMS: dict[str, tuple[str, ...]] = {
+    "oily": ("oily", "oiliness", "greasy"),
+    "dry": ("dry", "dryness", "dehydrated", "flaky"),
+    "tight": ("tight", "tightness"),
+    "combination": ("combination", "both oily and dry", "oily and dry"),
+    "balanced": ("balanced", "normal"),
+}
+_FACIAL_PREFERENCE_TERMS: dict[str, tuple[str, ...]] = {
+    "extractions": ("extraction", "extractions"),
+    "steam": ("steam", "steaming"),
+    "facial massage": ("facial massage", "face massage"),
+    "gentle hydration": ("gentle hydration", "hydration", "hydrating"),
+    "exfoliation": ("exfoliation", "exfoliating", "scrub", "scrubs", "peel", "peels"),
+    "fragrance": ("fragrance", "fragranced", "scented products"),
+    "masks": ("mask", "masks"),
+}
+_NEGATIVE_RESPONSE_RE = re.compile(
+    r"\b(?:no|none|not|don't|do not|doesn't|does not|haven't|have not|never|without|nope)\b",
+    re.IGNORECASE,
+)
+_POSITIVE_HISTORY_RE = re.compile(
+    r"\b(?:yes|have|had|before|previous|previously)\b", re.IGNORECASE
+)
+_LIKED_RE = re.compile(r"\b(?:like|liked|love|loved|enjoy|enjoyed|prefer|preferred)\b", re.IGNORECASE)
+_DISLIKED_RE = re.compile(r"\b(?:dislike|disliked|hate|hated|did not like|didn't like|avoid)\b", re.IGNORECASE)
+
 _FACIAL_CATEGORY_PRIORITY = {
     "custom": 1,
     "hydrating": 2,
@@ -91,6 +150,232 @@ _MASSAGE_ADDON_SIGNALS = {
 
 def _normalized(value: object) -> str:
     return " ".join(_TOKEN_RE.findall(str(value or "").casefold()))
+
+
+def _contains_term(text: str, terms: Sequence[str]) -> bool:
+    normalized = f" {_normalized(text)} "
+    return any(f" {_normalized(term)} " in normalized for term in terms)
+
+
+def _safe_facial_summary(value: object) -> dict[str, Any]:
+    raw = value if isinstance(value, Mapping) else {}
+    allowed_concerns = set(_FACIAL_CONCERN_TERMS)
+    allowed_feel = set(_SKIN_FEEL_TERMS)
+    allowed_preferences = set(_FACIAL_PREFERENCE_TERMS)
+    breakout_status = str(raw.get("active_breakouts") or "").strip()
+    sensitivity_status = str(raw.get("sensitivity") or "").strip()
+    prior_facials = str(raw.get("prior_facials") or "").strip()
+    return {
+        "concerns": _clean_string_list(
+            raw.get("concerns"), allowed=allowed_concerns
+        ),
+        "skin_feel": _clean_string_list(
+            raw.get("skin_feel"), allowed=allowed_feel
+        ),
+        "active_breakouts": (
+            breakout_status if breakout_status in {"reported", "not reported"} else None
+        ),
+        "sensitivity": (
+            sensitivity_status
+            if sensitivity_status in {"reported", "not reported"}
+            else None
+        ),
+        "prior_facials": (
+            prior_facials if prior_facials in {"yes", "no", "unclear"} else None
+        ),
+        "liked": _clean_string_list(raw.get("liked"), allowed=allowed_preferences),
+        "avoids": _clean_string_list(raw.get("avoids"), allowed=allowed_preferences),
+    }
+
+
+def _append_unique(target: list[str], values: Sequence[str]) -> None:
+    for value in values:
+        if value not in target:
+            target.append(value)
+
+
+def _negative_for(text: str, terms: Sequence[str]) -> bool:
+    normalized = _normalized(text)
+    negative = r"(?:no|not|without|never|don t|do not|doesn t|does not|haven t|have not|isn t|is not)"
+    bridge = r"(?:\s+(?:have|had|dealing with|experiencing|seeing|any|active))*"
+    for term in terms:
+        normalized_term = _normalized(term)
+        token = re.escape(normalized_term)
+        direct = re.search(
+            rf"\b{negative}{bridge}\s+{token}\b",
+            normalized,
+        )
+        if direct:
+            return True
+        position = normalized.find(normalized_term)
+        if position < 0:
+            continue
+        nearby = normalized[max(0, position - 55):position]
+        negatives = list(re.finditer(rf"\b{negative}\b", nearby))
+        contrasts = list(re.finditer(r"\b(?:but|however|although)\b", nearby))
+        if negatives and (
+            not contrasts or negatives[-1].start() > contrasts[-1].start()
+        ):
+            return True
+    return False
+
+
+def _reported_status(text: str, terms: Sequence[str]) -> str | None:
+    """Classify a signal group while respecting mixed yes/no clauses."""
+
+    mentioned = [term for term in terms if _contains_term(text, (term,))]
+    if not mentioned:
+        return None
+    if any(not _negative_for(text, (term,)) for term in mentioned):
+        return "reported"
+    return "not reported"
+
+
+def _update_facial_summary(
+    summary: Mapping[str, Any] | None,
+    *,
+    field: str,
+    answer: str,
+) -> dict[str, Any]:
+    """Reduce one answer to non-diagnostic, allow-listed staff details."""
+
+    result = _safe_facial_summary(summary)
+    text = str(answer or "").strip()
+    if not text:
+        return result
+    unsure = bool(
+        re.search(
+            r"\b(?:not sure|unsure|don't know|do not know|hard to say)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+    concerns = [
+        label
+        for label, terms in _FACIAL_CONCERN_TERMS.items()
+        if _contains_term(text, terms) and not _negative_for(text, terms)
+    ]
+    feel = [
+        label
+        for label, terms in _SKIN_FEEL_TERMS.items()
+        if _contains_term(text, terms) and not _negative_for(text, terms)
+    ]
+    _append_unique(result["concerns"], concerns)
+    _append_unique(result["skin_feel"], feel)
+
+    breakout_terms = (
+        "acne",
+        "breakout",
+        "breakouts",
+        "pimple",
+        "pimples",
+        "clogged pores",
+    )
+    breakout_status = _reported_status(text, breakout_terms)
+    if unsure and field == "active_breakouts":
+        result["active_breakouts"] = None
+    elif field == "active_breakouts" or breakout_status:
+        result["active_breakouts"] = breakout_status or (
+            "not reported" if _NEGATIVE_RESPONSE_RE.search(text) else "reported"
+        )
+
+    sensitivity_terms = (
+        "sensitive",
+        "sensitivity",
+        "reactive",
+        "red",
+        "redness",
+        "irritate",
+        "irritates",
+        "irritation",
+    )
+    sensitivity_status = _reported_status(text, sensitivity_terms)
+    if unsure and field == "skin_sensitivity":
+        result["sensitivity"] = None
+    elif field == "skin_sensitivity" or sensitivity_status:
+        result["sensitivity"] = sensitivity_status or (
+            "not reported" if _NEGATIVE_RESPONSE_RE.search(text) else "reported"
+        )
+
+    if field == "facial_history":
+        normalized_history = _normalized(text)
+        no_prior = bool(
+            re.search(
+                r"\b(?:no|never|haven't|have not)\b.{0,24}\b(?:facial|facials)\b",
+                text,
+                re.IGNORECASE,
+            )
+            or normalized_history in {"no", "nope", "not yet", "never"}
+            or re.search(
+                r"\b(?:my )?first\s+(?:facial|one|time)\b",
+                normalized_history,
+            )
+        )
+        result["prior_facials"] = (
+            "no" if no_prior else "yes" if _POSITIVE_HISTORY_RE.search(text) else "unclear"
+        )
+        normalized = _normalized(text)
+        for label, terms in _FACIAL_PREFERENCE_TERMS.items():
+            if not _contains_term(text, terms):
+                continue
+            positions = [normalized.find(_normalized(term)) for term in terms]
+            positions = [position for position in positions if position >= 0]
+            position = min(positions) if positions else len(normalized)
+            nearby = normalized[max(0, position - 45):position]
+            if _DISLIKED_RE.search(nearby) or re.search(
+                r"\b(?:no|not|without|harsh)\b", nearby, re.IGNORECASE
+            ):
+                _append_unique(result["avoids"], [label])
+            elif _LIKED_RE.search(text):
+                _append_unique(result["liked"], [label])
+    return result
+
+
+def facial_consultation_staff_note(state: Mapping[str, Any] | None) -> str | None:
+    """Return a bounded staff note containing only allow-listed facial details."""
+
+    if not isinstance(state, Mapping) or state.get("permission_status") != "accepted":
+        return None
+    summary = _safe_facial_summary(state.get("facial_summary"))
+    parts: list[str] = []
+    if summary["concerns"]:
+        parts.append("concerns: " + ", ".join(summary["concerns"]))
+    if summary["skin_feel"]:
+        parts.append("skin feel: " + ", ".join(summary["skin_feel"]))
+    if summary["active_breakouts"]:
+        parts.append("active breakouts: " + summary["active_breakouts"])
+    if summary["sensitivity"]:
+        parts.append("sensitivity/redness/product irritation: " + summary["sensitivity"])
+    if summary["prior_facials"]:
+        parts.append("prior facials: " + summary["prior_facials"])
+    if summary["liked"]:
+        parts.append("liked: " + ", ".join(summary["liked"]))
+    if summary["avoids"]:
+        parts.append("prefers to avoid: " + ", ".join(summary["avoids"]))
+    return "Facial consultation — " + "; ".join(parts) + "." if parts else None
+
+
+def _facial_category_from_summary(summary: Mapping[str, Any] | None) -> str | None:
+    """Choose a broad cosmetic category from polarity-aware safe signals."""
+
+    safe = _safe_facial_summary(summary)
+    concerns = set(safe["concerns"])
+    feel = set(safe["skin_feel"])
+    if safe["sensitivity"] == "reported" or concerns & {"sensitivity", "redness"}:
+        return "calming_barrier_repair"
+    if safe["active_breakouts"] == "reported" or concerns & {
+        "acne",
+        "breakouts",
+        "oiliness",
+        "clogged pores",
+    }:
+        return "acne_clarifying"
+    if concerns & {"dryness", "dullness"} or feel & {"dry", "tight"}:
+        return "hydrating"
+    if concerns & {"aging or fine lines", "uneven tone"}:
+        return "custom"
+    return None
 
 
 def _service_name(service: Mapping[str, Any]) -> str:
@@ -176,6 +461,9 @@ def _safe_prior_state(prior_state: Mapping[str, Any] | None, kind: str) -> dict[
 
     prior = prior_state if isinstance(prior_state, Mapping) else {}
     required = {field for field, _ in REQUIRED_QUESTIONS[kind]}
+    permission_status = str(prior.get("permission_status") or "").strip()
+    if permission_status not in {"accepted", "declined"}:
+        permission_status = ""
     safe: dict[str, Any] = {
         "kind": kind,
         "answered_fields": _clean_string_list(
@@ -207,8 +495,34 @@ def _safe_prior_state(prior_state: Mapping[str, Any] | None, kind: str) -> dict[
         "offered_addon_names": _clean_string_list(
             prior.get("offered_addon_names")
         )[:2],
+        "permission_status": permission_status or None,
+        "facial_summary": (
+            _safe_facial_summary(prior.get("facial_summary"))
+            if kind == FACIAL
+            else {}
+        ),
     }
     return safe
+
+
+def record_consultation_permission(
+    state: Mapping[str, Any], *, accepted: bool
+) -> dict[str, Any]:
+    """Record a caller's answer to the optional facial-question invitation."""
+
+    kind = str(state.get("kind") or "")
+    if kind != FACIAL:
+        raise ValueError("consultation permission applies only to facial consultations")
+    result = _safe_prior_state(state, kind)
+    result["permission_status"] = "accepted" if accepted else "declined"
+    if not accepted:
+        # Declining the optional questions must never prevent an otherwise
+        # valid facial booking.  Mark only the question fields complete; no
+        # answer detail or recommendation category is fabricated.
+        result["answered_fields"] = [
+            field for field, _question in REQUIRED_QUESTIONS[FACIAL]
+        ]
+    return result
 
 
 def _positive_int(value: object) -> int | None:
@@ -320,10 +634,75 @@ def record_consultation_answer(
     category: str | None = None
     if raw and field != "safety_answered":
         if kind == FACIAL:
-            category = classify_facial_need(raw)
+            result["facial_summary"] = _update_facial_summary(
+                result.get("facial_summary"), field=field, answer=raw
+            )
+            category = _facial_category_from_summary(result["facial_summary"])
         else:
             category = classify_massage_need(raw)
     result["category"] = _merge_category(kind, result.get("category"), category)
+    return result
+
+
+def record_volunteered_facial_details(
+    state: Mapping[str, Any], *, caller_utterance: str
+) -> dict[str, Any]:
+    """Credit clear facial details already volunteered in the same turn.
+
+    This prevents Cara from asking about a breakout or sensitivity immediately
+    after the caller just mentioned it.  Only strong allow-listed signals are
+    credited, and the caller's raw wording is discarded.
+    """
+
+    if state.get("kind") != FACIAL:
+        return dict(state)
+    result = _safe_prior_state(state, FACIAL)
+    text = str(caller_utterance or "").strip()
+    if not text:
+        return result
+    fields: list[str] = []
+    if any(
+        _contains_term(text, terms) and not _negative_for(text, terms)
+        for terms in _FACIAL_CONCERN_TERMS.values()
+    ):
+        fields.append("main_concern")
+    if any(_contains_term(text, terms) for terms in _SKIN_FEEL_TERMS.values()):
+        fields.append("skin_feel")
+    breakout_terms = ("acne", "breakout", "breakouts", "pimple", "pimples", "clogged pores")
+    if _contains_term(text, breakout_terms):
+        fields.append("active_breakouts")
+    sensitivity_terms = (
+        "sensitive",
+        "sensitivity",
+        "reactive",
+        "red",
+        "redness",
+        "irritate",
+        "irritates",
+        "irritation",
+    )
+    if _contains_term(text, sensitivity_terms):
+        fields.append("skin_sensitivity")
+    mentions_prior_facial = bool(
+        re.search(
+            r"\b(?:have|had|gotten|received)\b.{0,28}\bfacials?\b|"
+            r"\bfacials?\b.{0,28}\b(?:before|previously|last time)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+    mentions_facial_preference = bool(
+        (_LIKED_RE.search(text) or _DISLIKED_RE.search(text))
+        and any(
+            _contains_term(text, terms)
+            for terms in _FACIAL_PREFERENCE_TERMS.values()
+        )
+    )
+    if mentions_prior_facial or mentions_facial_preference:
+        fields.append("facial_history")
+
+    for field in fields:
+        result = record_consultation_answer(result, field=field, answer=text)
     return result
 
 
@@ -365,16 +744,118 @@ def record_pending_answer(
             "status": "no_pending_question",
             "answered_field": None,
         }
+    if kind == FACIAL:
+        if re.search(
+            r"\b(?:not sure|unsure|don't know|do not know|hard to say)\b",
+            utterance,
+            re.IGNORECASE,
+        ):
+            # Uncertainty is a complete, safe answer to an optional question.
+            # Advance without making the caller repeat it or inferring a fact.
+            result = record_consultation_answer(
+                result,
+                field=pending,
+                answer="unsure",
+            )
+            return {
+                "state": result,
+                "status": "answer_recorded",
+                "answered_field": pending,
+            }
+        if not _facial_answer_recognized(pending, utterance):
+            return {
+                "state": result,
+                "status": "unrecognized_answer",
+                "answered_field": pending,
+            }
     result = record_consultation_answer(
         result,
         field=pending,
         answer=utterance,
     )
+    if kind == FACIAL:
+        result = record_volunteered_facial_details(
+            result, caller_utterance=utterance
+        )
     return {
         "state": result,
         "status": "answer_recorded",
         "answered_field": pending,
     }
+
+
+def _facial_answer_recognized(field: str, utterance: str) -> bool:
+    text = str(utterance or "").strip()
+    if not text:
+        return False
+    if re.search(
+        r"\b(?:repeat (?:that|the question)|say (?:that|the question) again|"
+        r"didn't hear|did not hear|what was the question|come again|pardon)\b",
+        text,
+        re.IGNORECASE,
+    ) or re.fullmatch(r"\s*(?:what|huh|sorry)\s*[?.!]*\s*", text, re.IGNORECASE):
+        return False
+    unsure = bool(
+        re.search(
+            r"\b(?:not sure|unsure|don't know|do not know|hard to say)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+    if unsure:
+        return False
+    normalized = _normalized(text)
+    bare_polar = bool(
+        re.fullmatch(
+            r"(?:yes|yeah|yep|no|nope|none|never|not really|"
+            r"i do|i don't|i do not|i have|i haven't|i have not)",
+            normalized,
+        )
+    )
+    if field == "main_concern":
+        if re.fullmatch(
+            r"(?:what|huh|pardon|sorry|okay|ok|yes|yeah|yep|sure)",
+            normalized,
+        ):
+            return False
+        return bool(
+            normalized in {"no", "none", "nothing", "nothing in particular"}
+            or len(normalized.split()) >= 1
+        )
+    if field == "skin_feel":
+        return any(
+            _contains_term(text, terms) for terms in _SKIN_FEEL_TERMS.values()
+        )
+    if field == "active_breakouts":
+        return bare_polar or _reported_status(
+            text, ("acne", "breakout", "breakouts", "pimple", "pimples", "clogged pores")
+        ) is not None
+    if field == "skin_sensitivity":
+        return bare_polar or _reported_status(
+            text,
+            (
+                "sensitive",
+                "sensitivity",
+                "reactive",
+                "red",
+                "redness",
+                "irritate",
+                "irritates",
+                "irritation",
+                "product",
+                "products",
+            ),
+        ) is not None
+    if field == "facial_history":
+        return bool(
+            bare_polar
+            or re.search(
+                r"\b(?:first|before|previously|last time|have had|had a|had facials?|liked|loved|disliked|did not like|didn't like)\b",
+                text,
+                re.IGNORECASE,
+            )
+        )
+    return True
 
 
 def take_next_question(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -478,6 +959,7 @@ def _duration_offer_text(kind: str, choices: Sequence[Mapping[str, Any]]) -> str
     parts: list[str] = []
     if 30 in by_minutes:
         name = _service_name(by_minutes[30]["service"])
+        name = " ".join(_DURATION_RE.sub("", name, count=1).strip(" -").split()) or name
         benefit = (
             "is a focused start"
             if kind == FACIAL
@@ -486,6 +968,7 @@ def _duration_offer_text(kind: str, choices: Sequence[Mapping[str, Any]]) -> str
         parts.append(f"The 30-minute {name} {benefit}.")
     if 60 in by_minutes:
         name = _service_name(by_minutes[60]["service"])
+        name = " ".join(_DURATION_RE.sub("", name, count=1).strip(" -").split()) or name
         benefit = (
             "gives us more time to target your concern so the results can last longer"
             if kind == FACIAL

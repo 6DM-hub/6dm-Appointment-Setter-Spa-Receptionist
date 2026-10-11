@@ -223,6 +223,17 @@ async def test_earliest_request_runs_one_backend_forward_search_with_no_caller_s
     slots are whatever the fake provider echoed for that range start — never
     a time invented by the model or by a local hours calculation.
     """
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = cls(2026, 10, 12, 12, 0, tzinfo=timezone.utc)
+            return value if tz is None else value.astimezone(tz)
+
+    # Keep the range start away from midnight. Otherwise this test fails for
+    # one real clock hour each day when its echoing fake provider returns a
+    # 23:00 slot whose 60-minute service crosses the fixture's 23:59 close.
+    monkeypatch.setattr(appointment_booking_service, "datetime", _FrozenDateTime)
+
     spa = _spa()
     adapter = SpaBookingAdapter(spa)
     transport = _FakeTransport()

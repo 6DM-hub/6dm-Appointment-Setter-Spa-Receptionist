@@ -54,11 +54,15 @@ from app.services.appointment_booking_service import (
 )
 from app.services.spa_facts import dashboard_facts, lookup_spa_facts
 from app.services.consultation_gate import (
+    FACIAL_PERMISSION_PROMPT,
     availability_gate as consultation_availability_gate,
     infer_consultation_kind,
     initialize_consultation,
+    record_consultation_answer,
+    record_consultation_permission,
     record_duration_selection,
     record_pending_answer,
+    record_volunteered_facial_details,
     take_duration_offer,
     take_massage_addon_offer,
     take_next_question,
@@ -3223,6 +3227,63 @@ class XAIVoiceSession:
         )
 
     @staticmethod
+    def _caller_accepts_consultation_invitation(text: str) -> bool:
+        value = str(text or "").strip()
+        if not value:
+            return False
+        if is_affirmative(value):
+            return True
+        yes_prefixed = bool(
+            re.match(
+                r"^\s*(?:yes|yeah|yep|sure|okay|ok|absolutely|please|go ahead)\b",
+                value,
+                re.IGNORECASE,
+            )
+        )
+        asks_before_answering = bool(
+            "?" in value
+            or re.search(
+                r"\b(?:but|however|wait|first|what|why|how)\b",
+                value,
+                re.IGNORECASE,
+            )
+        )
+        return yes_prefixed and not asks_before_answering
+
+    @staticmethod
+    def _caller_declines_consultation_invitation(text: str) -> bool:
+        value = str(text or "").strip()
+        if re.fullmatch(
+            r"(?:no|nope|nah)(?:\s+(?:thanks|thank you))?\s*[.!]?",
+            value,
+            re.IGNORECASE,
+        ):
+            return True
+        return bool(
+            re.search(
+                r"\b(?:skip (?:the )?(?:skin )?questions?|rather not|prefer not|"
+                r"don't want to answer|do not want to answer|"
+                r"just (?:continue|book|schedule))\b",
+                value,
+                re.IGNORECASE,
+            )
+        )
+
+    @staticmethod
+    def _caller_skips_remaining_consultation(text: str) -> bool:
+        """Recognize an explicit flow opt-out, never a topical bare 'no'."""
+
+        return bool(
+            re.search(
+                r"\b(?:skip (?:the )?(?:skin )?questions?|rather not|prefer not|"
+                r"stop (?:the )?questions?|don't want to answer|"
+                r"do not want to answer|just (?:continue|book|schedule))\b",
+                str(text or ""),
+                re.IGNORECASE,
+            )
+        )
+
+    @staticmethod
     def _apply_consultation_selection(
         args: dict[str, Any], kind: str, state: dict[str, Any]
     ) -> None:
@@ -3282,6 +3343,15 @@ class XAIVoiceSession:
         question_turns = self.session.entities.get("consultation_question_turns")
         if not isinstance(question_turns, dict):
             question_turns = {}
+        answer_attempts = self.session.entities.get("consultation_answer_attempts")
+        if not isinstance(answer_attempts, dict):
+            answer_attempts = {}
+        permission_turns = self.session.entities.get("consultation_permission_turns")
+        if not isinstance(permission_turns, dict):
+            permission_turns = {}
+        permission_attempts = self.session.entities.get("consultation_permission_attempts")
+        if not isinstance(permission_attempts, dict):
+            permission_attempts = {}
         duration_turns = self.session.entities.get("consultation_duration_offer_turns")
         if not isinstance(duration_turns, dict):
             duration_turns = {}
@@ -3300,14 +3370,187 @@ class XAIVoiceSession:
             if state is None:
                 continue
 
+            if kind == "facial" and not state.get("permission_status"):
+                # Credit skin details the caller volunteered in the original
+                # request, but still ask permission before continuing with the
+                # optional questions. Only allow-listed structured signals are
+                # retained; the raw words are discarded by the gate.
+                if kind not in permission_turns:
+                    state = record_volunteered_facial_details(
+                        state, caller_utterance=caller_text
+                    )
+                permission_turn = permission_turns.get(kind)
+                if isinstance(permission_turn, int):
+                    if self._user_turn_count <= permission_turn:
+                        await self._send_function_output(
+                            call_ref,
+                            json.dumps({
+                                "status": "awaiting_consultation_permission",
+                                "available": False,
+                                "booked": False,
+                            }),
+                            nudge=False,
+                        )
+                        return True
+                    accepts_questions = (
+                        self._caller_accepts_consultation_invitation(caller_text)
+                    )
+                    declines_questions = (
+                        not accepts_questions
+                        and self._caller_declines_consultation_invitation(caller_text)
+                    )
+                    if accepts_questions:
+                        state = record_consultation_permission(
+                            state, accepted=True
+                        )
+                        state = record_volunteered_facial_details(
+                            state, caller_utterance=caller_text
+                        )
+                        permission_turns.pop(kind, None)
+                        permission_attempts.pop(kind, None)
+                    elif declines_questions:
+                        state = record_consultation_permission(
+                            state, accepted=False
+                        )
+                        permission_turns.pop(kind, None)
+                        permission_attempts.pop(kind, None)
+                    else:
+                        attempts = int(permission_attempts.get(kind) or 0) + 1
+                        if attempts >= 2:
+                            # An unclear reply must not trap a caller in an
+                            # optional consultation loop. Continue booking.
+                            state = record_consultation_permission(
+                                state, accepted=False
+                            )
+                            permission_turns.pop(kind, None)
+                            permission_attempts.pop(kind, None)
+                        else:
+                            permission_attempts[kind] = attempts
+                            permission_turns[kind] = self._user_turn_count
+                            states[kind] = state
+                            self.session.entities["consultation_state"] = state
+                            self.session.entities["consultation_states"] = states
+                            self.session.entities[
+                                "consultation_permission_turns"
+                            ] = permission_turns
+                            self.session.entities[
+                                "consultation_permission_attempts"
+                            ] = permission_attempts
+                            await self._speak_consultation_gate(
+                                call_ref,
+                                status="consultation_permission_clarification",
+                                spoken=(
+                                    "Would you like to answer a few quick skin "
+                                    "questions, or would you prefer that I continue "
+                                    "with the booking?"
+                                ),
+                            )
+                            return True
+
+                if not state.get("permission_status"):
+                    permission_turns[kind] = self._user_turn_count
+                    states[kind] = state
+                    self.session.entities["consultation_state"] = state
+                    self.session.entities["consultation_states"] = states
+                    self.session.entities[
+                        "consultation_permission_turns"
+                    ] = permission_turns
+                    self.session.entities[
+                        "consultation_permission_attempts"
+                    ] = permission_attempts
+                    await self._speak_consultation_gate(
+                        call_ref,
+                        status="consultation_permission_required",
+                        spoken=FACIAL_PERMISSION_PROMPT,
+                    )
+                    return True
+
+                states[kind] = state
+                self.session.entities["consultation_state"] = state
+                self.session.entities["consultation_states"] = states
+                self.session.entities[
+                    "consultation_permission_turns"
+                ] = permission_turns
+                self.session.entities[
+                    "consultation_permission_attempts"
+                ] = permission_attempts
+
             # A backend-owned question can only be answered by a later caller
             # turn. The model cannot mark fields complete in tool arguments.
             asked_turn = question_turns.get(kind)
             if isinstance(asked_turn, int) and self._user_turn_count > asked_turn:
-                recorded = record_pending_answer(state, caller_utterance=caller_text)
-                state = recorded["state"]
-                if recorded.get("status") == "answer_recorded":
+                if kind == "facial" and self._caller_skips_remaining_consultation(
+                    caller_text
+                ):
+                    state = record_consultation_permission(state, accepted=False)
                     question_turns.pop(kind, None)
+                    answer_attempts.pop(kind, None)
+                else:
+                    recorded = record_pending_answer(
+                        state, caller_utterance=caller_text
+                    )
+                    state = recorded["state"]
+                    if recorded.get("status") == "answer_recorded":
+                        question_turns.pop(kind, None)
+                        answer_attempts.pop(kind, None)
+                    elif recorded.get("status") == "unrecognized_answer":
+                        attempts = int(answer_attempts.get(kind) or 0) + 1
+                        field = str(recorded.get("answered_field") or "")
+                        if attempts >= 2:
+                            # Optional consultation details must never trap the
+                            # booking. Preserve an explicit unknown answer
+                            # without retaining raw words, then move on.
+                            state = record_consultation_answer(
+                                state,
+                                field=field,
+                                answer="unsure",
+                            )
+                            question_turns.pop(kind, None)
+                            answer_attempts.pop(kind, None)
+                        else:
+                            answer_attempts[kind] = attempts
+                            question_turns[kind] = self._user_turn_count
+                            states[kind] = state
+                            self.session.entities["consultation_state"] = state
+                            self.session.entities["consultation_states"] = states
+                            self.session.entities[
+                                "consultation_question_turns"
+                            ] = question_turns
+                            self.session.entities[
+                                "consultation_answer_attempts"
+                            ] = answer_attempts
+                            clarification = {
+                                "main_concern": (
+                                    "What would you most like your esthetician "
+                                    "to focus on?"
+                                ),
+                                "skin_feel": (
+                                    "Would you say your skin feels oily, dry or "
+                                    "tight, combination, or balanced?"
+                                ),
+                                "active_breakouts": (
+                                    "Are you having active breakouts right now: "
+                                    "yes, no, or are you unsure?"
+                                ),
+                                "skin_sensitivity": (
+                                    "Do you notice sensitivity, redness, or "
+                                    "product irritation: yes, no, or are you "
+                                    "unsure?"
+                                ),
+                                "facial_history": (
+                                    "Have you had a facial before, or would this "
+                                    "be your first one?"
+                                ),
+                            }.get(
+                                field,
+                                "Could you tell me a little more about that?",
+                            )
+                            await self._speak_consultation_gate(
+                                call_ref,
+                                status="consultation_answer_clarification",
+                                spoken=clarification,
+                            )
+                            return True
 
             question = take_next_question(state)
             state = question["state"]
@@ -3315,6 +3558,7 @@ class XAIVoiceSession:
             self.session.entities["consultation_state"] = state
             self.session.entities["consultation_states"] = states
             self.session.entities["consultation_question_turns"] = question_turns
+            self.session.entities["consultation_answer_attempts"] = answer_attempts
             if question["status"] == "ask_question":
                 question_turns[kind] = self._user_turn_count
                 self.session.entities["consultation_question_turns"] = question_turns
@@ -3388,7 +3632,14 @@ class XAIVoiceSession:
                 await self._speak_consultation_gate(
                     call_ref,
                     status="duration_options",
-                    spoken=duration["offer"]["text"],
+                    spoken=(
+                        "Thank you. I'll share that skin overview with your "
+                        "esthetician. "
+                        + duration["offer"]["text"]
+                        if kind == "facial"
+                        and state.get("permission_status") == "accepted"
+                        else duration["offer"]["text"]
+                    ),
                 )
                 return True
 
@@ -3520,6 +3771,8 @@ class XAIVoiceSession:
 
         self.session.entities["consultation_completed_kinds"] = sorted(completed)
         self.session.entities["consultation_states"] = states
+        self.session.entities["consultation_permission_turns"] = permission_turns
+        self.session.entities["consultation_permission_attempts"] = permission_attempts
         self.session.entities["consultation_duration_offer_turns"] = duration_turns
         self._restore_consultation_booking_request(args)
         # Apply every completed selection again after restoring the original

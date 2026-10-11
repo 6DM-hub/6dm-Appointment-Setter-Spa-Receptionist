@@ -787,6 +787,15 @@ def _context(
     notes = f"Booked by the AI agent during call {session.call_sid}."
     if guest_name and guest_name.casefold() != (caller_name or "").casefold():
         notes += f" Guest: {guest_name}."
+    consultation_states = session.entities.get("consultation_states")
+    if isinstance(consultation_states, dict):
+        from app.services.consultation_gate import facial_consultation_staff_note
+
+        facial_note = facial_consultation_staff_note(
+            consultation_states.get("facial")
+        )
+        if facial_note:
+            notes += " " + facial_note
     _remember_menu_identity(adapter, session, intent)
     draft = get_draft(session)
     pinned = selected_slot or draft.selected_slot or {}

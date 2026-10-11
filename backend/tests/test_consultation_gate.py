@@ -5,10 +5,12 @@ import pytest
 from app.services.consultation_gate import (
     availability_gate,
     consultation_complete,
+    facial_consultation_staff_note,
     infer_consultation_kind,
     initialize_consultation,
     record_consultation_answer,
     record_pending_answer,
+    record_consultation_permission,
     record_duration_selection,
     take_duration_offer,
     take_massage_addon_offer,
@@ -98,7 +100,7 @@ def test_questions_are_ordered_and_never_repeated_while_awaiting_answer():
     assert second["question"]["field"] == "skin_feel"
 
 
-def test_latest_caller_utterance_answers_only_the_pending_server_owned_field():
+def test_latest_caller_utterance_credits_other_clearly_volunteered_details():
     state = initialize_consultation("facial")
     asked = take_next_question(state)
     recorded = record_pending_answer(
@@ -107,9 +109,9 @@ def test_latest_caller_utterance_answers_only_the_pending_server_owned_field():
 
     assert recorded["status"] == "answer_recorded"
     assert recorded["answered_field"] == "main_concern"
-    assert recorded["state"]["answered_fields"] == ["main_concern"]
+    assert recorded["state"]["answered_fields"] == ["main_concern", "skin_feel"]
     assert recorded["state"]["category"] == "hydrating"
-    assert "dryness" not in json.dumps(recorded["state"]).casefold()
+    assert "mostly dryness and dullness" not in json.dumps(recorded["state"]).casefold()
 
 
 def test_caller_turn_cannot_skip_a_question_that_server_has_not_asked():
@@ -131,10 +133,16 @@ def test_facial_consultation_requires_every_question():
     )
     assert consultation_complete(state) is False
     decision = take_next_question(state)
-    assert decision["question"]["field"] == "skin_flags"
+    assert decision["question"]["field"] == "active_breakouts"
 
     done = record_consultation_answer(
-        decision["state"], field="skin_flags", answer="no sensitivity"
+        decision["state"], field="active_breakouts", answer="no active breakouts"
+    )
+    done = record_consultation_answer(
+        done, field="skin_sensitivity", answer="no sensitivity or redness"
+    )
+    done = record_consultation_answer(
+        done, field="facial_history", answer="no prior facials"
     )
     assert consultation_complete(done) is True
     assert take_next_question(done)["status"] == "complete"
@@ -171,6 +179,93 @@ def test_state_keeps_only_safe_category_not_raw_consultation_answers():
     assert state["category"] == "deeper_pressure_sports"
     assert "muscle tension" not in serialized
     assert "recovery" not in serialized
+
+
+def test_facial_staff_note_contains_only_structured_consented_details():
+    state = initialize_consultation("facial")
+    assert state is not None
+    state = record_consultation_permission(state, accepted=True)
+    state = record_consultation_answer(
+        state,
+        field="main_concern",
+        answer="My exact private wording says dry, dull skin and clogged pores",
+    )
+    state = record_consultation_answer(
+        state,
+        field="skin_feel",
+        answer="Dry and tight by midday",
+    )
+    state = record_consultation_answer(
+        state,
+        field="active_breakouts",
+        answer="I don't have active breakouts",
+    )
+    state = record_consultation_answer(
+        state,
+        field="skin_sensitivity",
+        answer="No redness, but I am sensitive to some products",
+    )
+    state = record_consultation_answer(
+        state,
+        field="facial_history",
+        answer="I've had facials and liked hydration but not harsh exfoliation",
+    )
+
+    note = facial_consultation_staff_note(state)
+
+    assert note is not None
+    assert "dryness" in note
+    assert "dullness" in note
+    assert "clogged pores" in note
+    assert "active breakouts: not reported" in note
+    assert "sensitivity/redness/product irritation: reported" in note
+    assert "liked: gentle hydration" in note
+    assert "prefers to avoid: exfoliation" in note
+    assert "exact private wording" not in note
+
+
+def test_declined_facial_questions_do_not_create_a_staff_note():
+    state = initialize_consultation("facial")
+    assert state is not None
+    state = record_consultation_permission(state, accepted=False)
+
+    assert facial_consultation_staff_note(state) is None
+
+
+def test_negated_sensitivity_does_not_override_a_hydrating_need():
+    state = initialize_consultation("facial")
+    assert state is not None
+    state = record_consultation_answer(
+        state,
+        field="main_concern",
+        answer="My skin is dry and dull, with no sensitivity or redness",
+    )
+
+    assert state["category"] == "hydrating"
+
+
+def test_positive_sensitivity_after_negated_redness_uses_calming_category():
+    state = initialize_consultation("facial")
+    assert state is not None
+    state = record_consultation_answer(
+        state,
+        field="skin_sensitivity",
+        answer="No redness, but I am sensitive to some products",
+    )
+
+    assert state["category"] == "calming_barrier_repair"
+
+
+@pytest.mark.parametrize("answer", ["No", "This is my first facial", "No, this is my first one"])
+def test_first_time_facial_answers_are_structured_as_no_prior_facial(answer):
+    state = initialize_consultation("facial")
+    assert state is not None
+    state = record_consultation_permission(state, accepted=True)
+    state = record_consultation_answer(
+        state, field="facial_history", answer=answer
+    )
+
+    assert state["facial_summary"]["prior_facials"] == "no"
 
 
 def test_explicit_duration_survives_later_model_call_that_omits_it():
@@ -210,7 +305,9 @@ def test_duration_offer_fills_missing_family_duration_from_same_modality():
         [
             ("main_concern", "dullness"),
             ("skin_feel", "dry"),
-            ("skin_flags", "none"),
+                ("active_breakouts", "none"),
+                ("skin_sensitivity", "none"),
+                ("facial_history", "no prior facials"),
         ],
     )
     result = take_duration_offer(
@@ -234,7 +331,9 @@ def test_duration_offer_never_invents_missing_catalog_duration():
         [
             ("main_concern", "uneven tone"),
             ("skin_feel", "balanced"),
-            ("skin_flags", "none"),
+                ("active_breakouts", "none"),
+                ("skin_sensitivity", "none"),
+                ("facial_history", "no prior facials"),
         ],
     )
     result = take_duration_offer(state, services)
@@ -470,7 +569,9 @@ def test_facial_availability_requires_duration_advice_once_but_no_addon_stage():
         [
             ("main_concern", "dull"),
             ("skin_feel", "dry"),
-            ("skin_flags", "none"),
+                ("active_breakouts", "none"),
+                ("skin_sensitivity", "none"),
+                ("facial_history", "no prior facials"),
         ],
     )
     assert availability_gate(state)["status"] == "duration_offer_required"

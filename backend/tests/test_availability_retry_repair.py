@@ -88,7 +88,9 @@ async def test_missing_hold_response_done_releases_verified_availability_once():
         "availability-1",
         json.dumps({"status": "day_part_openings", "spoken": "Three PM is available."}),
     )
-    await asyncio.sleep(0.03)
+    watchdog = v._availability_hold_watchdog_task
+    assert watchdog is not None
+    await asyncio.wait_for(watchdog, timeout=0.5)
 
     assert v._pending_availability_speech is None
     assert v._availability_hold_response_id is None

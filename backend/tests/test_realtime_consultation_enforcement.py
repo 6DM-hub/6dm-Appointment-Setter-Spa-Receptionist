@@ -210,14 +210,22 @@ async def test_facial_questions_and_soft_duration_offer_cannot_be_skipped():
 
     expected_questions = (
         "main thing bothering you",
-        "midday or the end of the day",
-        "breakouts, sensitivity, or redness",
+        "middle of the day",
+        "active breakouts",
+        "sensitivity or redness",
+        "had facials before",
     )
     assert await result._enforce_service_consultation("f-1", args) is True
+    assert "quick questions about your skin" in result._speak_consultation_gate.await_args.kwargs["spoken"]
+
+    caller_says(result, "Yes, please.")
+    assert await result._enforce_service_consultation("f-permission", args) is True
     assert expected_questions[0] in result._speak_consultation_gate.await_args.kwargs["spoken"]
     for answer, expected in (
-        ("My skin looks dull.", expected_questions[1]),
+        ("Fine lines are my main concern.", expected_questions[1]),
         ("Usually dry.", expected_questions[2]),
+        ("No active breakouts.", expected_questions[3]),
+        ("No sensitivity, redness, or irritating products.", expected_questions[4]),
     ):
         caller_says(result, answer)
         assert await result._enforce_service_consultation(
@@ -225,7 +233,7 @@ async def test_facial_questions_and_soft_duration_offer_cannot_be_skipped():
         ) is True
         assert expected in result._speak_consultation_gate.await_args.kwargs["spoken"]
 
-    caller_says(result, "No breakouts, sensitivity, or redness.")
+    caller_says(result, "I've had facials before and like gentle hydration.")
     assert await result._enforce_service_consultation(
         "f-duration", {"requested_services": ["Petite Facial"]}
     ) is True
@@ -283,6 +291,9 @@ def test_new_booking_intent_clears_every_consultation_progress_key():
         "consultation_states": {"massage": {"kind": "massage"}},
         "consultation_completed_kinds": ["massage"],
         "consultation_question_turns": {"facial": 3},
+        "consultation_answer_attempts": {"facial": 1},
+        "consultation_permission_turns": {"facial": 2},
+        "consultation_permission_attempts": {"facial": 1},
         "consultation_duration_offer_turns": {"massage": 5},
         "consultation_addon_pending": {
             "massage": {"turn": 6, "names": ["Hot Stones"]}
@@ -309,7 +320,14 @@ async def test_generic_facial_answers_drive_catalog_family_recommendation():
         "generic-facial-1", {"requested_services": ["facial"]}
     ) is True
     for index, answer in enumerate(
-        ("My skin is dull and dehydrated.", "Dry by midday.", "None of those."),
+        (
+            "Yes, please.",
+            "Dullness is my main concern.",
+            "Dry by midday.",
+            "No active breakouts.",
+            "No sensitivity, redness, or irritating products.",
+            "I've had facials and liked gentle hydration.",
+        ),
         start=2,
     ):
         caller_says(result, answer)
