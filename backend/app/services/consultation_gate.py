@@ -791,6 +791,21 @@ def record_pending_answer(
         result = record_volunteered_facial_details(
             result, caller_utterance=utterance
         )
+    elif kind == MASSAGE and pending == "massage_reason":
+        # "My back and legs are sore" already answers *which areas*.
+        # Ask next about pressure, not the same body parts again. Retain
+        # only the field marker/category, not raw personal health details.
+        body_areas = (
+            "back", "neck", "shoulder", "shoulders", "leg", "legs",
+            "arm", "arms", "hip", "hips", "feet", "foot", "calves",
+            "calf", "hands", "hand", "head", "scalp",
+        )
+        if any(_contains_term(utterance, (area,)) for area in body_areas):
+            result = record_consultation_answer(
+                result,
+                field="massage_areas",
+                answer=utterance,
+            )
     return {
         "state": result,
         "status": "answer_recorded",
