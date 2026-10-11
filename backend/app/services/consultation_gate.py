@@ -113,7 +113,7 @@ _SKIN_FEEL_TERMS: dict[str, tuple[str, ...]] = {
 _FACIAL_PREFERENCE_TERMS: dict[str, tuple[str, ...]] = {
     "extractions": ("extraction", "extractions"),
     "steam": ("steam", "steaming"),
-    "facial massage": ("facial massage", "face massage"),
+    "facial massage": ("facial massage", "face massage", "massaging the face", "massaging my face", "massaging face", "lymphatic drainage", "gua sha"),
     "gentle hydration": ("gentle hydration", "hydration", "hydrating"),
     "exfoliation": ("exfoliation", "exfoliating", "scrub", "scrubs", "peel", "peels"),
     "fragrance": ("fragrance", "fragranced", "scented products"),
@@ -481,6 +481,14 @@ def _safe_prior_state(prior_state: Mapping[str, Any] | None, kind: str) -> dict[
             prior.get("requested_service_name") or ""
         ).strip()
         or None,
+        "recommended_service_name": str(
+            prior.get("recommended_service_name") or ""
+        ).strip() or None,
+        "recommendation_status": (
+            prior.get("recommendation_status")
+            if prior.get("recommendation_status") in {"accepted", "declined"}
+            else None
+        ),
         "requested_duration_minutes": _positive_int(
             prior.get("requested_duration_minutes")
         ),
@@ -596,6 +604,8 @@ def initialize_consultation(
         state["duration_choices"] = []
         state["offered_addon_names"] = []
         state["selected_service_name"] = None
+        state["recommended_service_name"] = None
+        state["recommendation_status"] = None
     return state
 
 
@@ -849,6 +859,9 @@ def _facial_answer_recognized(field: str, utterance: str) -> bool:
     if field == "facial_history":
         return bool(
             bare_polar
+            or (_LIKED_RE.search(text) and any(
+                _contains_term(text, terms) for terms in _FACIAL_PREFERENCE_TERMS.values()
+            ))
             or re.search(
                 r"\b(?:first|before|previously|last time|have had|had a|had facials?|liked|loved|disliked|did not like|didn't like)\b",
                 text,
@@ -911,7 +924,22 @@ def _catalog_service(
     if not wanted:
         return None
     exact = [service for service in services if _normalized(_service_name(service)) == wanted]
-    return exact[0] if len(exact) == 1 else None
+    if len(exact) == 1:
+        return exact[0]
+    # A caller may say "60-minute European Facial" while the configured menu
+    # name is "European Facial" with duration_minutes=60. Match only a unique
+    # duration-compatible service after removing the duration phrase.
+    duration_match = _DURATION_RE.search(str(name or ""))
+    if duration_match is None:
+        return None
+    wanted_base = _normalized(_DURATION_RE.sub(" ", str(name), count=1))
+    wanted_minutes = _duration_minutes(str(name))
+    matches = [
+        service for service in services
+        if _normalized(_DURATION_RE.sub(" ", _service_name(service), count=1)) == wanted_base
+        and _duration_minutes(service) == wanted_minutes
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _duration_options(
@@ -1000,6 +1028,25 @@ def take_duration_offer(
     if result["duration_offer_presented"]:
         return {"state": result, "status": "already_presented", "offer": None}
 
+    # A specific menu treatment already chosen by the caller (or an explicitly
+    # accepted consultation recommendation) is not a request to compare 30 vs
+    # 60 minutes. Never substitute another service from the same duration.
+    selected_name = (
+        result.get("recommended_service_name")
+        if result.get("recommendation_status") == "accepted"
+        else result.get("requested_service_name")
+    )
+    chosen = _catalog_service(services, selected_name)
+    chosen_minutes = _duration_minutes(chosen) if chosen else None
+    if chosen and chosen_minutes:
+        result["duration_offer_presented"] = True
+        result["duration_choices"] = [{
+            "minutes": chosen_minutes, "service_name": _service_name(chosen)
+        }]
+        result["selected_service_name"] = _service_name(chosen)
+        result["selected_duration_minutes"] = chosen_minutes
+        return {"state": result, "status": "selection_preserved", "offer": None}
+
     options = _duration_options(result, services, recommended_service)
     if not options:
         return {"state": result, "status": "no_catalog_options", "offer": None}
@@ -1017,10 +1064,15 @@ def take_duration_offer(
         None,
     )
     if requested_choice:
-        # Presenting both options is advisory.  It must not erase a duration the
-        # caller already supplied unless a later caller turn explicitly changes it.
+        # A requested duration must never select an unrelated first catalog
+        # entry merely because it has the same number of minutes.
+        exact_requested = _catalog_service(services, result.get("requested_service_name"))
         result["selected_duration_minutes"] = requested_choice["minutes"]
-        result["selected_service_name"] = requested_choice["service_name"]
+        result["selected_service_name"] = (
+            _service_name(exact_requested)
+            if exact_requested and _duration_minutes(exact_requested) == requested
+            else requested_choice["service_name"]
+        )
     offer = {
         "kind": kind,
         "choices": result["duration_choices"],
