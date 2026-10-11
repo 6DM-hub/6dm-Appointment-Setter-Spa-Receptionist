@@ -1072,7 +1072,13 @@ def take_duration_offer(
     requested = result.get("requested_duration_minutes")
     chosen = _selected_catalog_service(services, selected_name, requested) if requested else _catalog_service(services, selected_name)
     chosen_minutes = _duration_minutes(chosen) if chosen else None
-    if chosen and chosen_minutes:
+    # A bare, non-unique menu label does not prove which variation the
+    # caller chose. Require unique name, explicit length, or caller evidence.
+    if chosen and chosen_minutes and (
+        _catalog_service(services, selected_name) is not None
+        or duration_from_name(selected_name) is not None
+        or requested_duration_grounded
+    ):
         selected_display = _qualified_selected_name(services, chosen, chosen_minutes)
         result["duration_offer_presented"] = True
         result["duration_choices"] = [{
