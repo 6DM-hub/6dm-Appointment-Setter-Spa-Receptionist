@@ -108,9 +108,10 @@ def test_no_model_only_duration_selected_without_caller_grounding():
     state = _complete_massage("Swedish Massage", minutes=60)
     res = take_duration_offer(state, DUPLICATE_NAME_MENU)
     # A model field alone is not a customer-confirmed choice for ambiguous
-    # duplicate-named variants. Offer menu-grounded durations instead.
-    assert res["status"] == "selection_preserved" or res["status"] == "offer_duration"
-    assert res["state"]["selected_duration_minutes"] == 60
+    # duplicate-named variants. Offer the actual menu choices instead.
+    assert res["status"] == "offer_duration"
+    assert [item["minutes"] for item in res["state"]["duration_choices"]] == [60, 90]
+    assert res["state"]["selected_service_name"] == "60 minute Swedish Massage"
 
 
 def test_name_normalization_does_not_erase_answered_consultation():
