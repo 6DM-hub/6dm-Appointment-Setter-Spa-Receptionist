@@ -29,7 +29,7 @@ PREFERENCE_KEYS = frozenset({
 })
 _REMEMBER_INTENT = re.compile(
     r"\b(?:remember|save (?:that|this|my)|keep (?:that|this|my) on file|"
-    r"my preference is|i (?:usually )?prefer)\b", re.I
+    r"please remember)\b", re.I
 )
 _FORGET_INTENT = re.compile(
     r"\b(?:forget|delete|remove|don't remember|do not remember)\b", re.I
@@ -117,10 +117,10 @@ def _saved_preferences(contact: Contact | None) -> dict[str, str]:
 def _update_preferences(contact: Contact, preferences: dict[str, str]) -> None:
     # Assign a fresh dict so SQLAlchemy tracks JSONB changes reliably.
     meta = dict(contact.extra_metadata or {})
-    meta[MEMORY_KEY] = {
-        "preferences": dict(preferences),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
+    store = dict(meta.get(MEMORY_KEY) or {})
+    store["preferences"] = dict(preferences)
+    store["updated_at"] = datetime.now(timezone.utc).isoformat()
+    meta[MEMORY_KEY] = store
     contact.extra_metadata = meta
 
 
@@ -203,6 +203,7 @@ async def _recent_treatments(
                 AppointmentStatus.CONFIRMED,
                 AppointmentStatus.COMPLETED,
             ]),
+            Appointment.start_time < datetime.now(timezone.utc),
         )
         .order_by(Appointment.start_time.desc())
         .limit(3)
@@ -215,6 +216,108 @@ async def _recent_treatments(
     return names
 
 
+
+def _safe_feedback(message: str, utterance: str) -> str | None:
+    """A deliberately short, non-medical comment volunteered by the caller."""
+    if not isinstance(message, str):
+        return None
+    clean = " ".join(message.strip().split())
+    if not 3 <= len(clean) <= 240:
+        return None
+    if _PRIVATE.search(clean) or re.search(r"(?:\d[ -]?){7,}|@", clean):
+        return None
+    if _norm(clean) not in _norm(utterance):
+        return None
+    return clean
+
+
+async def _latest_previous_visit(
+    db: AsyncSession, session: CallSession, contact: Contact | None
+) -> dict[str, str] | None:
+    if contact is None or session.scope is None:
+        return None
+    result = await db.execute(
+        select(Appointment)
+        .where(
+            scope_filter(session.scope, Appointment),
+            Appointment.contact_id == contact.id,
+            Appointment.status.in_([
+                AppointmentStatus.SCHEDULED,
+                AppointmentStatus.CONFIRMED,
+                AppointmentStatus.COMPLETED,
+            ]),
+            Appointment.start_time < datetime.now(timezone.utc),
+        )
+        .order_by(Appointment.start_time.desc())
+        .limit(1)
+    )
+    appt = result.scalars().first()
+    if appt is None:
+        return None
+    return {
+        "appointment_id": str(appt.id),
+        "service": str(appt.title or ""),
+        "date": appt.start_time.date().isoformat(),
+    }
+
+
+async def _local_contact_for_write(
+    db: AsyncSession, session: CallSession, contact: Contact | None,
+    on_file_name: str
+) -> Contact | None:
+    if contact is not None:
+        return contact
+    scope = session.scope
+    if scope is None or scope.tenant_id is None:
+        return None
+    phone = canonical_customer_phone(
+        session.customer_phone, timezone_name=session.timezone
+    )
+    existing = (
+        await db.execute(
+            select(Contact).where(
+                scope_filter(scope, Contact), Contact.phone_number == phone
+            )
+        )
+    ).scalar_one_or_none()
+    # One local CRM row per tenant/phone. Do not silently overwrite a shared
+    # number belonging to a different person.
+    if existing is not None:
+        return existing if _full_name_match(existing.full_name, on_file_name) else None
+    pieces = on_file_name.split(maxsplit=1)
+    if len(pieces) < 2:
+        return None
+    created = Contact(
+        phone_number=phone,
+        first_name=pieces[0],
+        last_name=pieces[1],
+        **scope_columns(scope, Contact),
+    )
+    db.add(created)
+    await db.flush()
+    return created
+
+
+def _append_visit_feedback(
+    contact: Contact, feedback: str, last_visit: dict[str, str] | None
+) -> None:
+    meta = dict(contact.extra_metadata or {})
+    store = dict(meta.get(MEMORY_KEY) or {})
+    entries = list(store.get("visit_feedback") or [])
+    entries.append({
+        "feedback": feedback,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "appointment_id": last_visit["appointment_id"] if last_visit else None,
+        "verified_visit": bool(last_visit),
+        "service": last_visit["service"] if last_visit else None,
+        "visit_date": last_visit["date"] if last_visit else None,
+    })
+    store["visit_feedback"] = entries[-10:]
+    store["updated_at"] = datetime.now(timezone.utc).isoformat()
+    meta[MEMORY_KEY] = store
+    contact.extra_metadata = meta
+
+
 async def customer_profile_action(
     db: AsyncSession,
     session: CallSession,
@@ -223,6 +326,7 @@ async def customer_profile_action(
     caller_name: str | None = None,
     preference_key: str | None = None,
     preference_value: str | None = None,
+    feedback_text: str | None = None,
 ) -> dict[str, Any]:
     """Lookup, remember, or forget preferences without trusting model claims.
 
@@ -230,7 +334,7 @@ async def customer_profile_action(
     copied into CRM memory. All writes are to an identity-verified contact
     within the current spa.
     """
-    if action not in {"lookup", "remember", "forget"}:
+    if action not in {"lookup", "remember", "forget", "feedback_invite", "feedback_save"}:
         return {"status": "invalid_action", "message": "Please try again."}
     if session.direction != "inbound" or not session.tenant_id:
         return {"status": "unsupported", "message": "This customer lookup is unavailable."}
@@ -264,6 +368,65 @@ async def customer_profile_action(
     session.entities["verified_customer_profile"] = {"name": on_file_name}
     session.entities.pop("awaiting_customer_profile_name", None)
 
+    if action == "feedback_invite":
+        # Asking does not save anything and does not impede a new booking.
+        if session.entities.get("feedback_invited_this_call"):
+            return {
+                "status": "already_invited",
+                "message": "Continue with the caller's current request.",
+            }
+        visit = await _latest_previous_visit(db, session, contact)
+        count = sum(turn.get("role") == "user" for turn in session.history)
+        session.entities["awaiting_visit_feedback"] = {
+            "invited_at_turn": count,
+            "last_visit": visit,
+        }
+        session.entities["feedback_invited_this_call"] = True
+        if visit:
+            return {
+                "status": "feedback_invited",
+                "message": "If you have a moment, how was your last visit with us?",
+                "last_verified_service": visit["service"],
+                "last_verified_date": visit["date"],
+            }
+        return {
+            "status": "feedback_invited",
+            "message": "If you've visited us before, would you like to share how your last experience was?",
+        }
+
+    if action == "feedback_save":
+        pending = session.entities.get("awaiting_visit_feedback")
+        if not isinstance(pending, dict):
+            return {
+                "status": "not_requested",
+                "message": "I can ask for feedback after helping with your appointment.",
+            }
+        count = sum(turn.get("role") == "user" for turn in session.history)
+        if count <= pending.get("invited_at_turn", count):
+            return {"status": "awaiting_answer", "message": "Wait for the caller's reply."}
+        utterance = _last_caller_turn(session)
+        session.entities.pop("awaiting_visit_feedback", None)
+        if re.search(r"\b(?:no thanks|not now|no thank you|skip|rather not)\b", utterance, re.I):
+            return {"status": "declined", "message": "Of course! Is there anything else I can help with?"}
+        clean = _safe_feedback(feedback_text or "", utterance)
+        if clean is None:
+            return {
+                "status": "not_saved",
+                "message": "Thank you for sharing. I couldn't save those details to the general profile.",
+            }
+        local_contact = await _local_contact_for_write(db, session, contact, on_file_name)
+        if local_contact is None:
+            return {
+                "status": "shared_number",
+                "message": "I can't safely attach feedback to that shared-number profile. Staff can help with it.",
+            }
+        _append_visit_feedback(local_contact, clean, pending.get("last_visit"))
+        await db.commit()
+        return {
+            "status": "feedback_saved",
+            "message": "Thank you for the feedback! I'll keep that on file for the spa team.",
+        }
+
     if action == "remember":
         utterance = _last_caller_turn(session)
         if not _REMEMBER_INTENT.search(utterance):
@@ -277,32 +440,12 @@ async def customer_profile_action(
                 "status": "unsupported_preference",
                 "message": "I can remember treatment, staff, time, and non-medical style preferences, but not sensitive personal details.",
             }
+        contact = await _local_contact_for_write(db, session, contact, on_file_name)
         if contact is None:
-            # Square-only customers can acquire a LOCAL, spa-scoped preference
-            # record once they explicitly identify themselves and request it.
-            scope = session.scope
-            phone = canonical_customer_phone(
-                session.customer_phone, timezone_name=session.timezone
-            )
-            # The phone may already belong to a different local contact. Never
-            # replace it with somebody else's Square profile.
-            existing = (
-                await db.execute(select(Contact).where(
-                    scope_filter(scope, Contact), Contact.phone_number == phone
-                ))
-            ).scalar_one_or_none()
-            if existing is not None:
-                return {
-                    "status": "shared_number",
-                    "message": "I can see that number has more than one profile. Staff can help save your preference safely.",
-                }
-            contact = Contact(
-                phone_number=phone, first_name=on_file_name.split()[0],
-                last_name=" ".join(on_file_name.split()[1:]),
-                **scope_columns(scope, Contact),
-            )
-            db.add(contact)
-            await db.flush()
+            return {
+                "status": "shared_number",
+                "message": "That phone number has an identity conflict. Staff can help save your preference safely.",
+            }
         prefs = _saved_preferences(contact)
         prefs[preference_key] = clean
         _update_preferences(contact, prefs)
