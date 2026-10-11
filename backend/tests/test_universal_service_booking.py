@@ -202,6 +202,8 @@ async def test_generic_massage_unmatched_category_requires_actual_menu_choice():
     v = voice()
     v._consultation_catalog = AsyncMock(return_value=(SERVICES, []))
     state = _answered_massage("massage")
+    # No category-grounded recommendation exists for a broad request.
+    state["category"] = None
     v.session.entities["consultation_state"] = state
     v.session.entities["consultation_states"] = {"massage": state}
     caller_says(v, "I'd like a massage on Wednesday at 2:30 PM.")
