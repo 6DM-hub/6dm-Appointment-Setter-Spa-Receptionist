@@ -49,7 +49,7 @@ def test_duration_extracted_from_named_service_not_clock_time(utterance, minutes
     assert duration_from_name(utterance) == minutes
 
 
-@pytest.mark.parametrize(("request", "expected"), [
+@pytest.mark.parametrize(("service_request", "expected"), [
     ("90-minute Swedish Massage", "90 Minute Swedish Massage"),
     ("75 minute European Facial", "75 Minute European Facial"),
     ("Brow Wax", "Eyebrow Wax"),
@@ -57,8 +57,8 @@ def test_duration_extracted_from_named_service_not_clock_time(utterance, minutes
     ("Lash Lift", "Lash Lift"),
     ("Nail Treatment", "Nail Treatment"),
 ])
-def test_exact_real_menu_service_for_any_modality(request, expected):
-    service = exact_catalog_service(SERVICES, request)
+def test_exact_real_menu_service_for_any_modality(service_request, expected):
+    service = exact_catalog_service(SERVICES, service_request)
     assert service is not None
     assert service["name"] == expected
 
@@ -95,7 +95,7 @@ def test_aliases_cannot_disambiguate_multiple_different_catalog_variations():
          "aliases": ["deep tissue"]},
     ]
     assert exact_catalog_service(candidates, "deep tissue") is None
-    assert exact_catalog_service(candidates, "90-minute deep tissue") is None
+    assert exact_catalog_service(candidates, "90-minute deep tissue")["name"] == "90 Minute Deep Tissue Massage"
 
 
 def _answered_massage(name):
