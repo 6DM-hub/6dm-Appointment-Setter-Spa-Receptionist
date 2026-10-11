@@ -22,6 +22,7 @@ from typing import Any
 from app.services.catalog_selection import (
     base_name,
     configured_duration,
+    duration_from_name,
     exact_catalog_service,
     family_variations,
 )
@@ -587,11 +588,21 @@ def initialize_consultation(
         state["requested_duration_minutes"] = explicit_duration
         state["selected_duration_minutes"] = explicit_duration
 
+    same_menu_family = (
+        bool(previous_name and requested_name)
+        and base_name(previous_name) == base_name(requested_name)
+        and (
+            _duration_minutes(requested_name) is None
+            or state.get("selected_duration_minutes") is None
+            or _duration_minutes(requested_name) == state.get("selected_duration_minutes")
+        )
+    )
     if same_kind and requested_name and previous_name and (
         _normalized(requested_name) != _normalized(previous_name)
-    ):
-        # Consultation answers still describe the caller, but any menu offers
-        # were grounded against the previous service and must be rebuilt.
+    ) and not same_menu_family:
+        # Only a genuinely different menu family or changed duration resets
+        # previous offers. An xAI tool spelling the same Swedish Massage as
+        # "60-minute Swedish Massage" must not restart an answered consult.
         state["duration_offer_presented"] = False
         state["addon_offer_presented"] = False
         state["duration_choices"] = []
@@ -916,6 +927,47 @@ def _catalog_service(
     return exact_catalog_service(services, name)
 
 
+def _selected_catalog_service(
+    services: Sequence[Mapping[str, Any]],
+    name: object,
+    minutes: int | None,
+) -> Mapping[str, Any] | None:
+    """Find the uniquely configured variation, even when menu names repeat.
+
+    Providers commonly publish "Swedish Massage" as two entries distinguished
+    only by duration. Looking up the bare name rejects both; the duration
+    already selected by the caller safely disambiguates them.
+    """
+    if not minutes:
+        return None
+    selected = _catalog_service(services, name)
+    if selected is not None and _duration_minutes(selected) == minutes:
+        return selected
+    # Do not duplicate a duration prefix if the original name already has one.
+    base = " ".join(_DURATION_RE.sub(" ", str(name or ""), count=1).split())
+    return _catalog_service(services, f"{minutes} minute {base}") if base else None
+
+
+def _qualified_selected_name(
+    services: Sequence[Mapping[str, Any]],
+    selected: Mapping[str, Any],
+    minutes: int,
+) -> str:
+    """Retain a caller's duration when dashboard entries share their name."""
+    name = _service_name(selected)
+    if duration_from_name(name) is not None:
+        return name
+    # One named service maps to multiple distinct duration variations.
+    same_named = [
+        entry for entry in services
+        if _normalized(_service_name(entry)) == _normalized(name)
+        and _duration_minutes(entry) is not None
+    ]
+    if len({ _duration_minutes(entry) for entry in same_named }) > 1:
+        return f"{minutes} minute {name}"
+    return name
+
+
 def _duration_options(
     state: Mapping[str, Any],
     services: Sequence[Mapping[str, Any]],
@@ -981,8 +1033,9 @@ def take_duration_offer(
     services: Sequence[Mapping[str, Any]],
     *,
     recommended_service: Mapping[str, Any] | str | None = None,
+    requested_duration_grounded: bool = False,
 ) -> dict[str, Any]:
-    """Ground and return the one permitted duration offer for this consultation."""
+    """Ground the duration offer, or honor an already-spoken selection."""
 
     kind = str(state.get("kind") or "")
     if kind not in CONSULTATION_KINDS:
@@ -1001,14 +1054,16 @@ def take_duration_offer(
         if result.get("recommendation_status") == "accepted"
         else result.get("requested_service_name")
     )
-    chosen = _catalog_service(services, selected_name)
+    requested = result.get("requested_duration_minutes")
+    chosen = _selected_catalog_service(services, selected_name, requested) if requested else _catalog_service(services, selected_name)
     chosen_minutes = _duration_minutes(chosen) if chosen else None
     if chosen and chosen_minutes:
+        selected_display = _qualified_selected_name(services, chosen, chosen_minutes)
         result["duration_offer_presented"] = True
         result["duration_choices"] = [{
-            "minutes": chosen_minutes, "service_name": _service_name(chosen)
+            "minutes": chosen_minutes, "service_name": selected_display
         }]
-        result["selected_service_name"] = _service_name(chosen)
+        result["selected_service_name"] = selected_display
         result["selected_duration_minutes"] = chosen_minutes
         return {"state": result, "status": "selection_preserved", "offer": None}
 
@@ -1023,21 +1078,30 @@ def take_duration_offer(
         }
         for choice in options
     ]
-    requested = result.get("requested_duration_minutes")
     requested_choice = next(
         (choice for choice in result["duration_choices"] if choice["minutes"] == requested),
         None,
     )
     if requested_choice:
-        # A requested duration must never select an unrelated first catalog
-        # entry merely because it has the same number of minutes.
-        exact_requested = _catalog_service(services, result.get("requested_service_name"))
-        result["selected_duration_minutes"] = requested_choice["minutes"]
+        # Only this configured family, never the first arbitrary same-length
+        # treatment. Retain a length-qualified name for duplicate menu labels.
+        exact_requested = _selected_catalog_service(
+            services, result.get("requested_service_name"), requested
+        )
+        result["selected_duration_minutes"] = requested
         result["selected_service_name"] = (
-            _service_name(exact_requested)
-            if exact_requested and _duration_minutes(exact_requested) == requested
+            _qualified_selected_name(services, exact_requested, requested)
+            if exact_requested is not None
             else requested_choice["service_name"]
         )
+        if requested_duration_grounded:
+            # The caller already selected this real menu variation on an
+            # earlier turn. There is no reason to repeat the duration offer.
+            return {
+                "state": result,
+                "status": "selection_preserved",
+                "offer": None,
+            }
     offer = {
         "kind": kind,
         "choices": result["duration_choices"],
@@ -1078,7 +1142,14 @@ def record_duration_selection(
             raise ValueError("selected service was not in the grounded catalog offer")
         result["selected_service_name"] = str(selected_service_name).strip()
     elif matching:
-        result["selected_service_name"] = matching[0]["service_name"]
+        chosen = matching[0]["service_name"]
+        distinct_lengths = {
+            choice.get("minutes") for choice in choices
+            if _normalized(choice.get("service_name")) == _normalized(chosen)
+        }
+        if len(distinct_lengths) > 1 and duration_from_name(chosen) is None:
+            chosen = f"{minutes} minute {chosen}"
+        result["selected_service_name"] = chosen
     # A caller changed the duration, so any prior add-on offer was tied to a
     # different variation and may be recomputed once.
     result["addon_offer_presented"] = False
@@ -1105,8 +1176,10 @@ def take_massage_addon_offer(
         return {"state": result, "status": "already_presented", "offer": None}
     selected_name = result.get("selected_service_name")
     selected_minutes = result.get("selected_duration_minutes")
-    selected = _catalog_service(services, selected_name)
-    if not selected or _duration_minutes(selected) != selected_minutes:
+    selected = _selected_catalog_service(
+        services, selected_name, selected_minutes
+    )
+    if selected is None:
         return {"state": result, "status": "duration_not_selected", "offer": None}
 
     signal = _MASSAGE_ADDON_SIGNALS.get(str(result.get("category") or ""), "")
