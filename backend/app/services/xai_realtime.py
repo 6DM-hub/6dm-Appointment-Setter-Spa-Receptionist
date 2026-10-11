@@ -3490,9 +3490,53 @@ class XAIVoiceSession:
                         state, selected_duration_minutes=chosen
                     )
                 except ValueError:
-                    # A model-supplied name cannot expand the allow-listed
-                    # choices. Keep the prior caller-grounded selection.
-                    pass
+                    # An already-selected exact menu entry might have only
+                    # itself in duration_choices. If the caller explicitly
+                    # changes its length, permit a DIFFERENT REAL variation
+                    # of that very same treatment family; never switch to
+                    # another massage/facial simply to find matching minutes.
+                    catalog = self._consultation_catalog_cache
+                    available_services = (
+                        catalog[0]
+                        if isinstance(catalog, tuple)
+                        and catalog
+                        and isinstance(catalog[0], list)
+                        else []
+                    )
+                    selected = exact_catalog_service(
+                        available_services, state.get("selected_service_name")
+                    )
+                    variants = family_variations(
+                        available_services, selected
+                    ) if selected is not None else []
+                    chosen_entries = [
+                        item for item in variants
+                        if configured_duration(item) == chosen
+                    ]
+                    if len(chosen_entries) == 1:
+                        name = str(chosen_entries[0]["name"])
+                        state = dict(state)
+                        state["requested_service_name"] = name
+                        state["requested_duration_minutes"] = chosen
+                        state["selected_service_name"] = name
+                        state["selected_duration_minutes"] = chosen
+                        state["duration_choices"] = [
+                            {"minutes": configured_duration(item),
+                             "service_name": str(item["name"])}
+                            for item in variants
+                        ]
+                        state["duration_offer_presented"] = True
+                        logger.info(
+                            "call %s: caller changed to configured %d-minute %s",
+                            self.call_id, chosen, kind,
+                        )
+                    else:
+                        # Never apply an unoffered or cross-family service
+                        # length based on the model's own tool arguments.
+                        logger.info(
+                            "call %s: ignored unconfigured %d-minute %s change",
+                            self.call_id, chosen, kind,
+                        )
                 states[kind] = state
             self._apply_consultation_selection(args, kind, state)
         self.session.entities["consultation_states"] = states
