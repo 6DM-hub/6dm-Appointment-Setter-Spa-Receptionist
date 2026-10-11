@@ -13,6 +13,12 @@ jobs:
   backend-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Fake local-only Twilio values: avoid loading real secrets or making calls.
+    env:
+      TWILIO_ACCOUNT_SID: AC00000000000000000000000000000000
+      TWILIO_AUTH_TOKEN: test-token-not-a-real-credential
+      TWILIO_PHONE_NUMBER: '+15551234567'
+      TWILIO_VALIDATE_SIGNATURE: 'false'
     defaults:
       run:
         working-directory: backend
