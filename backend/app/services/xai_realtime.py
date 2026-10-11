@@ -3688,6 +3688,68 @@ class XAIVoiceSession:
         args["requested_services"] = updated
         args["service_description"] = " + ".join(updated)
 
+    @staticmethod
+    def _canonicalize_menu_services(
+        args: dict[str, Any], services: list[dict[str, Any]]
+    ) -> None:
+        """Use actual menu entry names for *all* service categories.
+
+        The same provider-backed booking flow still verifies availability
+        before the caller confirms. Ambiguous or unmatched names remain
+        untouched for the booking provider to clarify rather than guessing.
+        """
+        current = XAIVoiceSession._consultation_service_candidates(args)
+        if not current:
+            return
+        chosen = []
+        for name in current:
+            entry = exact_catalog_service(services, name)
+            chosen.append(str(entry["name"]) if entry is not None else name)
+        args["requested_services"] = chosen
+        args["service_description"] = " + ".join(chosen)
+
+    @staticmethod
+    def _spoken_menu_family(
+        services: list[dict[str, Any]], caller_text: str, kind: str
+    ) -> str | None:
+        """Return one menu family explicitly named by the caller, if unique.
+
+        Do not infer a service from an answer about skin or massage pressure.
+        Qualifiers such as 90-minute select that variation only when configured.
+        """
+        utterance = normalized_menu_name(caller_text)
+        if not utterance:
+            return None
+        candidates: dict[str, str] = {}
+        for service in services:
+            if service.get("is_add_on") or infer_consultation_kind(service, services) != kind:
+                continue
+            family = service_family(service)
+            if not family:
+                continue
+            distinctive = [
+                word for word in family.split()
+                if word not in {
+                    "facial", "facials", "massage", "massages",
+                    "minute", "minutes", "service", "treatment",
+                }
+            ]
+            if distinctive and all(
+                re.search(rf"\b{re.escape(word)}\b", utterance)
+                for word in distinctive
+            ):
+                candidates.setdefault(family, family)
+        if len(candidates) != 1:
+            return None
+        family = next(iter(candidates))
+        minutes = XAIVoiceSession._spoken_duration_choice(caller_text)
+        if minutes:
+            exact = exact_catalog_service(services, f"{minutes} minute {family}")
+            if exact is not None:
+                return str(exact["name"])
+            return None
+        return family
+
     async def _enforce_service_consultation(
         self, call_ref: str | None, args: dict[str, Any]
     ) -> bool:
@@ -3712,6 +3774,7 @@ class XAIVoiceSession:
             # refusal; this also keeps isolated guard tests/provider recovery
             # independent from dashboard fixtures.
             return False
+        self._canonicalize_menu_services(args, services)
         candidates = self._consultation_service_candidates(args)
         kinds: list[tuple[str, str]] = []
         for service in candidates:
@@ -3753,6 +3816,9 @@ class XAIVoiceSession:
         addon_pending = self.session.entities.get("consultation_addon_pending")
         if not isinstance(addon_pending, dict):
             addon_pending = {}
+        menu_pending = self.session.entities.get("consultation_menu_choice_pending")
+        if not isinstance(menu_pending, dict):
+            menu_pending = {}
         caller_text = self._last_user_utterance() or ""
 
         for kind, requested_service in kinds:
@@ -3767,6 +3833,65 @@ class XAIVoiceSession:
                 self._apply_consultation_selection(args, kind, state)
                 self._remember_consultation_booking_request(args)
                 continue
+
+            # A general "massage" or "facial" with no category-grounded
+            # menu match needs a treatment choice, not a random same-duration
+            # substitute from a different family. Keep the consultation
+            # answers, date and time intact while the caller chooses.
+            pending_menu = menu_pending.get(kind)
+            if isinstance(pending_menu, dict):
+                if self._user_turn_count <= int(pending_menu.get("turn", self._user_turn_count)):
+                    await self._send_function_output(
+                        call_ref,
+                        json.dumps({
+                            "status": "awaiting_menu_service_choice",
+                            "available": False, "booked": False,
+                        }),
+                        nudge=False,
+                    )
+                    return True
+                picked = self._spoken_menu_family(services, caller_text, kind)
+                if picked is None:
+                    attempts = int(pending_menu.get("attempts") or 0) + 1
+                    if attempts >= 2:
+                        await self._send_function_output(
+                            call_ref,
+                            json.dumps({
+                                "status": "needs_service_clarification",
+                                "available": False, "booked": False,
+                                "message": (
+                                    "I couldn't confirm which menu treatment "
+                                    "you wanted. Nothing has been booked. "
+                                    "Would you like a staff member to help?"
+                                ),
+                            }),
+                            nudge=False,
+                        )
+                        await self._offer_staff_callback()
+                        return True
+                    pending_menu["attempts"] = attempts
+                    pending_menu["turn"] = self._user_turn_count
+                    menu_pending[kind] = pending_menu
+                    self.session.entities["consultation_menu_choice_pending"] = menu_pending
+                    await self._speak_consultation_gate(
+                        call_ref,
+                        status="menu_service_clarification",
+                        spoken="Which treatment from those menu choices would you like?",
+                    )
+                    return True
+                requested_service = picked
+                current = self._consultation_service_candidates(args)
+                for index, item in enumerate(current):
+                    if infer_consultation_kind(item, services) == kind:
+                        current[index] = picked
+                        break
+                args["requested_services"] = current
+                args["service_description"] = " + ".join(current)
+                menu_pending.pop(kind, None)
+                self.session.entities["consultation_menu_choice_pending"] = menu_pending
+                # Clear the original generic "massage"/"facial" before
+                # reinitializing the state against the chosen menu family.
+                self._remember_consultation_booking_request(args)
 
             pending_duration_turn = duration_turns.get(kind)
             if isinstance(pending_duration_turn, int) and (
@@ -4213,6 +4338,27 @@ class XAIVoiceSession:
             states[kind] = state
             self.session.entities["consultation_state"] = state
             self.session.entities["consultation_states"] = states
+            if duration["status"] == "no_catalog_options":
+                options = []
+                for item in services:
+                    if item.get("is_add_on") or infer_consultation_kind(item, services) != kind:
+                        continue
+                    family = service_family(item)
+                    if family and family not in options:
+                        options.append(family)
+                if options:
+                    menu_pending[kind] = {"turn": self._user_turn_count, "attempts": 0}
+                    self.session.entities["consultation_menu_choice_pending"] = menu_pending
+                    await self._speak_consultation_gate(
+                        call_ref,
+                        status="menu_service_required",
+                        spoken=(
+                            "Which " + kind + " would you like: "
+                            + ", or ".join(options[:4])
+                            + ("? I can share more options if you'd like." if len(options) > 4 else "?")
+                        ),
+                    )
+                    return True
             if duration["status"] == "offer_duration":
                 duration_turns[kind] = self._user_turn_count
                 duration_attempts.pop(kind, None)
@@ -4367,6 +4513,7 @@ class XAIVoiceSession:
         self.session.entities["consultation_duration_offer_turns"] = duration_turns
         self.session.entities["consultation_duration_attempts"] = duration_attempts
         self.session.entities["consultation_recommendation_pending"] = recommendation_pending
+        self.session.entities["consultation_menu_choice_pending"] = menu_pending
         self._restore_consultation_booking_request(args)
         # Apply every completed selection again after restoring the original
         # multi-service request, then remember the grounded, final version.
