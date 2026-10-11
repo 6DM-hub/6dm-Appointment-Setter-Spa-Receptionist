@@ -126,11 +126,11 @@ async def test_declining_skin_questions_skips_them_without_blocking_explicit_boo
     caller_says(result, "No thank you, I'd rather just book the facial.")
     continued = await result._enforce_service_consultation("declined", facial_args())
 
-    assert continued is True
-    assert result._speak_consultation_gate.await_count == prompt_count + 1
-    assert "30-minute" in spoken(result)
-    assert "60-minute" in spoken(result)
-    assert "skin" not in spoken(result).casefold()
+    assert continued is False
+    # A declined optional consultation must go straight to availability for
+    # the already selected 60-minute service, not repeat duration choices.
+    assert result._speak_consultation_gate.await_count == prompt_count
+    assert result.session.entities["consultation_states"]["facial"]["selected_service_name"] == "60 Minute Custom Facial"
     state = result.session.entities["consultation_states"]["facial"]
     assert state["permission_status"] == "declined"
 
@@ -269,11 +269,9 @@ async def test_caller_can_skip_remaining_questions_and_continue_booking():
     assert await result._enforce_service_consultation("main-concern", facial_args()) is True
 
     caller_says(result, "Let's skip the questions and just continue booking.")
-    assert await result._enforce_service_consultation("skip", facial_args()) is True
+    assert await result._enforce_service_consultation("skip", facial_args()) is False
 
-    assert "30-minute" in spoken(result)
-    assert "60-minute" in spoken(result)
-    assert "skin" not in spoken(result).casefold()
+    assert result.session.entities["consultation_states"]["facial"]["selected_service_name"] == "60 Minute Custom Facial"
     state = result.session.entities["consultation_states"]["facial"]
     assert state["permission_status"] == "declined"
 
