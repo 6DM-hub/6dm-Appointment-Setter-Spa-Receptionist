@@ -4424,6 +4424,10 @@ class XAIVoiceSession:
                     # This remains limited to one real configured variation.
                     state["requested_duration_minutes"] = grounded_duration
                     state["selected_duration_minutes"] = grounded_duration
+                    logger.info(
+                        "call %s: verified caller-selected %s duration %d minutes before availability",
+                        self.call_id, kind, grounded_duration,
+                    )
             duration = take_duration_offer(
                 state,
                 services,
@@ -4635,6 +4639,17 @@ class XAIVoiceSession:
 
             gate = consultation_availability_gate(state)
             if not gate["allow"]:
+                # Log only FSM metadata, never personal consultation answers.
+                # This makes genuine catalog gaps distinguishable from an
+                # optional add-on gate stuck after duration selection.
+                logger.warning(
+                    "call %s: consultation gate blocked kind=%s status=%s "
+                    "duration=%s duration_offer=%s addon_offer=%s",
+                    self.call_id, kind, gate["status"],
+                    state.get("selected_duration_minutes"),
+                    bool(state.get("duration_offer_presented")),
+                    bool(state.get("addon_offer_presented")),
+                )
                 # Catalog/configuration gaps must not silently bypass the
                 # required flow or invent a service.
                 await self._speak_consultation_gate(
