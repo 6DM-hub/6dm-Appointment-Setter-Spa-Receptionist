@@ -853,7 +853,7 @@ CUSTOMER_PROFILE_TOOL: dict[str, Any] = {
                 "type": "string",
                 "enum": [
                     "favorite_service", "preferred_staff", "preferred_time",
-                    "treatment_style", "all",
+                    "treatment_style", "feedback", "all",
                 ],
             },
             "preference_value": {
