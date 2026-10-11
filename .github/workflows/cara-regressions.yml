@@ -1,0 +1,42 @@
+name: Cara booking and consultation regression tests
+
+on:
+  pull_request:
+    branches:
+      - codex/cara-grok-ara
+    paths:
+      - 'backend/**'
+      - '.github/workflows/cara-regressions.yml'
+  workflow_dispatch:
+
+jobs:
+  backend-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Install backend dependencies
+        run: pip install -r requirements.txt
+      - name: Run booking and consultation regression suite
+        run: |
+          python -m pytest -q \
+            tests/test_cara_facial_booking_regression.py \
+            tests/test_consultation_gate.py \
+            tests/test_realtime_consultation_enforcement.py \
+            tests/test_realtime_facial_permission_flow.py \
+            tests/test_realtime_request_memory.py \
+            tests/test_booking_confirmation_text_recovery.py \
+            tests/test_greeting_once_per_call.py \
+            tests/test_temporal_grounding_backend.py
+      - name: Run complete backend suite
+        run: python -m pytest -q
