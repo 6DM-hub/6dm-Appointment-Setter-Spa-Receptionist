@@ -312,71 +312,71 @@ def test_new_booking_intent_clears_every_consultation_progress_key():
 @pytest.mark.asyncio
 async def test_duration_offer_duplicate_waits_silently_and_selection_survives_tool_name_change():
     result = voice()
-    result._consultation_catalog = AsyncMock(return_value=(FACIAL_SERVICES, []))
-    state = initialize_consultation("facial", services=FACIAL_SERVICES)
+    result._consultation_catalog = AsyncMock(return_value=(CONSULTATIVE_SERVICES, []))
+    state = initialize_consultation("Custom Facial", services=CONSULTATIVE_SERVICES)
     assert state is not None
     state = record_consultation_permission(state, accepted=False)
-    state = take_duration_offer(state, FACIAL_SERVICES)["state"]
+    state = take_duration_offer(state, CONSULTATIVE_SERVICES)["state"]
     caller_says(result, "I would like a facial.")
     result.session.entities.update(
         {
             "consultation_state": state,
             "consultation_states": {"facial": state},
             "consultation_duration_offer_turns": {"facial": result._user_turn_count},
-            "consultation_booking_request": {"requested_services": ["facial"]},
+            "consultation_booking_request": {"requested_services": ["Custom Facial"]},
         }
     )
 
     # A second tool call in the same caller turn must not replay the offer or
     # let the model's catalog name reset the server-owned pending choices.
-    args = {"requested_services": ["European Facial"]}
+    args = {"requested_services": ["60 Minute Custom Facial"]}
     assert await result._enforce_service_consultation("same-turn", args) is True
     assert result._speak_consultation_gate.await_count == 0
-    state = result.session.entities["consultation_states"]["facial"]
+    state = result.session.entities["consultation_states"]["Custom Facial"]
     assert state["duration_offer_presented"] is True
     assert len(state["duration_choices"]) == 2
 
     caller_says(result, "The 60-minute option, please.")
-    args = {"requested_services": ["European Facial"]}
+    args = {"requested_services": ["60 Minute Custom Facial"]}
     assert await result._enforce_service_consultation("duration-answer", args) is False
-    assert args["requested_services"] == ["European Facial"]
-    state = result.session.entities["consultation_states"]["facial"]
+    assert args["requested_services"] == ["60 Minute Custom Facial"]
+    state = result.session.entities["consultation_states"]["Custom Facial"]
     assert state["selected_duration_minutes"] == 60
-    assert state["selected_service_name"] == "European Facial"
-    assert result.session.entities["consultation_completed_kinds"] == ["facial"]
+    assert state["selected_service_name"] == "60 Minute Custom Facial"
+    assert result.session.entities["consultation_completed_kinds"] == ["Custom Facial"]
 
 
 @pytest.mark.asyncio
 async def test_duration_clarification_keeps_pending_latch_for_the_next_valid_answer():
     result = voice()
-    result._consultation_catalog = AsyncMock(return_value=(FACIAL_SERVICES, []))
-    state = initialize_consultation("facial", services=FACIAL_SERVICES)
+    result._consultation_catalog = AsyncMock(return_value=(CONSULTATIVE_SERVICES, []))
+    state = initialize_consultation("Custom Facial", services=CONSULTATIVE_SERVICES)
     assert state is not None
     state = record_consultation_permission(state, accepted=False)
-    state = take_duration_offer(state, FACIAL_SERVICES)["state"]
+    state = take_duration_offer(state, CONSULTATIVE_SERVICES)["state"]
     caller_says(result, "I would like a facial.")
     result.session.entities.update(
         {
             "consultation_state": state,
             "consultation_states": {"facial": state},
             "consultation_duration_offer_turns": {"facial": result._user_turn_count},
-            "consultation_booking_request": {"requested_services": ["facial"]},
+            "consultation_booking_request": {"requested_services": ["Custom Facial"]},
         }
     )
 
     caller_says(result, "How much do the options cost?")
     assert await result._enforce_service_consultation(
-        "duration-clarification", {"requested_services": ["European Facial"]}
+        "duration-clarification", {"requested_services": ["60 Minute Custom Facial"]}
     ) is True
-    assert result.session.entities["consultation_duration_offer_turns"]["facial"] == (
+    assert result.session.entities["consultation_duration_offer_turns"]["Custom Facial"] == (
         result._user_turn_count
     )
 
     caller_says(result, "Sixty minutes, please.")
-    args = {"requested_services": ["European Facial"]}
+    args = {"requested_services": ["60 Minute Custom Facial"]}
     assert await result._enforce_service_consultation("duration-final", args) is False
-    assert args["requested_services"] == ["European Facial"]
-    assert result.session.entities["consultation_states"]["facial"][
+    assert args["requested_services"] == ["60 Minute Custom Facial"]
+    assert result.session.entities["consultation_states"]["Custom Facial"][
         "selected_duration_minutes"
     ] == 60
 
@@ -384,62 +384,62 @@ async def test_duration_clarification_keeps_pending_latch_for_the_next_valid_ans
 @pytest.mark.asyncio
 async def test_completed_facial_choice_ignores_stale_tool_service_and_clock_minutes():
     result = voice()
-    result._consultation_catalog = AsyncMock(return_value=(FACIAL_SERVICES, []))
-    state = initialize_consultation("facial", services=FACIAL_SERVICES)
+    result._consultation_catalog = AsyncMock(return_value=(CONSULTATIVE_SERVICES, []))
+    state = initialize_consultation("Custom Facial", services=CONSULTATIVE_SERVICES)
     assert state is not None
     state = record_consultation_permission(state, accepted=False)
-    state = take_duration_offer(state, FACIAL_SERVICES)["state"]
+    state = take_duration_offer(state, CONSULTATIVE_SERVICES)["state"]
     state = record_duration_selection(state, selected_duration_minutes=60)
     result.session.entities.update(
         {
             "consultation_state": state,
             "consultation_states": {"facial": state},
-            "consultation_completed_kinds": ["facial"],
+            "consultation_completed_kinds": ["Custom Facial"],
             "consultation_booking_request": {
-                "requested_services": ["European Facial"],
-                "service_description": "European Facial",
+                "requested_services": ["60 Minute Custom Facial"],
+                "service_description": "60 Minute Custom Facial",
             },
         }
     )
 
     caller_says(result, "Two thirty PM works for me.")
-    args = {"requested_services": ["Petite Facial"]}
+    args = {"requested_services": ["30 Minute Custom Facial"]}
     assert await result._enforce_service_consultation("stale-service", args) is False
     assert result._speak_consultation_gate.await_count == 0
-    assert args["requested_services"] == ["European Facial"]
+    assert args["requested_services"] == ["60 Minute Custom Facial"]
     remembered = result.session.entities["consultation_booking_request"]
-    assert remembered["requested_services"] == ["European Facial"]
-    state = result.session.entities["consultation_states"]["facial"]
+    assert remembered["requested_services"] == ["60 Minute Custom Facial"]
+    state = result.session.entities["consultation_states"]["Custom Facial"]
     assert state["selected_duration_minutes"] == 60
 
 
 @pytest.mark.asyncio
 async def test_completed_facial_allows_an_explicit_caller_duration_change():
     result = voice()
-    result._consultation_catalog = AsyncMock(return_value=(FACIAL_SERVICES, []))
-    state = initialize_consultation("facial", services=FACIAL_SERVICES)
+    result._consultation_catalog = AsyncMock(return_value=(CONSULTATIVE_SERVICES, []))
+    state = initialize_consultation("Custom Facial", services=CONSULTATIVE_SERVICES)
     assert state is not None
     state = record_consultation_permission(state, accepted=False)
-    state = take_duration_offer(state, FACIAL_SERVICES)["state"]
+    state = take_duration_offer(state, CONSULTATIVE_SERVICES)["state"]
     state = record_duration_selection(state, selected_duration_minutes=60)
     result.session.entities.update(
         {
             "consultation_state": state,
             "consultation_states": {"facial": state},
-            "consultation_completed_kinds": ["facial"],
+            "consultation_completed_kinds": ["Custom Facial"],
             "consultation_booking_request": {
-                "requested_services": ["European Facial"]
+                "requested_services": ["60 Minute Custom Facial"]
             },
         }
     )
 
     caller_says(result, "Actually, change that to the 30-minute facial.")
-    args = {"requested_services": ["Petite Facial"]}
+    args = {"requested_services": ["30 Minute Custom Facial"]}
     assert await result._enforce_service_consultation("caller-change", args) is False
-    assert args["requested_services"] == ["Petite Facial"]
+    assert args["requested_services"] == ["30 Minute Custom Facial"]
     remembered = result.session.entities["consultation_booking_request"]
-    assert remembered["requested_services"] == ["Petite Facial"]
-    state = result.session.entities["consultation_states"]["facial"]
+    assert remembered["requested_services"] == ["30 Minute Custom Facial"]
+    state = result.session.entities["consultation_states"]["Custom Facial"]
     assert state["selected_duration_minutes"] == 30
 
 
@@ -449,7 +449,7 @@ async def test_completed_multi_service_duration_change_is_scoped_to_named_modali
     result._consultation_catalog = AsyncMock(
         return_value=(CONSULTATIVE_SERVICES, MASSAGE_UPSELL_RULES)
     )
-    facial = initialize_consultation("facial", services=CONSULTATIVE_SERVICES)
+    facial = initialize_consultation("Custom Facial", services=CONSULTATIVE_SERVICES)
     assert facial is not None
     facial = record_consultation_permission(facial, accepted=False)
     facial = take_duration_offer(facial, CONSULTATIVE_SERVICES)["state"]
