@@ -3808,6 +3808,10 @@ class XAIVoiceSession:
         wanted = base_name(requested_service)
         if not wanted:
             return None
+        # Square can list "Massage - Swedish 60 Minutes" while callers say
+        # "Swedish massage". Family words, not display order, determine
+        # whether a later service request supersedes the earlier duration.
+        wanted_words = tuple(sorted(wanted.split()))
         requests = self.session.entities.get("consultation_booking_request") or {}
         requested_items = requests.get("requested_services") or []
         if len(requested_items) > 1:
@@ -3819,7 +3823,7 @@ class XAIVoiceSession:
                 continue
             spoken = str(turn.get("content") or "")
             named = self._spoken_menu_family(services, spoken, kind)
-            if named is not None and base_name(named) != wanted:
+            if named is not None and tuple(sorted(base_name(named).split())) != wanted_words:
                 break
             minutes = self._spoken_duration_choice(spoken)
             if minutes is not None:
