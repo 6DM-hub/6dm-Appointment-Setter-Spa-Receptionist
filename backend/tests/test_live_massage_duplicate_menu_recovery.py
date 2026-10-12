@@ -24,6 +24,7 @@ from app.services.consultation_gate import (
     take_massage_addon_offer,
 )
 from tests.test_realtime_consultation_enforcement import caller_says, voice
+from tests.test_swedish_catalog_order import MENU as SQUARE_CATEGORY_FIRST_MENU
 
 
 DUPLICATE_NAME_MENU = [
@@ -230,3 +231,67 @@ def test_volunteered_back_and_leg_areas_are_not_asked_twice():
     assert next_question["awaiting_field"] == "pressure_preference"
     # No raw caller health details should be copied into state.
     assert "my back and legs are sore" not in str(answered["state"]).lower()
+
+
+
+@pytest.mark.parametrize("requested_service", [
+    "Swedish massage",
+    "Massage - Swedish 60 Minutes",
+    "60-minute Swedish massage",
+])
+def test_remembers_early_duration_with_square_category_first_names(requested_service):
+    """The October 12 Square catalog import displays the category first."""
+    v = voice()
+    caller_says(v, "I'd like a Swedish massage.")
+    caller_says(v, "Let's do 60 minutes.")
+    caller_says(v, "My back and legs are sore.")
+    assert v._caller_grounded_consultation_duration(
+        "massage", requested_service, SQUARE_CATEGORY_FIRST_MENU
+    ) == 60
+
+
+def test_recovered_duration_selects_actual_square_variation_not_couples_or_mat():
+    state = _complete_massage("Swedish Massage", 60)
+    result = take_duration_offer(
+        state, SQUARE_CATEGORY_FIRST_MENU,
+        requested_duration_grounded=True,
+    )
+    assert result["status"] == "selection_preserved"
+    assert result["state"]["selected_service_name"] == "Massage - Swedish 60 Minutes"
+    assert result["state"]["selected_duration_minutes"] == 60
+    addons = take_massage_addon_offer(
+        result["state"], SQUARE_CATEGORY_FIRST_MENU, []
+    )
+    assert addons["status"] == "no_relevant_addons"
+    assert availability_gate(addons["state"])["allow"] is True
+
+
+@pytest.mark.asyncio
+async def test_category_first_square_menu_reaches_booking_handoff_without_reask():
+    v = voice()
+    v._consultation_catalog = AsyncMock(return_value=(SQUARE_CATEGORY_FIRST_MENU, []))
+    caller_says(v, "I'd like a Swedish massage.")
+    caller_says(v, "Let's do the 60-minute massage.")
+    args = {
+        "service_description": "60 minute Swedish massage",
+        "requested_start_iso": "2026-10-14T14:30:00",
+    }
+    assert await v._enforce_service_consultation("reason", args) is True
+    caller_says(v, "My back and legs are sore.")
+    assert await v._enforce_service_consultation("pressure", {
+        "service_description": "Swedish massage",
+    }) is True
+    assert v._speak_consultation_gate.await_args.kwargs["status"] == "consultation_question"
+    assert "pressure" in v._speak_consultation_gate.await_args.kwargs["spoken"].lower()
+    caller_says(v, "Medium pressure.")
+    assert await v._enforce_service_consultation("safety", {
+        "service_description": "Swedish massage",
+    }) is True
+    caller_says(v, "No injuries.")
+    final_args = {"service_description": "Swedish massage"}
+    count = v._speak_consultation_gate.await_count
+    assert await v._enforce_service_consultation("availability", final_args) is False
+    assert v._speak_consultation_gate.await_count == count
+    assert final_args["requested_services"] == ["Massage - Swedish 60 Minutes"]
+    assert final_args["requested_start_iso"] == "2026-10-14T14:30:00"
+    assert v.session.booking_status not in {"booked", "rescheduled"}
