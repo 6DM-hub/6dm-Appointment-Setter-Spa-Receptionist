@@ -281,7 +281,7 @@ async def test_category_first_square_menu_reaches_booking_handoff_without_reask(
     assert await v._enforce_service_consultation("pressure", {
         "service_description": "Swedish massage",
     }) is True
-    assert v._speak_consultation_gate.await_args.kwargs["status"] == "consultation_question"
+    assert v._speak_consultation_gate.await_args.kwargs["status"] == "consultation_required"
     assert "pressure" in v._speak_consultation_gate.await_args.kwargs["spoken"].lower()
     caller_says(v, "Medium pressure.")
     assert await v._enforce_service_consultation("safety", {
