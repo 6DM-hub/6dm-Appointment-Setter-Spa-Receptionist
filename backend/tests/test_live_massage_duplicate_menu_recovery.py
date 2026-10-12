@@ -295,3 +295,46 @@ async def test_category_first_square_menu_reaches_booking_handoff_without_reask(
     assert final_args["requested_services"] == ["Massage - Swedish 60 Minutes"]
     assert final_args["requested_start_iso"] == "2026-10-14T14:30:00"
     assert v.session.booking_status not in {"booked", "rescheduled"}
+
+
+
+def test_square_category_first_alias_does_not_reset_completed_massage_questions():
+    state = _complete_massage("Swedish Massage", 60)
+    state = take_duration_offer(
+        state, SQUARE_CATEGORY_FIRST_MENU, requested_duration_grounded=True
+    )["state"]
+    state = take_massage_addon_offer(state, SQUARE_CATEGORY_FIRST_MENU, [])["state"]
+    assert availability_gate(state)["allow"] is True
+    from app.services.consultation_gate import initialize_consultation
+
+    updated = initialize_consultation(
+        "Massage - Swedish 60 Minutes",
+        services=SQUARE_CATEGORY_FIRST_MENU,
+        prior_state=state,
+    )
+    assert updated is not None
+    assert updated["duration_offer_presented"] is True
+    assert updated["addon_offer_presented"] is True
+    assert updated["selected_duration_minutes"] == 60
+    assert len(updated["answered_fields"]) == 4
+    assert availability_gate(updated)["allow"] is True
+
+
+def test_changing_from_swedish_to_sports_does_reset_previous_massage_offer():
+    state = _complete_massage("Swedish Massage", 60)
+    state = take_duration_offer(
+        state, SQUARE_CATEGORY_FIRST_MENU, requested_duration_grounded=True
+    )["state"]
+    state = take_massage_addon_offer(state, SQUARE_CATEGORY_FIRST_MENU, [])["state"]
+    from app.services.consultation_gate import initialize_consultation
+
+    updated = initialize_consultation(
+        "Massage - Sports 60 Minutes",
+        services=SQUARE_CATEGORY_FIRST_MENU + [
+            {"name": "Massage - Sports 60 Minutes", "duration_minutes": 60}
+        ],
+        prior_state=state,
+    )
+    assert updated is not None
+    assert updated["duration_offer_presented"] is False
+    assert updated["addon_offer_presented"] is False
