@@ -69,7 +69,7 @@ from app.services.consultation_gate import (
     take_next_question,
 )
 from app.services.catalog_selection import (
-    configured_duration, duration_from_name, exact_catalog_service,
+    base_name, configured_duration, duration_from_name, exact_catalog_service,
     family_variations, normalized as normalized_menu_name, service_family,
 )
 from app.services.service_consultation import configured_service_for_category
@@ -3794,6 +3794,51 @@ class XAIVoiceSession:
             return None
         return family
 
+    def _caller_grounded_consultation_duration(
+        self, kind: str, requested_service: str, services: list[dict[str, Any]]
+    ) -> int | None:
+        """Recover a duration selected *before* the massage consultation.
+
+        The caller may choose "Swedish massage", answer "let's do 60-minute",
+        then answer several consultation questions before the first tool call.
+        Realtime tool arguments are model output; use actual caller turns.
+        Stop at a newer different treatment-family selection to avoid
+        carrying a prior appointment's duration into another service.
+        """
+        wanted = base_name(requested_service)
+        if not wanted:
+            return None
+        # Square can list "Massage - Swedish 60 Minutes" while callers say
+        # "Swedish massage". Family words, not display order, determine
+        # whether a later service request supersedes the earlier duration.
+        wanted_words = tuple(sorted(wanted.split()))
+        requests = self.session.entities.get("consultation_booking_request") or {}
+        requested_items = requests.get("requested_services") or []
+        if len(requested_items) > 1:
+            # A bare "60-minute" cannot unambiguously identify one item in a
+            # combined multi-service appointment.
+            return None
+        for turn in reversed(self.session.history):
+            if turn.get("role") != "user":
+                continue
+            spoken = str(turn.get("content") or "")
+            named = self._spoken_menu_family(services, spoken, kind)
+            if named is not None and tuple(sorted(base_name(named).split())) != wanted_words:
+                break
+            minutes = self._spoken_duration_choice(spoken)
+            if minutes is not None:
+                candidate = exact_catalog_service(
+                    services, f"{minutes} minute {wanted}"
+                )
+                if candidate is not None and configured_duration(candidate) == minutes:
+                    return minutes
+                return None
+            if named is not None:
+                # The latest family was named without a length. Do not borrow
+                # a duration from an earlier, potentially unrelated choice.
+                break
+        return None
+
     async def _enforce_service_consultation(
         self, call_ref: str | None, args: dict[str, Any]
     ) -> bool:
@@ -4373,10 +4418,28 @@ class XAIVoiceSession:
                     category=state.get("category"),
                     service_kind=kind,
                 )
+            grounded_duration = None
+            if not state.get("duration_offer_presented"):
+                grounded_duration = self._caller_grounded_consultation_duration(
+                    kind, str(state.get("requested_service_name") or requested_service), services
+                )
+                if grounded_duration is not None:
+                    # Caller evidence outranks a stale/missing model duration.
+                    # This remains limited to one real configured variation.
+                    state["requested_duration_minutes"] = grounded_duration
+                    state["selected_duration_minutes"] = grounded_duration
+                    logger.info(
+                        "call %s: verified caller-selected %s duration %d minutes before availability",
+                        self.call_id, kind, grounded_duration,
+                    )
             duration = take_duration_offer(
                 state,
                 services,
                 recommended_service=recommended_service,
+                requested_duration_grounded=(
+                    grounded_duration is not None
+                    and state.get("requested_duration_minutes") == grounded_duration
+                ),
             )
             state = duration["state"]
             states[kind] = state
@@ -4580,6 +4643,17 @@ class XAIVoiceSession:
 
             gate = consultation_availability_gate(state)
             if not gate["allow"]:
+                # Log only FSM metadata, never personal consultation answers.
+                # This makes genuine catalog gaps distinguishable from an
+                # optional add-on gate stuck after duration selection.
+                logger.warning(
+                    "call %s: consultation gate blocked kind=%s status=%s "
+                    "duration=%s duration_offer=%s addon_offer=%s",
+                    self.call_id, kind, gate["status"],
+                    state.get("selected_duration_minutes"),
+                    bool(state.get("duration_offer_presented")),
+                    bool(state.get("addon_offer_presented")),
+                )
                 # Catalog/configuration gaps must not silently bypass the
                 # required flow or invent a service.
                 await self._speak_consultation_gate(
