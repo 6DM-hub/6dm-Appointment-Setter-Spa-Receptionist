@@ -590,7 +590,8 @@ def initialize_consultation(
 
     same_menu_family = (
         bool(previous_name and requested_name)
-        and base_name(previous_name) == base_name(requested_name)
+        and tuple(sorted(base_name(previous_name).split()))
+            == tuple(sorted(base_name(requested_name).split()))
         and (
             _duration_minutes(requested_name) is None
             or state.get("selected_duration_minutes") is None
