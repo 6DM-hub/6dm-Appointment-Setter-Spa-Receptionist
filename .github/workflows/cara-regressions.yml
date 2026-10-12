@@ -40,6 +40,7 @@ jobs:
             tests/test_cara_facial_booking_regression.py \
             tests/test_cara_customer_memory.py \
             tests/test_universal_service_booking.py \
+            tests/test_live_massage_duplicate_menu_recovery.py \
             tests/test_consultation_gate.py \
             tests/test_realtime_consultation_enforcement.py \
             tests/test_realtime_facial_permission_flow.py \
