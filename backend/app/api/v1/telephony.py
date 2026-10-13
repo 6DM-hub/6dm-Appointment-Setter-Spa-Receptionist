@@ -128,6 +128,89 @@ def _authoritative_reply(session: CallSession, reply: str) -> str:
     return reply
 
 
+def _note_gratuity_discussion(session: CallSession, utterance: str | None) -> None:
+    """Prevent the legacy voice path from repeating a policy it just answered."""
+    from app.services.gratuity import mentions_gratuity
+
+    if mentions_gratuity(utterance):
+        session.entities["gratuity_discussed"] = True
+
+
+def _with_gratuity_reminder(session: CallSession, reply: str, result: object | None) -> str:
+    """Apply the same verified reminder policy to the legacy Twilio voice path."""
+    from app.services.gratuity import (
+        AFTER_BOOKING_CONFIRMATION,
+        DURING_CLOSING,
+        booking_card_allows_reminder,
+        fee_may_be_spoken,
+        normalize_gratuity_policy,
+        reminder_message,
+    )
+
+    entities = session.entities
+    policy = normalize_gratuity_policy(entities.get("gratuity_policy"))
+    outcome = getattr(result, "outcome", None)
+    appointment = getattr(result, "appointment", None)
+    external_id = getattr(appointment, "external_booking_id", None)
+    successful = (
+        outcome in {BookingOutcome.BOOKED, BookingOutcome.RESCHEDULED}
+        and appointment is not None
+        and external_id
+        and booking_card_allows_reminder(getattr(appointment, "card_status", None))
+    )
+
+    if (
+        successful
+        and not entities.get("gratuity_reminder_spoken")
+        and not entities.get("gratuity_discussed")
+    ):
+        key = f"{external_id}:{session.confirmed_datetime or ''}"
+        message = reminder_message(policy, selection_key=key)
+        if message and policy.get("timing") == DURING_CLOSING:
+            entities["pending_gratuity_reminder"] = {
+                "confirmation_key": key,
+                "message": message,
+                "fee_included": fee_may_be_spoken(policy),
+            }
+        elif message and policy.get("timing") == AFTER_BOOKING_CONFIRMATION:
+            entities["gratuity_reminder_spoken"] = True
+            entities.pop("pending_gratuity_reminder", None)
+            question = re.search(
+                r"\s*is there anything else i can help you with today\?\s*$",
+                reply,
+                re.IGNORECASE,
+            )
+            if question:
+                reply = reply[: question.start()].rstrip() + " " + message + " " + question.group().strip()
+            else:
+                reply = reply.rstrip() + " " + message
+            logger.info(
+                "call %s: gratuity reminder spoken timing=%s fee_included=%s",
+                session.call_sid,
+                AFTER_BOOKING_CONFIRMATION,
+                fee_may_be_spoken(policy),
+            )
+
+    pending = entities.get("pending_gratuity_reminder")
+    if (
+        isinstance(pending, dict)
+        and pending.get("message")
+        and not entities.get("gratuity_reminder_spoken")
+        and not entities.get("gratuity_discussed")
+        and _is_closing_reply(reply)
+    ):
+        entities.pop("pending_gratuity_reminder", None)
+        entities["gratuity_reminder_spoken"] = True
+        reply = str(pending["message"]).strip() + " " + reply.lstrip()
+        logger.info(
+            "call %s: gratuity reminder spoken timing=%s fee_included=%s",
+            session.call_sid,
+            DURING_CLOSING,
+            bool(pending.get("fee_included")),
+        )
+    return reply
+
+
 def _authoritative_availability_reply(session: CallSession, reply: str) -> str:
     """Availability-side counterpart to `_authoritative_reply`.
 
@@ -637,6 +720,7 @@ async def voice_respond(
     session.entities["retry_count"] = 0
     turn_started_at = time.perf_counter()
     session.add_turn("user", SpeechResult)
+    _note_gratuity_discussion(session, SpeechResult)
 
     # Structured extraction + booking BEFORE the agent replies.
     #
@@ -710,6 +794,7 @@ async def voice_respond(
     )
     reply = _authoritative_reply(session, reply)
     reply = _authoritative_availability_reply(session, reply)
+    reply = _with_gratuity_reminder(session, reply, result)
     session.add_turn("assistant", reply)
     # If the agent just recited the details and asked for the go-ahead, the
     # caller's next "yes" is consent to those exact details — and only then.

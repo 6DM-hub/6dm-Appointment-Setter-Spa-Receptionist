@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.models.spa_account import BookingProvider, VoiceEngine
 from app.schemas.common import ORMModel
@@ -89,6 +89,63 @@ class SpaUpsellRule(BaseModel):
     allowed_upsells: list[str] = Field(default_factory=list)
 
 
+class SpaGratuityPolicy(BaseModel):
+    """Caller-facing gratuity reminder settings for one spa tenant.
+
+    This configuration never applies a payment fee.  `fee_verified` is the
+    business owner's attestation that its processor setup and applicable law
+    permit Cara to describe the configured fee.
+    """
+
+    enabled: bool = False
+    cash_preferred: bool = True
+    card_processing_fee_percent: float = Field(4.0, ge=0, le=4)
+    fee_verified: bool = False
+    timing: Literal[
+        "after_booking_confirmation", "during_closing", "disabled"
+    ] = "after_booking_confirmation"
+    custom_message: str | None = Field(None, max_length=1200)
+    use_voice_personality: bool = True
+
+    @field_validator("custom_message", mode="before")
+    @classmethod
+    def normalize_custom_message(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        cleaned = str(value).strip()
+        return cleaned or None
+
+    @model_validator(mode="after")
+    def validate_fee_attestation(self):
+        from app.services.gratuity import custom_message_violation
+
+        active = self.enabled and self.timing != "disabled"
+        if active and self.card_processing_fee_percent > 0 and not self.fee_verified:
+            raise ValueError(
+                "verify the processor and applicable-law basis before enabling a "
+                "card gratuity processing fee"
+            )
+        custom = self.custom_message or ""
+        violation = (
+            custom_message_violation(custom, self.model_dump())
+            if active and custom
+            else None
+        )
+        if violation == "mandatory":
+            raise ValueError(
+                "custom gratuity message must not imply that tipping is required"
+            )
+        if violation == "unverified_fee":
+            raise ValueError(
+                "custom gratuity message cannot mention an unverified card fee"
+            )
+        if violation == "mismatched_fee":
+            raise ValueError(
+                "custom gratuity message percentage must match the configured fee"
+            )
+        return self
+
+
 class SpaPaymentPolicy(BaseModel):
     """Booking CC configuration: whether a card is required, and how.
 
@@ -103,6 +160,7 @@ class SpaPaymentPolicy(BaseModel):
     card_required: bool = False
     collection_mode: str = "none"
     script: str | None = Field(None, max_length=1000)
+    gratuity: SpaGratuityPolicy = Field(default_factory=SpaGratuityPolicy)
 
     @field_validator("collection_mode")
     @classmethod

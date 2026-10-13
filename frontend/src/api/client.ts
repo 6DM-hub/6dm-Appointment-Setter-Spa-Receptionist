@@ -273,8 +273,17 @@ export interface SpaAccount {
   upsell_rules: { base_service: string; allowed_upsells: string[] }[];
   payment_policy: {
     card_required: boolean;
-    collection_mode: "none" | "at_spa" | "square_link" | "secure_sms_link";
+    collection_mode: "none" | "at_spa" | "square_link" | "secure_voice_card" | "secure_sms_link";
     script?: string | null;
+    gratuity?: {
+      enabled: boolean;
+      cash_preferred: boolean;
+      card_processing_fee_percent: number;
+      fee_verified: boolean;
+      timing: "after_booking_confirmation" | "during_closing" | "disabled";
+      custom_message?: string | null;
+      use_voice_personality: boolean;
+    };
   };
 }
 

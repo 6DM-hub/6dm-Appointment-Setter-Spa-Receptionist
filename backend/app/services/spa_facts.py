@@ -10,6 +10,11 @@ from typing import Any
 
 from app.models.spa_account import SpaAccount
 from app.services.business_hours import describe_business_hours
+from app.services.gratuity import (
+    fee_may_be_spoken,
+    gratuity_policy_of,
+    gratuity_question_answer,
+)
 from app.services.service_consultation import facial_consultation, massage_consultation
 from app.services.truth_log import truth
 
@@ -103,6 +108,7 @@ def dashboard_facts(spa: SpaAccount) -> dict[str, Any]:
         "booking_policies": _as_dict(getattr(spa, "booking_policies", None)),
         "upsell_rules": _as_list(getattr(spa, "upsell_rules", None)),
         "payment_policy": payment_policy_of(spa),
+        "gratuity_policy": gratuity_policy_of(spa),
         "services": services,
         "hours_text": hours if hours_configured else None,
         "dashboard_timezone": spa.timezone,
@@ -303,6 +309,32 @@ async def lookup_spa_facts(
 
     upsells = matching_upsells(facts["upsell_rules"], service_name)
     payment = facts["payment_policy"]
+    gratuity = facts["gratuity_policy"]
+    gratuity_fee_is_speakable = fee_may_be_spoken(gratuity)
+    # This payload is sent to the language model. Never expose raw custom copy
+    # or an unverified percentage that the model could accidentally repeat.
+    caller_safe_gratuity = {
+        "enabled": bool(gratuity.get("enabled")),
+        "cash_preferred": (
+            bool(gratuity.get("cash_preferred"))
+            if gratuity.get("enabled")
+            else None
+        ),
+        "card_processing_fee_percent": (
+            gratuity.get("card_processing_fee_percent")
+            if gratuity_fee_is_speakable
+            else None
+        ),
+        "fee_verified": gratuity_fee_is_speakable,
+        "timing": gratuity.get("timing"),
+    }
+    # payment_policy stores gratuity settings in the same JSON document for the
+    # dashboard, but the model must receive only the sanitized view above.
+    caller_safe_payment = {
+        key: value
+        for key, value in payment.items()
+        if str(key).casefold() != "gratuity"
+    }
 
     payload: dict[str, Any] = {
         "status": "ok",
@@ -332,7 +364,7 @@ async def lookup_spa_facts(
         "upsells": upsells,
         "upsell_configured": bool(upsells),
         "payment": {
-            **payment,
+            **caller_safe_payment,
             "collect_raw_card_on_call": False,
             "booking_cc": (
                 "Booking CC means the spa's configured card-on-file / payment "
@@ -347,6 +379,7 @@ async def lookup_spa_facts(
                 "Never ask the caller to speak a card number, expiry, ZIP, or CVV."
             ),
         },
+        "gratuity": caller_safe_gratuity,
         "vip": configured_vip(facts["packages"]),
         "policies": policy_statement(facts),
     }
@@ -547,6 +580,19 @@ async def lookup_spa_facts(
             payload["status"] = "ok" if plan["status"] == "handoff" else "unavailable"
         else:
             payload["message"] = str(payment.get("script") or DEFAULT_PAYMENT_POLICY["script"])
+        return payload
+
+    if topic in {"gratuity", "tip", "tipping"}:
+        truth(
+            "SPA_DETAIL_LOOKUP",
+            source="dashboard" if gratuity.get("enabled") else "none",
+            field="gratuity",
+        )
+        payload["message"] = gratuity_question_answer(gratuity)
+        # Reminder timing controls proactive speech only. An enabled policy is
+        # still authoritative when a caller directly asks about tipping.
+        if not gratuity.get("enabled"):
+            payload["status"] = "unknown"
         return payload
 
     payload["message"] = (

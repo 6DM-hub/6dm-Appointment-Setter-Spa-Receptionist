@@ -763,7 +763,7 @@ LOOKUP_SPA_FACTS_TOOL: dict[str, Any] = {
         "Look up authoritative spa business facts from the dashboard and the "
         "active booking provider. REQUIRED before answering questions about "
         "location, address, hours, phone, services, prices, policies, packages, "
-        "upsells, or payment. Facial and massage booking consultations are "
+        "upsells, payment, or gratuities. Facial and massage booking consultations are "
         "managed by propose_appointment. "
         "Never invent a fact if this tool returns unknown."
     ),
@@ -783,6 +783,7 @@ LOOKUP_SPA_FACTS_TOOL: dict[str, Any] = {
                     "vip",
                     "upsells",
                     "payment",
+                    "gratuity",
                     "all",
                 ],
             },
@@ -4814,6 +4815,11 @@ class XAIVoiceSession:
                 "status": "unknown",
                 "message": "I don't have that information available.",
             })
+        if topic in {"gratuity", "tip", "tipping"}:
+            # A direct caller question was answered from the tenant policy. Do
+            # not repeat the proactive reminder after the later booking.
+            self.session.entities["gratuity_discussed"] = True
+            await self._persist_session()
         return json.dumps(payload)
 
     async def _offer_staff_callback(self) -> None:
@@ -5248,6 +5254,84 @@ class XAIVoiceSession:
             }
         )
 
+    def _apply_booking_gratuity_reminder(
+        self,
+        sentence: str,
+        *,
+        confirmation_key: str,
+        card_status: str | None = None,
+    ) -> str:
+        """Place one tenant-configured reminder after provider-backed success."""
+        from app.services.gratuity import (
+            AFTER_BOOKING_CONFIRMATION,
+            DURING_CLOSING,
+            booking_card_allows_reminder,
+            fee_may_be_spoken,
+            normalize_gratuity_policy,
+            reminder_message,
+        )
+
+        if (
+            not booking_card_allows_reminder(card_status)
+            or self.session.entities.get("gratuity_reminder_spoken")
+            or self.session.entities.get("gratuity_discussed")
+        ):
+            return sentence
+        policy = normalize_gratuity_policy(
+            self.session.entities.get("gratuity_policy")
+        )
+        message = reminder_message(policy, selection_key=confirmation_key)
+        if not message:
+            return sentence
+
+        timing = policy.get("timing")
+        if timing == DURING_CLOSING:
+            self.session.entities["pending_gratuity_reminder"] = {
+                "confirmation_key": confirmation_key,
+                "message": message,
+                "fee_included": fee_may_be_spoken(policy),
+            }
+            return sentence
+        if timing != AFTER_BOOKING_CONFIRMATION:
+            return sentence
+
+        self.session.entities["gratuity_reminder_spoken"] = True
+        self.session.entities.pop("pending_gratuity_reminder", None)
+        truth(
+            "GRATUITY_REMINDER_SPOKEN",
+            call_sid=self.call_id,
+            timing=AFTER_BOOKING_CONFIRMATION,
+            fee_included=fee_may_be_spoken(policy),
+        )
+        question = " Is there anything else I can help you with today?"
+        if sentence.endswith(question):
+            return sentence[: -len(question)] + " " + message + question
+        return sentence + " " + message
+
+    def _wrap_up_message(self) -> str:
+        """Consume a closing-timed gratuity reminder at most once."""
+        from app.services.gratuity import DURING_CLOSING
+
+        pending = self.session.entities.pop("pending_gratuity_reminder", None)
+        if (
+            isinstance(pending, dict)
+            and pending.get("message")
+            and not self.session.entities.get("gratuity_reminder_spoken")
+            and not self.session.entities.get("gratuity_discussed")
+        ):
+            self.session.entities["gratuity_reminder_spoken"] = True
+            truth(
+                "GRATUITY_REMINDER_SPOKEN",
+                call_sid=self.call_id,
+                timing=DURING_CLOSING,
+                fee_included=bool(pending.get("fee_included")),
+            )
+            return (
+                str(pending["message"]).strip()
+                + " Perfect. We look forward to seeing you. Have a great day!"
+            )
+        return "Perfect. We look forward to seeing you. Have a great day!"
+
     def _authoritative_tool_followup(self, tool_name: str, output: str) -> str | None:
         """Return exact caller-facing speech for terminal authoritative outcomes."""
         try:
@@ -5357,8 +5441,14 @@ class XAIVoiceSession:
                 card_sms=payload.get("card_sms") or "not_attempted",
             )
             if sentence.endswith(question):
-                return sentence[: -len(question)] + clause + question
-            return sentence + clause
+                sentence = sentence[: -len(question)] + clause + question
+            else:
+                sentence = sentence + clause
+            return self._apply_booking_gratuity_reminder(
+                sentence,
+                confirmation_key=confirmation_key,
+                card_status=payload.get("card_status"),
+            )
 
         if not confirmed:
             # Still avoid an invented greeting even if the local display time is
@@ -6273,7 +6363,10 @@ class XAIVoiceSession:
                 forced_followup = CARD_LINK_PERMISSION_QUESTION
         if forced_followup is not None:
             await self._send_function_output(call_ref, output, nudge=False)
-            if forced_followup == BOOKING_CONFIRMATION_TEXT_QUESTION:
+            if (
+                name == CONFIRM_APPOINTMENT_TOOL["name"]
+                or forced_followup == BOOKING_CONFIRMATION_TEXT_QUESTION
+            ):
                 await self._persist_session()
             if self._active_response_id is None:
                 logger.info(
@@ -6377,7 +6470,7 @@ class XAIVoiceSession:
                     return
                 self._awaiting_wrap_up = False
                 await self._send_force_message(
-                    "Perfect. We look forward to seeing you. Have a great day!"
+                    self._wrap_up_message()
                 )
                 await self._persist_session()
                 return

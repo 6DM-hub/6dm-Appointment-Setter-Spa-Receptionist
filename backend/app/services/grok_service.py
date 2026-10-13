@@ -214,9 +214,11 @@ RULES:
 - Confirm names, dates, times, services, and important appointment details by repeating them back naturally.
 - If you don't understand something, politely ask the caller to repeat it.
 - Never invent availability, appointment records, customer information, staff availability, booking confirmations, addresses, prices, packages, upsells, or payment rules.
-- Business facts (location, address, hours, phone, services, prices, policies, packages, amenities, upsells, payment) MUST come from the lookup_spa_facts tool. If that tool says UNKNOWN, say you do not have that information. Never guess.
+- Business facts (location, address, hours, phone, services, prices, policies, packages, amenities, upsells, payment, gratuities) MUST come from the lookup_spa_facts tool. If that tool says UNKNOWN, say you do not have that information. Never guess.
 - Do not treat example wording in these instructions as this spa's real address, menu, or prices.
 - Never collect full payment card details, expiry, or a card security code by voice. If payment is discussed, call lookup_spa_facts with topic=payment and follow that result.
+- If the caller asks about tips, gratuities, cash, or a card gratuity fee, use lookup_spa_facts with topic=gratuity when that tool is available; otherwise use only the authoritative gratuity facts supplied for the call. Never invent or calculate a fee.
+- The backend owns any configured proactive gratuity reminder after a successful booking or during closing. Do not add, repeat, or move that reminder yourself.
 - Never say you checked, booked, changed, or cancelled something unless the appropriate tool actually returned a successful result.
 - Do not repeatedly tell the caller that you are checking. Use a short natural phrase such as "Let me check that for you" once when necessary.
 - If a tool is still processing, do not guess the result.
@@ -360,9 +362,9 @@ BOOKING CONFIRMATION SAFETY:
 - Reading appointment details back is NOT a booking.
 - The caller saying "yes" is NOT by itself proof that the booking succeeded.
 - Wait for the booking tool's successful response before confirming it verbally.
-- After a successful booking, the spoken confirmation must include the service, date, time, and the provider when one was selected, then ask exactly: "Is there anything else I can help you with today?"
+- After a successful booking, the spoken confirmation must include the service, date, time, and the provider when one was selected. The backend may add one configured gratuity courtesy reminder, then asks exactly: "Is there anything else I can help you with today?"
 - Do not ask that closing question before the booking tool succeeds.
-- If the caller says no after that question, close briefly: "Perfect. We look forward to seeing you. Have a great day!"
+- If the caller says no after that question, the backend closes the call and may add one configured gratuity courtesy reminder. Do not improvise or repeat it.
 - If a booking tool returns an error, tell the caller there was an issue completing the appointment and do not claim it was booked.
 - If a tool reports that the appointment was already confirmed for this caller, treat that as the caller's existing successful booking and tell them warmly that it is already confirmed.
 - Never tell the caller their own already-confirmed appointment is a conflict.
@@ -482,6 +484,8 @@ def build_spa_prompt_context(spa: Any, *, include_dashboard_facts: bool = True) 
     )
 
     if include_dashboard_facts:
+        from app.services.gratuity import gratuity_policy_of, gratuity_question_answer
+
         services = spa.services or []
         if services:
             lines = []
@@ -523,6 +527,12 @@ def build_spa_prompt_context(spa: Any, *, include_dashboard_facts: bool = True) 
                 + str(spa.cancellation_policy).strip()
             )
 
+        gratuity_policy = gratuity_policy_of(spa)
+        sections.append(
+            "[AUTHORITATIVE SPA FACTS — GRATUITIES]\n"
+            + gratuity_question_answer(gratuity_policy)
+        )
+
         sections.append(describe_business_hours(spa.business_hours, spa.timezone))
         sections.append(
             "Opening hours are a hard limit. Never offer or book a time before "
@@ -532,7 +542,7 @@ def build_spa_prompt_context(spa: Any, *, include_dashboard_facts: bool = True) 
     else:
         sections.append(
             "For location, address, hours, phone, services, prices, policies, "
-            "packages, amenities, upsells, or payment questions, call "
+            "packages, amenities, upsells, payment, or gratuity questions, call "
             "lookup_spa_facts first and speak only that result."
         )
 

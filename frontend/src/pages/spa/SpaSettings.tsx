@@ -56,6 +56,18 @@ const DAYS: [string, string][] = [
   ["sun", "Sunday"],
 ];
 
+type GratuityPolicy = NonNullable<SpaAccount["payment_policy"]["gratuity"]>;
+
+const DEFAULT_GRATUITY_POLICY: GratuityPolicy = {
+  enabled: false,
+  cash_preferred: true,
+  card_processing_fee_percent: 4,
+  fee_verified: false,
+  timing: "after_booking_confirmation",
+  custom_message: null,
+  use_voice_personality: true,
+};
+
 /**
  * The receptionist configuration for one spa — the whole of what onboarding
  * touches. Everything here is a column on the tenant's `SpaAccount` row, read
@@ -168,6 +180,33 @@ export default function SpaSettings() {
     setSaved(false);
   };
 
+  const patchGratuity = <K extends keyof GratuityPolicy>(
+    key: K,
+    value: GratuityPolicy[K]
+  ) => {
+    if (!spa) return;
+    const current = {
+      ...DEFAULT_GRATUITY_POLICY,
+      ...(spa.payment_policy?.gratuity ?? {}),
+    };
+    const next = {
+      ...current,
+      [key]: value,
+    };
+    if (
+      key === "card_processing_fee_percent" &&
+      value !== current.card_processing_fee_percent
+    ) {
+      // Verification applies to the exact configured percentage. A material
+      // fee change must be attested again before Cara can quote it.
+      next.fee_verified = false;
+    }
+    patch("payment_policy", {
+      ...(spa.payment_policy ?? { card_required: false, collection_mode: "none" }),
+      gratuity: next,
+    });
+  };
+
   const setHours = (day: string, field: "open" | "close", value: string) => {
     if (!spa) return;
     const existing = spa.business_hours[day]?.[0] ?? { open: "", close: "" };
@@ -180,6 +219,22 @@ export default function SpaSettings() {
 
   const save = async () => {
     if (!spa) return;
+    const gratuity = {
+      ...DEFAULT_GRATUITY_POLICY,
+      ...(spa.payment_policy?.gratuity ?? {}),
+    };
+    if (
+      gratuity.enabled &&
+      gratuity.timing !== "disabled" &&
+      gratuity.card_processing_fee_percent > 0 &&
+      !gratuity.fee_verified
+    ) {
+      setSaved(false);
+      setError(
+        "Verify the exact card-gratuity fee with the payment processor and applicable rules before enabling this reminder."
+      );
+      return;
+    }
     setSaving(true);
     setError(null);
     try {
@@ -700,6 +755,146 @@ export default function SpaSettings() {
                   </button>
                 )}
               </div>
+            </Panel>
+
+            <Panel
+              title="Payments & Gratuities"
+              subtitle="A courteous reminder can play once, only after the booking provider confirms the appointment."
+            >
+              {(() => {
+                const gratuity = {
+                  ...DEFAULT_GRATUITY_POLICY,
+                  ...(spa.payment_policy?.gratuity ?? {}),
+                };
+                const active = gratuity.enabled && gratuity.timing !== "disabled";
+                const feeNeedsVerification =
+                  active && gratuity.card_processing_fee_percent > 0 && !gratuity.fee_verified;
+                return (
+                  <div className="space-y-4">
+                    <label className="flex items-center gap-2 text-xs text-slate-300">
+                      <input
+                        type="checkbox"
+                        checked={gratuity.enabled}
+                        disabled={!editable}
+                        onChange={(event) => patchGratuity("enabled", event.target.checked)}
+                      />
+                      Enable gratuity reminder
+                    </label>
+
+                    <label className="flex items-center gap-2 text-xs text-slate-300">
+                      <input
+                        type="checkbox"
+                        checked={gratuity.cash_preferred}
+                        disabled={!editable}
+                        onChange={(event) => patchGratuity("cash_preferred", event.target.checked)}
+                      />
+                      Cash gratuities preferred
+                    </label>
+
+                    <label className="block">
+                      <span className="mb-1.5 block text-xs font-medium text-slate-400">
+                        Card gratuity processing fee (%)
+                      </span>
+                      <input
+                        type="number"
+                        min={0}
+                        max={4}
+                        step={0.25}
+                        value={gratuity.card_processing_fee_percent}
+                        disabled={!editable}
+                        onChange={(event) =>
+                          patchGratuity(
+                            "card_processing_fee_percent",
+                            Number(event.target.value || 0)
+                          )
+                        }
+                        className="w-full rounded-lg border border-slate-700 bg-[#07111f] px-3 py-2.5 text-sm text-white outline-none disabled:opacity-60"
+                      />
+                    </label>
+
+                    <label className="block">
+                      <span className="mb-1.5 block text-xs font-medium text-slate-400">
+                        Reminder timing
+                      </span>
+                      <select
+                        value={gratuity.timing}
+                        disabled={!editable}
+                        onChange={(event) =>
+                          patchGratuity(
+                            "timing",
+                            event.target.value as GratuityPolicy["timing"]
+                          )
+                        }
+                        className="w-full rounded-lg border border-slate-700 bg-[#07111f] px-3 py-2.5 text-sm text-slate-200 outline-none disabled:opacity-60"
+                      >
+                        <option value="after_booking_confirmation">After booking confirmation</option>
+                        <option value="during_closing">During closing</option>
+                        <option value="disabled">Disabled</option>
+                      </select>
+                    </label>
+
+                    <label className="block">
+                      <span className="mb-1.5 block text-xs font-medium text-slate-400">
+                        Custom gratuity message
+                      </span>
+                      <textarea
+                        rows={4}
+                        maxLength={1200}
+                        value={gratuity.custom_message ?? ""}
+                        disabled={!editable}
+                        onChange={(event) =>
+                          patchGratuity("custom_message", event.target.value || null)
+                        }
+                        placeholder="Leave blank to let Cara rotate the approved spa-style wording."
+                        className="w-full rounded-lg border border-slate-700 bg-[#07111f] px-3 py-2.5 text-sm text-white outline-none disabled:opacity-60"
+                      />
+                    </label>
+
+                    <label className="flex items-center gap-2 text-xs text-slate-300">
+                      <input
+                        type="checkbox"
+                        checked={gratuity.use_voice_personality}
+                        disabled={!editable}
+                        onChange={(event) =>
+                          patchGratuity("use_voice_personality", event.target.checked)
+                        }
+                      />
+                      Use Cara&apos;s selected voice personality
+                    </label>
+
+                    <div className="rounded-lg border border-amber-400/20 bg-amber-400/5 p-3">
+                      <label className="flex items-start gap-2 text-xs text-amber-100">
+                        <input
+                          className="mt-0.5"
+                          type="checkbox"
+                          checked={gratuity.fee_verified}
+                          disabled={!editable || gratuity.card_processing_fee_percent <= 0}
+                          onChange={(event) =>
+                            patchGratuity("fee_verified", event.target.checked)
+                          }
+                        />
+                        <span>
+                          I verified this exact fee with the business&apos;s payment processor
+                          and applicable state/local rules. Debit and prepaid restrictions,
+                          card-brand caps, advance notices, and receipt disclosures may apply.
+                        </span>
+                      </label>
+                      <p className="mt-2 text-[10px] leading-relaxed text-amber-200/70">
+                        This setting changes only what Cara says; it does not add a fee in
+                        Square or another payment system. Keep the reminder disabled until
+                        the processor is configured to charge the same verified policy.
+                      </p>
+                    </div>
+
+                    {feeNeedsVerification && (
+                      <p className="rounded-lg border border-rose-400/20 bg-rose-400/5 px-3 py-2 text-[11px] text-rose-300">
+                        Verify the fee policy before saving an enabled reminder. Cara will
+                        never speak an unverified processing fee.
+                      </p>
+                    )}
+                  </div>
+                );
+              })()}
             </Panel>
           </div>
         )}

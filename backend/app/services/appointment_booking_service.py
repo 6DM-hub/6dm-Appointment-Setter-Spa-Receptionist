@@ -884,6 +884,7 @@ async def _prepare(db: AsyncSession, session: CallSession) -> _Routing:
     session.entities["default_service_title"] = adapter.default_title
     session.entities["booking_provider"] = adapter.provider
     if spa is not None:
+        from app.services.gratuity import gratuity_policy_of
         from app.services.spa_facts import payment_policy_of
 
         session.entities["smart_enhancements_enabled"] = bool(
@@ -894,6 +895,9 @@ async def _prepare(db: AsyncSession, session: CallSession) -> _Routing:
             policy.get("card_required")
             and policy.get("collection_mode") == "secure_sms_link"
         )
+        # Snapshot this tenant's reminder policy into the call. The voice layer
+        # never reads another tenant's settings and never relies on model text.
+        session.entities["gratuity_policy"] = gratuity_policy_of(spa)
 
     return _Routing(
         scope=scope,
