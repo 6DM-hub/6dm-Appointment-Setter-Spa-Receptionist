@@ -14,6 +14,60 @@ from app.schemas import AppointmentCreate, AppointmentRead, AppointmentUpdate, P
 router = APIRouter(prefix="/appointments", tags=["appointments"])
 
 
+from pydantic import BaseModel, EmailStr
+from app.api.deps import get_tenant_manager
+
+
+class CardEmailRequest(BaseModel):
+    confirmed_email: EmailStr
+    consent: bool
+    request_id: uuid.UUID
+
+
+@router.post("/{appointment_id}/card-email", dependencies=[Depends(get_tenant_manager)])
+async def email_card_link(
+    appointment_id: uuid.UUID,
+    payload: CardEmailRequest,
+    scope: TenantScope = Depends(get_tenant_scope),
+    db: AsyncSession = Depends(get_db),
+):
+    """Owner-authorized transactional email; never creates or cancels a booking."""
+    from app.models.spa_account import SpaAccount
+    from app.models.external_customer_link import ExternalCustomerLink
+    from app.models.card_entry_token import CardEntryToken
+    from app.services.card_entry import SqlCardEntryStore
+    from app.services.card_email import offer_secure_card_email
+    from app.services.booking_adapters.spa_router import SpaBookingAdapter
+
+    appointment = (await db.execute(select(Appointment).where(
+        Appointment.id == appointment_id, scope_filter(scope, Appointment)
+    ).with_for_update())).scalar_one_or_none()
+    if appointment is None or scope.tenant_id is None:
+        raise HTTPException(404, "Appointment not found")
+    existing = (await db.execute(select(CardEntryToken).where(
+        CardEntryToken.appointment_id == appointment.id,
+        CardEntryToken.idempotency_key == f"email:{payload.request_id}",
+    ))).scalar_one_or_none()
+    if existing is not None:
+        return {"status": "already_attempted", "delivered": False}
+    spa = await db.get(SpaAccount, scope.tenant_id)
+    if spa is None:
+        raise HTTPException(404, "Spa not found")
+    contact = await db.get(Contact, appointment.contact_id)
+    link = (await db.execute(select(ExternalCustomerLink).where(
+        ExternalCustomerLink.tenant_id == scope.tenant_id,
+        ExternalCustomerLink.contact_id == appointment.contact_id,
+        ExternalCustomerLink.provider == appointment.booking_provider,
+    ))).scalar_one_or_none()
+    result = await offer_secure_card_email(
+        store=SqlCardEntryStore(db), spa=spa, appointment=appointment,
+        contact=contact, link=link, adapter=SpaBookingAdapter(spa),
+        confirmed_email=str(payload.confirmed_email), consent=payload.consent,
+        request_id=payload.request_id,
+    )
+    return {"status": result, "delivered": False}
+
+
 @router.post("", response_model=AppointmentRead, status_code=status.HTTP_201_CREATED)
 async def create_appointment(
     payload: AppointmentCreate,

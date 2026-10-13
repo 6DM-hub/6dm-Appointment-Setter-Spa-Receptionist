@@ -695,6 +695,8 @@ def start_new_intent(session: Any) -> BookingDraft:
     session.entities.pop("caller_confirmed_revision", None)
     session.entities.pop("caller_confirmed_fingerprint", None)
     session.entities.pop("card_policy_explained", None)
+    session.entities.pop("card_email_collecting", None)
+    session.entities.pop("card_email_confirmed", None)
     session.entities.pop("card_link_consent_pending_revision", None)
     session.entities.pop("card_link_consent_authorized_revision", None)
     # Consultation and caller-grounding state belongs to one booking intent.
@@ -922,6 +924,10 @@ def confirmation_block_reason(session: Any) -> str | None:
     ):
         truth("CARD_LINK_CONSENT_REQUIRED", call_sid=getattr(session, "call_sid", None))
         return "card_link_consent_missing"
+    if session.entities.get("card_on_file_required") and session.entities.get("card_link_delivery") == "email":
+        from app.services.card_email_conversation import confirmed_email
+        if not confirmed_email(session):
+            return "card_link_consent_missing"
     if status != "awaiting_confirmation":
         return "not_awaiting_confirmation"
     if not draft.start_iso or not draft.service_description:
@@ -1146,6 +1152,13 @@ def booking_card_speech(card_status: str | None, card_sms: str | None) -> str:
     """
     status = (card_status or "").strip().lower()
     sms = (card_sms or "").strip().lower()
+    if status == "pending_card" and sms == "email_accepted":
+        return (
+            " Your secure card-link email has been accepted for sending. Please check your inbox and spam folder."
+            " You can complete it after this call. Your reservation is pending your card on file."
+        )
+    if status == "pending_card" and sms.startswith("email_"):
+        return " I couldn't verify that the secure card-link email was sent. Your reservation remains in place; please contact the spa for help adding your card."
     if status == "pending_card" and sms == "sent":
         return (
             " I've also sent you a secure text link to add your card on file. "

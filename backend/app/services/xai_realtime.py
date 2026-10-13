@@ -1797,6 +1797,16 @@ class XAIVoiceSession:
         if await self._handle_confirmation_text_answer(caller_text):
             return True
 
+        from app.services.card_email_conversation import email_answer
+        handled_email, email_line, email_ready = email_answer(self.session, caller_text)
+        if handled_email:
+            await self._cancel_active_response()
+            if email_ready:
+                await self._explain_card_policy()
+            elif email_line:
+                await self._send_force_message(email_line)
+            return True
+
         from app.services.enhancements import respond as enhancement_response
         accepted_base_fingerprint = self.session.entities.get(
             "enhancement_base_time_accepted"
@@ -2079,6 +2089,14 @@ class XAIVoiceSession:
         if not (draft.confirmation_authorized
                 and self.session.entities.get("caller_confirmed_revision") == draft.draft_revision):
             return
+        if self.session.entities.get("card_link_delivery") == "email":
+            from app.services.card_email_conversation import confirmed_email, begin_email
+            if not confirmed_email(self.session):
+                # Some tool-result paths mark the policy before requesting
+                # speech. Collection must not count as actual policy playback.
+                self.session.entities["card_policy_explained"] = False
+                await self._send_force_message(begin_email(self.session))
+                return
         already_explained = bool(self.session.entities.get("card_policy_explained"))
         self.session.entities["card_policy_explained"] = True
         if self.session.booking_status not in {"booked", "rescheduled", "conflict"}:
@@ -5458,6 +5476,17 @@ class XAIVoiceSession:
         This is ideal for final booking confirmations because the calendar result,
         not the language model, is the source of truth.
         """
+        email_delivery = self.session.entities.get("card_link_delivery") == "email"
+        if email_delivery and message in {CARD_ON_FILE_POLICY, CARD_LINK_PERMISSION_QUESTION}:
+            from app.services.card_email_conversation import confirmed_email, begin_email
+            draft = get_draft(self.session)
+            if not (draft.confirmation_authorized and
+                    self.session.entities.get("caller_confirmed_revision") == draft.draft_revision):
+                return
+            if not confirmed_email(self.session):
+                self.session.entities["card_policy_explained"] = False
+                await self._send_force_message(begin_email(self.session))
+                return
         if message == CARD_ON_FILE_POLICY:
             draft = get_draft(self.session)
             if not (draft.confirmation_authorized and
@@ -5483,6 +5512,11 @@ class XAIVoiceSession:
                 reason="already_greeted",
             )
             return
+        if email_delivery and message == CARD_ON_FILE_POLICY:
+            message = message.replace("I can text you", "I can email you")
+        if email_delivery:
+            message = message.replace(CARD_LINK_PERMISSION_QUESTION,
+                "Are you okay with me emailing the secure card link to the address you just confirmed?")
         spoken_message = await self._localized_force_message(message)
         await self._send(
             {
