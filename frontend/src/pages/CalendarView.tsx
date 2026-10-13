@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { CalendarDays } from "lucide-react";
+import CardEmailRequest from "../components/CardEmailRequest";
 import { fetchAppointments, type Appointment } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import { PageHeader, Panel, StateBlock } from "../components/ui/Primitives";
@@ -44,7 +45,7 @@ export default function CalendarView({
   title?: string;
   subtitle?: string;
 }) {
-  const { impersonatedTenantId } = useAuth();
+  const { impersonatedTenantId, role } = useAuth();
   const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -138,6 +139,10 @@ export default function CalendarView({
                             {CARD_STATUS_LABELS[appointment.card_status]}
                           </span>
                         )}
+                        {appointment.card_status === "pending_card" &&
+                          ["scheduled", "confirmed"].includes(appointment.status) &&
+                          (role === "spa_admin" || role === "super_admin") &&
+                          <CardEmailRequest key={`${impersonatedTenantId || "own"}:${appointment.id}`} appointmentId={appointment.id} />}
                       </div>
                     </div>
                   ))}

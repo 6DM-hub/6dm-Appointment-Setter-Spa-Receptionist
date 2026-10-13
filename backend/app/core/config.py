@@ -61,6 +61,14 @@ def resolve_service_host(host: str) -> str:
         return "localhost"
 
 class Settings(BaseSettings):
+    # Separate from staff alerts. Disabled unless pinned to one business.
+    CARD_EMAIL_TENANT_ID: str = ""
+    CARD_SMTP_HOST: str = "smtp.gmail.com"
+    CARD_SMTP_PORT: int = 465
+    CARD_SMTP_USER: str = ""
+    CARD_EMAIL_DISPLAY_NAME: str = ""
+    CARD_SMTP_PASSWORD: str = ""
+
     STAFF_SMTP_HOST: str = ""
     STAFF_SMTP_PORT: int = 465
     STAFF_SMTP_FROM: str = ""

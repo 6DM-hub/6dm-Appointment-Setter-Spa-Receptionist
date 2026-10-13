@@ -891,6 +891,8 @@ async def _prepare(db: AsyncSession, session: CallSession) -> _Routing:
             (getattr(spa, "enhancement_settings", None) or {}).get("enabled")
         )
         policy = payment_policy_of(spa)
+        from app.services.card_email import configured_for
+        session.entities["card_link_delivery"] = "email" if configured_for(spa) else "sms"
         session.entities["card_on_file_required"] = bool(
             policy.get("card_required")
             and policy.get("collection_mode") == "secure_sms_link"
@@ -1998,7 +2000,30 @@ async def confirm_booking(
         await db.commit()
         await db.refresh(appointment)
         card_sms = "not_attempted"
-        if appointment.card_status == CardStatus.PENDING_CARD:
+        if appointment.card_status == CardStatus.PENDING_CARD and session.entities.get("card_link_delivery") == "email":
+            from app.services.card_email import offer_secure_card_email
+            from app.services.card_email_conversation import confirmed_email
+            from app.services.card_entry import SqlCardEntryStore
+            recipient = confirmed_email(session)
+            consent = session.entities.get("card_link_consent_authorized_revision") == draft.draft_revision
+            card_sms = "email_failed"
+            try:
+                if recipient and consent:
+                    # Explicit caller read-back authorizes correcting their own
+                    # local contact email; never use a guessed provider address.
+                    contact.email = recipient
+                    await db.commit()
+                    result = await offer_secure_card_email(
+                        store=SqlCardEntryStore(db), spa=routing.spa,
+                        appointment=appointment, contact=contact, link=link,
+                        adapter=routing.adapter, confirmed_email=recipient, consent=True,
+                        request_id=appointment.id,
+                    )
+                    card_sms = "email_" + result
+            except Exception:
+                logger.warning("Card email failed for appointment %s; booking stands", appointment.id)
+            truth("CARD_EMAIL_RESULT", status=card_sms, call_sid=session.call_sid)
+        elif appointment.card_status == CardStatus.PENDING_CARD:
             card_sms = "failed"
             try:
                 from app.services.card_entry import SqlCardEntryStore, offer_secure_card_sms
