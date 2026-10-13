@@ -1387,7 +1387,7 @@ async def stage_booking(
             session.booking_status = "collecting_details"
             return BookingResult(
                 BookingOutcome.MISSING_INFO,
-                message="No clear date and time yet. Ask the caller for a specific date and time.",
+                message="Ask the caller: What day and time works best for you? Do not guess a date or time.",
             )
         start, end = window
         session.requested_datetime = start.isoformat()

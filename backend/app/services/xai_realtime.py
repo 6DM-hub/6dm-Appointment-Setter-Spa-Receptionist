@@ -6376,6 +6376,16 @@ class XAIVoiceSession:
             self._coalesce_service_arguments(parsed_args)
             raw_args = json.dumps(parsed_args)
 
+            # A request for openings on a known day is sufficient to search.
+            # Handle it before asking for a time or checking model earliest flags.
+            spoken_window = self._spoken_day_part_window()
+            if spoken_window is not None and name in {
+                CHECK_AVAILABILITY_TOOL["name"],
+                PROPOSE_APPOINTMENT_TOOL["name"],
+            }:
+                await self._offer_spoken_window(call_ref, spoken_window, parsed_args)
+                return
+
             # A calendar day plus a service is enough to ask for the caller's
             # preferred time, but it is not permission for the model to invent
             # one exact timestamp or dump an entire day of results. An explicit
@@ -6446,13 +6456,6 @@ class XAIVoiceSession:
                     self.session.entities["day_part_question_turn"] = self._user_turn_count
                     await self._cancel_active_response()
                     await self._send_force_message("What's the best time for you to come in?")
-                return
-            spoken_window = self._spoken_day_part_window()
-            if spoken_window is not None and name in {
-                CHECK_AVAILABILITY_TOOL["name"],
-                PROPOSE_APPOINTMENT_TOOL["name"],
-            }:
-                await self._offer_spoken_window(call_ref, spoken_window, parsed_args)
                 return
 
             spoken_start = self._spoken_exact_start()
