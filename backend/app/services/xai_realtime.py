@@ -89,6 +89,7 @@ from app.services.booking_state import (
     get_draft,
     grounded_availability_speech,
     is_affirmative,
+    is_negative,
     looks_card_hesitant,
     looks_like_unverified_booking_success,
     mark_read_back,
@@ -113,6 +114,13 @@ from app.services.call_state import (
     mark_greeting_sent,
 )
 from app.services.caller_identity import persist_caller_identity
+from app.services.call_language import (
+    CallLanguage,
+    detect_requested_call_language,
+    locked_language_instruction,
+    normalize_call_language,
+    SUPPORTED_CALL_LANGUAGES,
+)
 from app.services.grok_service import (
     AppointmentIntent,
     build_realtime_instructions,
@@ -829,6 +837,33 @@ REQUEST_CALLBACK_TOOL: dict[str, Any] = {
     },
 }
 
+SET_CONVERSATION_LANGUAGE_TOOL: dict[str, Any] = {
+    "type": "function",
+    "name": "set_conversation_language",
+    "description": (
+        "Lock Cara's spoken language for the remainder of this call. Call this BEFORE "
+        "replying when the caller asks to use another language or begins a substantive "
+        "turn in another supported language. Call it at most once. Do not call it for "
+        "a name, service name, date, time, yes/no, or another isolated foreign word. "
+        "This changes caller-facing speech only; keep tool arguments and configured "
+        "business/service/staff names in their canonical form."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "language_code": {
+                "type": "string",
+                "enum": list(SUPPORTED_CALL_LANGUAGES),
+                "description": (
+                    "BCP-47 language code. Use es-MX for Spanish and pt-BR for "
+                    "Portuguese unless the caller explicitly requests another region."
+                ),
+            }
+        },
+        "required": ["language_code"],
+    },
+}
+
 CUSTOMER_PROFILE_TOOL: dict[str, Any] = {
     "type": "function",
     "name": "customer_profile",
@@ -875,6 +910,7 @@ CUSTOMER_PROFILE_TOOL: dict[str, Any] = {
 }
 
 VOICE_TOOLS: list[dict[str, Any]] = [
+    SET_CONVERSATION_LANGUAGE_TOOL,
     LOOKUP_SPA_FACTS_TOOL,
     CHECK_AVAILABILITY_TOOL,
     PROPOSE_APPOINTMENT_TOOL,
@@ -1137,6 +1173,11 @@ class XAIVoiceSession:
         self._after_availability_line: str | None = None
         self._availability_speech_interrupted = False
         self._recover_availability_tool = False
+        # One caller-selected language owns every spoken path for the rest of
+        # the call. The entity survives media-bridge/session recovery; the
+        # in-memory cache avoids retranslating repeated guard messages.
+        self._realtime_instructions = ""
+        self._language_translation_cache: dict[tuple[str, str], str] = {}
 
     # ---------------------------------------------------------------- plumbing
     @property
@@ -1795,7 +1836,7 @@ class XAIVoiceSession:
                     if result.get("status") == "stored" else "I couldn't save your callback request. Please contact the spa directly."
                 )
                 return True
-            if caller_text.strip().lower() in {"no", "no thanks", "no thank you"}:
+            if is_negative(caller_text):
                 self.session.entities.pop("callback_offer_pending", None)
                 await self._send_force_message("Okay. What else can I help you with?")
                 return True
@@ -1817,7 +1858,7 @@ class XAIVoiceSession:
                     call_sid=self.call_id,
                     revision=draft.draft_revision,
                 )
-            elif caller_text.strip().casefold() in {"no", "no thanks", "no thank you", "not now"}:
+            elif is_negative(caller_text):
                 await self._cancel_active_response()
                 await self._send_force_message(
                     "Okay. I won't send the link, and the appointment has not been reserved."
@@ -2133,6 +2174,21 @@ class XAIVoiceSession:
             "tool instead of asserting it."
         )
 
+    @staticmethod
+    def _language_protocol_instructions() -> str:
+        return (
+            "\n\nCALL LANGUAGE CONTINUITY:\n"
+            "- Begin in English. If the caller asks for another language or begins a "
+            "substantive turn in another supported language, call "
+            "set_conversation_language BEFORE replying.\n"
+            "- After that tool reports locked, speak only that language for the rest "
+            "of the call. Never switch back because the caller says an English name, "
+            "treatment, date, time, yes/no, or another short phrase.\n"
+            "- Keep business, service, staff, and product names exactly as configured. "
+            "Keep tool arguments, IDs, and provider data in their canonical form; the "
+            "language lock applies to caller-facing speech."
+        )
+
     async def _configure(self) -> None:
         instructions = build_realtime_instructions(
             self.session.business_name or settings.APP_NAME,
@@ -2140,6 +2196,7 @@ class XAIVoiceSession:
             self.session.timezone,
         )
         instructions += self._booking_write_protocol_instructions()
+        instructions += self._language_protocol_instructions()
         known_contact = self.session.entities.get("known_contact")
         if known_contact:
             # Caller ID is not proof of identity; never preload a name
@@ -2151,6 +2208,10 @@ class XAIVoiceSession:
                 "account name before using customer_profile; still collect "
                 "caller_name for the current booking."
             )
+        locked_language = self._locked_call_language()
+        if locked_language is not None:
+            instructions += locked_language_instruction(locked_language)
+        self._realtime_instructions = instructions
         requested_voice = resolve_xai_voice(
             self.session.entities.get("xai_voice") or settings.XAI_VOICE_ID
         )
@@ -2161,6 +2222,11 @@ class XAIVoiceSession:
             XAI_REALTIME_MODEL,
             settings.GROK_MODEL,
         )
+        audio_config: dict[str, Any] = {"output": {"speed": 1.0}}
+        if locked_language is not None:
+            audio_config["input"] = {
+                "transcription": {"language_hint": locked_language.code}
+            }
         await self._send(
             {
                 "type": "session.update",
@@ -2171,10 +2237,111 @@ class XAIVoiceSession:
                     "turn_detection": {"type": "server_vad"},
                     "tools": VOICE_TOOLS,
                     # Keep voice pacing stable across server/model updates.
-                    "audio": {"output": {"speed": 1.0}},
+                    "audio": audio_config,
                 },
             }
         )
+
+    def _locked_call_language(self) -> CallLanguage | None:
+        state = self.session.entities.get("conversation_language")
+        if not isinstance(state, dict) or not state.get("locked"):
+            return None
+        return normalize_call_language(str(state.get("code") or state.get("name") or ""))
+
+    async def _lock_conversation_language(
+        self,
+        language: CallLanguage,
+        *,
+        source: str,
+    ) -> CallLanguage:
+        """Lock one language and update both model output and ASR hint.
+
+        A later request cannot mutate the lock during the same call. This is
+        intentional: short English names and menu terms otherwise caused Cara
+        to drift back to English after correctly switching languages.
+        """
+        existing = self._locked_call_language()
+        if existing is not None:
+            return existing
+        self.session.entities["conversation_language"] = {
+            "name": language.name,
+            "code": language.code,
+            "locked": True,
+            "source": source,
+        }
+        truth(
+            "CALL_LANGUAGE_LOCKED",
+            call_sid=self.call_id,
+            language=language.name,
+            code=language.code,
+            source=source,
+        )
+        logger.info(
+            "call %s: conversation language locked name=%s code=%s source=%s",
+            self.call_id,
+            language.name,
+            language.code,
+            source,
+        )
+        restart_active_response = bool(
+            source == "caller_transcript" and self._active_response_id
+        )
+        if restart_active_response:
+            # Server VAD can begin a reply before the final transcript event.
+            # Cut that pre-lock response before any wrong-language audio is
+            # allowed to continue, then recreate it after session.update.
+            await self._cancel_active_response()
+        if self._ws is not None:
+            base = self._realtime_instructions or (
+                build_realtime_instructions(
+                    self.session.business_name or settings.APP_NAME,
+                    self.session.tenant_prompt,
+                    self.session.timezone,
+                )
+                + self._booking_write_protocol_instructions()
+                + self._language_protocol_instructions()
+            )
+            if "CALL LANGUAGE — LOCKED FOR THE REST OF THIS CALL:" not in base:
+                base += locked_language_instruction(language)
+            self._realtime_instructions = base
+            # Deliberately omit `voice`: a mid-call language change must never
+            # replace the tenant's selected Ara voice.
+            await self._send({
+                "type": "session.update",
+                "session": {
+                    "instructions": base,
+                    "audio": {
+                        "input": {
+                            "transcription": {"language_hint": language.code}
+                        }
+                    },
+                },
+            })
+            if restart_active_response:
+                await self._send({"type": "response.create"})
+        return language
+
+    async def _run_set_conversation_language(self, raw_arguments: str) -> str:
+        try:
+            payload = json.loads(raw_arguments or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        requested = normalize_call_language(str(payload.get("language_code") or ""))
+        if requested is None:
+            return json.dumps({
+                "status": "unsupported",
+                "locked": False,
+                "message": "Ask which supported language the caller would like.",
+            })
+        existing = self._locked_call_language()
+        locked = await self._lock_conversation_language(requested, source="model_tool")
+        return json.dumps({
+            "status": "already_locked" if existing is not None else "locked",
+            "locked": True,
+            "language": locked.name,
+            "language_code": locked.code,
+            "message": f"Continue speaking only {locked.name} for the rest of this call.",
+        })
 
     def _looks_like_session_restart_greeting(self, text: str | None) -> bool:
         """True when the model is restarting the call with the opening welcome."""
@@ -3544,7 +3711,7 @@ class XAIVoiceSession:
 
     @staticmethod
     def _caller_declines_optional_item(text: str) -> bool:
-        return bool(
+        return is_negative(text) or bool(
             re.search(
                 r"\b(?:no|nope|neither|none|skip|without|not today|no thanks)\b",
                 text or "",
@@ -3587,6 +3754,8 @@ class XAIVoiceSession:
         are not consent. Only the pending offer, not a model tool argument,
         can establish the candidate treatment.
         """
+        if is_negative(text):
+            return "declined"
         utterance = " ".join(re.findall(r"[a-z0-9]+", str(text or "").casefold()))
         if not utterance:
             return None
@@ -3682,6 +3851,8 @@ class XAIVoiceSession:
     @staticmethod
     def _caller_declines_consultation_invitation(text: str) -> bool:
         value = str(text or "").strip()
+        if is_negative(value):
+            return True
         if re.fullmatch(
             r"(?:no|nope|nah)(?:\s+(?:thanks|thank you))?\s*[.!]?",
             value,
@@ -5209,6 +5380,76 @@ class XAIVoiceSession:
             self._grounded_exact_times
         )
 
+    def _voice_translation_protected_values(self) -> list[str]:
+        """Names/labels that translation may pronounce but must not rewrite."""
+        draft = get_draft(self.session)
+        candidates = [
+            self.session.business_name,
+            self.session.selected_service,
+            draft.service_description,
+            draft.caller_name,
+            draft.guest_name,
+            draft.preferred_staff,
+        ]
+        values: list[str] = []
+        for value in candidates:
+            cleaned = " ".join(str(value or "").split())
+            if 2 <= len(cleaned) <= 120 and cleaned not in values:
+                values.append(cleaned)
+        return sorted(values, key=len, reverse=True)
+
+    async def _localized_force_message(self, message: str) -> str:
+        """Translate verbatim backend speech into this call's locked language.
+
+        Booking/provider facts are replaced with opaque placeholders first and
+        restored only when the translation preserves all of them and every
+        numeric value. On translation failure the source is retained: an
+        untranslated true provider result is safer than a fluent fabricated
+        booking confirmation, and the failure is visible in production logs.
+        """
+        language = self._locked_call_language()
+        if language is None or language.code == "en":
+            return message
+        cache_key = (language.code, message)
+        cached = self._language_translation_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        masked = message
+        replacements: list[tuple[str, str]] = []
+        for index, value in enumerate(self._voice_translation_protected_values()):
+            if value not in masked:
+                continue
+            token = f"__CARA_KEEP_{index}__"
+            masked = masked.replace(value, token)
+            replacements.append((token, value))
+        source_numbers = sorted(re.findall(r"\d+(?:[.:]\d+)?", masked))
+        try:
+            translated = await asyncio.wait_for(
+                grok_service.translate_voice_message(masked, language.name),
+                timeout=min(float(settings.GROK_TIMEOUT_SECONDS), 3.0),
+            )
+            missing = [token for token, _ in replacements if token not in translated]
+            translated_numbers = sorted(re.findall(r"\d+(?:[.:]\d+)?", translated))
+            if missing or translated_numbers != source_numbers:
+                raise ValueError(
+                    "translation changed protected booking facts "
+                    f"missing_placeholders={missing} numbers_changed="
+                    f"{translated_numbers != source_numbers}"
+                )
+            for token, value in replacements:
+                translated = translated.replace(token, value)
+        except Exception:
+            logger.exception(
+                "call %s: force-message translation failed language=%s; using "
+                "authoritative source text",
+                self.call_id,
+                language.code,
+            )
+            return message
+        self._language_translation_cache[cache_key] = translated
+        return translated
+
     async def _send_force_message(self, message: str, *, protect_playback: bool = False) -> None:
         """Speak an authoritative backend result verbatim without another model turn.
 
@@ -5242,6 +5483,7 @@ class XAIVoiceSession:
                 reason="already_greeted",
             )
             return
+        spoken_message = await self._localized_force_message(message)
         await self._send(
             {
                 "type": "conversation.item.create",
@@ -5249,7 +5491,7 @@ class XAIVoiceSession:
                     "type": "force_message",
                     "role": "assistant",
                     "interruptible": True,
-                    "content": [{"type": "output_text", "text": message}],
+                    "content": [{"type": "output_text", "text": spoken_message}],
                 },
             }
         )
@@ -5973,6 +6215,12 @@ class XAIVoiceSession:
         if name in self._AVAILABILITY_PROBE_TOOLS and self._recover_availability_tool:
             self._recover_availability_tool = False
 
+        if name == SET_CONVERSATION_LANGUAGE_TOOL["name"]:
+            output = await self._run_set_conversation_language(raw_args)
+            await self._send_function_output(call_ref, output)
+            await self._persist_session()
+            return
+
         from app.services.enhancements import pending as enhancement_pending
         if (enhancement_pending(self.session) or (self.session.entities.get("smart_enhancement") or {}).get("phase") == "checking") and name in self._AVAILABILITY_PROBE_TOOLS | {CONFIRM_APPOINTMENT_TOOL["name"]}:
             await self._send_function_output(call_ref, json.dumps({"status": "awaiting_enhancement_response", "booked": False}), nudge=False)
@@ -6431,6 +6679,13 @@ class XAIVoiceSession:
             if text:
                 self._pending_caller = text
             caller_text = self._pending_caller.strip()
+            if caller_text and self._locked_call_language() is None:
+                detected_language = detect_requested_call_language(caller_text)
+                if detected_language is not None and detected_language.code != "en":
+                    await self._lock_conversation_language(
+                        detected_language,
+                        source="caller_transcript",
+                    )
             self._flush_caller_turn()
             if caller_text and capture_caller_name_answer(self.session, caller_text):
                 self._caller_name_question_sent = False

@@ -54,6 +54,7 @@ async def test_outbound_bridge_uses_sales_objective_and_ara(monkeypatch):
     assert "salon owner" in config["instructions"]
     assert "never to a spa calendar" in config["instructions"]
     assert {tool["name"] for tool in config["tools"]} == {
+        "set_conversation_language",
         "check_availability", "propose_appointment", "confirm_appointment",
     }
     assert config["audio"]["input"]["format"]["type"] == "audio/pcmu"

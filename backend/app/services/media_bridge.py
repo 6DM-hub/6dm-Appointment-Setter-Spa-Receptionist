@@ -140,6 +140,14 @@ class TwilioMediaBridge(XAIVoiceSession):
             direction=self.session.direction,
             call_objective=self.session.call_objective,
         )
+        instructions += self._booking_write_protocol_instructions()
+        instructions += self._language_protocol_instructions()
+        locked_language = self._locked_call_language()
+        if locked_language is not None:
+            from app.services.call_language import locked_language_instruction
+
+            instructions += locked_language_instruction(locked_language)
+        self._realtime_instructions = instructions
         requested_voice = resolve_xai_voice(
             self.session.entities.get("xai_voice") or settings.XAI_VOICE_ID
         )
@@ -162,7 +170,13 @@ class TwilioMediaBridge(XAIVoiceSession):
                     # G.711 μ-law 8kHz both ways — byte-identical to Twilio's
                     # PCMU payloads, so no transcoding is needed anywhere.
                     "audio": {
-                        "input": {"format": {"type": "audio/pcmu"}},
+                        "input": {
+                            "format": {"type": "audio/pcmu"},
+                            **(
+                                {"transcription": {"language_hint": locked_language.code}}
+                                if locked_language is not None else {}
+                            ),
+                        },
                         "output": {
                             "format": {"type": "audio/pcmu"},
                             # Explicit normal speed keeps speech pacing stable.
@@ -179,6 +193,7 @@ class TwilioMediaBridge(XAIVoiceSession):
 
         if self.session.direction == "outbound":
             return [tool for tool in VOICE_TOOLS if tool["name"] in {
+                "set_conversation_language",
                 "check_availability", "propose_appointment", "confirm_appointment",
             }]
         return VOICE_TOOLS

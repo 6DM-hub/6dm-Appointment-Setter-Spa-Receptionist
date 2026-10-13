@@ -41,12 +41,53 @@ from app.services.truth_log import truth
 # Matched against the caller's most recent utterance only. Kept deliberately
 # tight: a false positive books an appointment the caller never agreed to,
 # which is far worse than asking them to confirm twice.
-_AFFIRMATIVE = {
+_ENGLISH_AFFIRMATIVE = {
     "yes", "yeah", "yep", "yup", "yes please", "sure", "ok", "okay", "correct",
     "right", "exactly", "perfect", "great", "sounds good", "that works",
     "works for me", "go ahead", "book it", "confirm", "confirmed", "do it",
     "lets do it", "let's do it", "please do", "absolutely", "definitely",
     "that's right", "thats right", "affirmative", "sounds great", "i confirm",
+}
+
+# Exact-only confirmations in the languages supported by Grok Realtime. They
+# are intentionally not eligible for the English prefix rule below: "sí" may
+# confirm, while "sí, pero mañana" must never book the prior slot.
+_TRANSLATED_AFFIRMATIVE = {
+    "sí", "sí por favor", "si por favor", "de acuerdo", "adelante",  # Spanish
+    "oui", "bien sûr", "d'accord", "allez y",  # French
+    "sim", "pode reservar", "está certo",  # Portuguese
+    "ja", "natürlich", "in ordnung",  # German
+    "sì", "certo", "va bene", "proceda",  # Italian
+    "ya", "iya", "tentu", "silakan",  # Indonesian
+    "evet", "tabii", "devam",  # Turkish
+    "vâng", "đúng", "được",  # Vietnamese
+    "да", "конечно",  # Russian
+    "نعم", "بالتأكيد",  # Arabic
+    "हाँ", "हां", "बिल्कुल",  # Hindi
+    "হ্যাঁ",  # Bengali
+    "是", "好的", "可以",  # Chinese
+    "はい", "お願いします",  # Japanese
+    "네", "예", "좋아요",  # Korean
+}
+_AFFIRMATIVE = _ENGLISH_AFFIRMATIVE | _TRANSLATED_AFFIRMATIVE
+
+_NEGATIVE = {
+    "no", "no thanks", "no thank you", "not now",
+    "no gracias", "ahora no",  # Spanish
+    "non", "non merci", "pas maintenant",  # French
+    "não", "não obrigado", "agora não",  # Portuguese
+    "nein", "nein danke", "jetzt nicht",  # German
+    "no grazie", "non ora",  # Italian
+    "tidak", "tidak terima kasih",  # Indonesian
+    "hayır", "hayır teşekkürler",  # Turkish
+    "không", "không cảm ơn",  # Vietnamese
+    "нет", "нет спасибо",  # Russian
+    "لا", "لا شكرا",  # Arabic
+    "नहीं",  # Hindi
+    "না",  # Bengali
+    "不", "不用", "不要",  # Chinese
+    "いいえ", "結構です",  # Japanese
+    "아니요", "괜찮아요",  # Korean
 }
 
 # Any of these anywhere in the utterance means the caller is still negotiating,
@@ -187,7 +228,7 @@ def utterance_modifies_booking(utterance: str | None) -> bool:
     if _VETO.search(text):
         return True
     remainder = text
-    for phrase in sorted(_AFFIRMATIVE, key=len, reverse=True):
+    for phrase in sorted(_ENGLISH_AFFIRMATIVE, key=len, reverse=True):
         if remainder == phrase:
             return False
         if remainder.startswith(phrase + " "):
@@ -214,10 +255,15 @@ def is_affirmative(utterance: str | None) -> bool:
         return True
     words = text.split()
     if len(words) <= 8:
-        for phrase in _AFFIRMATIVE:
+        for phrase in _ENGLISH_AFFIRMATIVE:
             if text.startswith(phrase + " ") or text == phrase:
                 return True
     return False
+
+
+def is_negative(utterance: str | None) -> bool:
+    """Whether the caller gave a short, unambiguous refusal."""
+    return _normalize(utterance or "") in _NEGATIVE
 
 
 # Anything that could plausibly carry a date, a time, or a scheduling request.

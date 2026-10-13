@@ -109,6 +109,7 @@ async def test_session_update_carries_the_tenant_persona(bridge):
     # the model on this path would still be able to book on hearing a date.
     names = [t["name"] for t in session["tools"]]
     assert names == [
+        "set_conversation_language",
         "lookup_spa_facts",
         "check_availability",
         "propose_appointment",
@@ -123,6 +124,23 @@ async def test_session_update_carries_the_tenant_persona(bridge):
     # commit the current pending request.
     confirm = next(t for t in session["tools"] if t["name"] == "confirm_appointment")
     assert confirm["parameters"]["properties"] == {}
+
+
+async def test_bridge_restores_locked_language_without_changing_ara_or_pcmu(bridge):
+    bridge.session.entities["conversation_language"] = {
+        "name": "Spanish",
+        "code": "es-MX",
+        "locked": True,
+    }
+
+    await bridge._configure()
+
+    session = bridge.xai_sent[0]["session"]
+    assert "Speak only Spanish" in session["instructions"]
+    assert session["audio"]["input"]["transcription"]["language_hint"] == "es-MX"
+    assert session["audio"]["input"]["format"]["type"] == "audio/pcmu"
+    assert session["audio"]["output"]["format"]["type"] == "audio/pcmu"
+    assert session["voice"] == settings.XAI_VOICE_ID
 
 
 async def test_bridge_url_has_no_call_id(bridge):

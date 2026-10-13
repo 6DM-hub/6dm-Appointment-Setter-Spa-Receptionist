@@ -161,7 +161,7 @@ def primary_caller_language(session: CallSession, detected: str | None) -> str |
 VOICE_CALL_BASE_RULES = """
 RULES:
 - You are on a live phone call. Twilio will speak your reply aloud via text-to-speech.
-- Keep responses SHORT (1-2 sentences), natural, and conversational. 
+- Keep responses SHORT (1-2 sentences), natural, and conversational.
 - Never use markdown, bullet points, lists, emojis, or special characters.
 - Confirm names, phone numbers, dates, and times by repeating them back.
 - If you don't understand, politely ask the caller to repeat.
@@ -178,7 +178,7 @@ SALES_AGENT_PROMPT = f"""
 You are a top-tier B2B sales agent for 6DM.
 Current date/time: {{now_iso}}.
 
-Your goal is to talk to the business owner or manager, qualify their business, 
+Your goal is to talk to the business owner or manager, qualify their business,
 handle objections smoothly, and book a sales presentation on Dominic's calendar.
 
 {VOICE_CALL_BASE_RULES}
@@ -760,6 +760,47 @@ class GrokService:
         except Exception:
             logger.exception("Call analysis failed for call %s", session.call_sid)
             return None
+
+    async def translate_voice_message(self, message: str, language_name: str) -> str:
+        """Translate one backend-owned spoken line without changing its facts.
+
+        Realtime ``force_message`` is verbatim TTS, so session instructions
+        cannot translate these authoritative booking/card/recovery sentences.
+        Callers must still hear them in the language selected for the call.
+        Callers' content is never included here; only the single sanitized line
+        that Cara is about to speak is sent to the existing xAI text endpoint.
+
+        The caller owns placeholders such as ``__CARA_KEEP_0__``.  The caller
+        validates/restores those tokens after translation so provider IDs,
+        business names, services, and staff names cannot be rewritten.
+        """
+        source = _tts_text(message)
+        if not source or language_name.casefold() == "english":
+            return source
+        raw = await self._chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You translate short lines for a live spa receptionist. "
+                        f"Translate into {language_name}. Return JSON with exactly one "
+                        "string field named translation. Preserve every token shaped "
+                        "like __CARA_KEEP_0__ exactly, preserve every number and URL, "
+                        "and do not add explanations, facts, promises, or booking status. "
+                        "Keep the tone warm, concise, and natural for speech."
+                    ),
+                },
+                {"role": "user", "content": source},
+            ],
+            json_mode=True,
+            temperature=0.0,
+            max_tokens=512,
+        )
+        payload = json.loads(raw)
+        translated = _tts_text(str(payload.get("translation") or ""))
+        if not translated:
+            raise ValueError("xAI returned an empty voice translation")
+        return translated
 
 
 grok_service = GrokService()

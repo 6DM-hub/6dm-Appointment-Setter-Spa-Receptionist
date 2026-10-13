@@ -474,7 +474,7 @@ async def prepare(db, session, routing):
 
 def respond(session, text):
     """Returns (handled, line, status, continue_original). No silent consent."""
-    from app.services.booking_state import is_affirmative, BookingDraft
+    from app.services.booking_state import is_affirmative, is_negative, BookingDraft
     state = session.entities.get(KEY) or {}
     if not pending(session):
         return False, None, None, False
@@ -487,7 +487,7 @@ def respond(session, text):
         remember_offer(session)
         accept_offer(session)
         return True, None, "declined", True
-    if normalized in {"no", "no thanks", "no thank you", "just the original", "keep the original"}:
+    if is_negative(text) or normalized in {"just the original", "keep the original"}:
         state["phase"] = "declined"
         # Declining a suggestion alone is not consent to create the base booking.
         return True, "Of course, we'll keep your original treatment. Would you like me to book it?", "declined", False
