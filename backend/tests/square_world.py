@@ -327,3 +327,30 @@ def local(dt: datetime) -> str:
     """Business-local wall clock, as the voice tools send it."""
     from zoneinfo import ZoneInfo
     return dt.astimezone(ZoneInfo(CHICAGO)).replace(tzinfo=None).isoformat(timespec="seconds")
+
+
+def voice_for(world, session, monkeypatch):
+    """A realtime voice session wired to this world's DB and appointment lookup."""
+    from contextlib import asynccontextmanager
+
+    from app.services import xai_realtime
+    from app.services.xai_realtime import XAIVoiceSession
+
+    @asynccontextmanager
+    async def _db():
+        yield world.db
+
+    async def _upcoming(_db, _session, limit=10):
+        return sorted(world.store.live, key=lambda row: row.start_time)[:limit]
+
+    async def _noop(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(xai_realtime, "AsyncSessionLocal", _db)
+    monkeypatch.setattr(xai_realtime, "lookup_upcoming_appointments", _upcoming)
+    voice = XAIVoiceSession(session.call_sid, session)
+    voice._send = _noop
+    voice._cancel_active_response = _noop
+    voice._persist_session = _noop
+    voice._arm_availability_hold = _noop
+    return voice

@@ -2733,8 +2733,36 @@ class XAIVoiceSession:
                     })
                 draft.target_appointment_id = appointment_id
                 draft.offered_appointment_ids = list(by_id)
-            elif current_id:
+            elif current_id and not [appt for appt in upcoming if str(appt.id) != str(current_id)]:
                 draft.target_appointment_id = current_id
+            elif current_id:
+                # This call booked one appointment, but the caller also has
+                # others. "Move my Friday facial" must not silently move the
+                # one booked a minute ago: ask which appointment, listing all.
+                choices = list(upcoming)
+                draft.operation_mode = "reschedule"
+                draft.target_appointment_id = None
+                draft.offered_appointment_ids = [str(appt.id) for appt in choices]
+                save_draft(self.session, draft)
+                await self._persist_session()
+                truth("RESCHEDULE_TARGET_ASKED", call_sid=self.call_id, choices=len(choices))
+                return json.dumps({
+                    "status": "needs_appointment_selection",
+                    "booked": False,
+                    "appointment_options": [
+                        {
+                            "appointment_id": str(appt.id),
+                            "start_iso": appt.start_time.isoformat(),
+                            "service": appt.title,
+                        }
+                        for appt in choices
+                    ],
+                    "message": (
+                        "The caller has more than one upcoming appointment, including the "
+                        "one just booked. Nothing was changed. Read the choices back and "
+                        "ask which one to move before staging the new time."
+                    ),
+                })
             elif len(upcoming) == 1:
                 draft.target_appointment_id = str(upcoming[0].id)
                 draft.offered_appointment_ids = [str(upcoming[0].id)]

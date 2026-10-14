@@ -1885,13 +1885,39 @@ async def confirm_booking(
         # them decides whether a row already exists.
         await _lock_call(db, session.call_sid)
 
-        existing = await _load_by_intent_key(db, routing.scope, key)
-        if existing is None:
-            # State written before this key existed, or lost from Redis. Adopt
-            # the row rather than shadowing it with a duplicate.
+        targeted = bool(draft.operation_mode == "reschedule" and draft.target_appointment_id)
+        if targeted:
+            # The caller chose WHICH appointment to move (from the backend's
+            # own lookup, or this call's booking). Load exactly that row. Never
+            # fall back to this call's intent row: in a call that already
+            # booked appointment A, "move my Friday appointment" (B) must move
+            # B, not A.
             existing = await _load_active_appointment(
-                db, routing.scope, draft.appointment_id
-            ) or await _load_call_owned_appointment(db, routing.scope, session.call_sid)
+                db, routing.scope, draft.target_appointment_id
+            )
+            if existing is None:
+                truth(
+                    "RESCHEDULE_TARGET_MISSING",
+                    call_sid=session.call_sid,
+                    target_appointment_id=draft.target_appointment_id,
+                )
+                session.booking_status = "collecting_details"
+                return BookingResult(
+                    BookingOutcome.NOT_FOUND,
+                    message=(
+                        "The appointment the caller chose to move is no longer active, so "
+                        "nothing was changed. Look up their upcoming appointments again and "
+                        "ask which one to move. Do not create a new appointment."
+                    ),
+                )
+        else:
+            existing = await _load_by_intent_key(db, routing.scope, key)
+            if existing is None:
+                # State written before this key existed, or lost from Redis. Adopt
+                # the row rather than shadowing it with a duplicate.
+                existing = await _load_active_appointment(
+                    db, routing.scope, draft.appointment_id
+                ) or await _load_call_owned_appointment(db, routing.scope, session.call_sid)
 
         if existing is None and draft.operation_mode == "reschedule":
             # Cross-call reschedules must target an appointment the backend has
@@ -1913,7 +1939,9 @@ async def confirm_booking(
 
         # getattr: rows written before this column existed, and the stub
         # appointments the adapter tests use, may not carry the attribute.
-        if existing is not None and not getattr(existing, "booking_intent_key", None):
+        # A targeted row may belong to another intent; giving it this call's key
+        # would make the key point at two different appointments.
+        if existing is not None and not targeted and not getattr(existing, "booking_intent_key", None):
             existing.booking_intent_key = key
 
         if existing is not None:
