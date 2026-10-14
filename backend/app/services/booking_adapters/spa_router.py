@@ -31,6 +31,7 @@ from app.services.booking_adapters.base import (
     BookingAdapter,
     BookingContext,
     BookingProviderError,
+    CaraNativeAdapter,
     ExternalBooking,
     ProviderNotConfigured,
 )
@@ -210,6 +211,14 @@ class ProviderNotConfiguredAdapter(BookingAdapter):
         self.calendar_label = f"{spa_name}'s {provider} calendar"
         self.default_title = "Spa Service Appointment"
 
+    async def check_availability(self, ctx: BookingContext) -> AvailabilityVerdict:
+        # Nothing can be verified without the calendar. The inherited default
+        # ("available", no slot) let Cara promise times it could never book.
+        raise BookingProviderError(
+            f"{self.calendar_label} is not connected, so availability cannot be verified.",
+            code="CALENDAR_NOT_CONNECTED",
+        )
+
     async def create_booking(self, ctx: BookingContext) -> ExternalBooking:
         raise ProviderNotConfigured(
             f"{self.provider} is not configured or has no live booking adapter"
@@ -224,6 +233,27 @@ class SpaBookingAdapter(BookingAdapter):
         self.calendar_label = f"{spa.name}'s service calendar"
         self.default_title = "Spa Service Appointment"
         self.default_duration_minutes = self._default_duration(spa)
+
+    @staticmethod
+    def uses_cara_native_scheduling(spa: SpaAccount) -> bool:
+        """Explicit per-spa opt-in: CARA's appointments are the calendar of record."""
+        policies = getattr(spa, "booking_policies", None) or {}
+        return policies.get("scheduling_source") == "cara_native"
+
+    @property
+    def supports_list_openings(self) -> bool:  # type: ignore[override]
+        return bool(getattr(self.delegate, "supports_list_openings", False))
+
+    @staticmethod
+    def _require_verified(verdict: AvailabilityVerdict) -> AvailabilityVerdict:
+        """An "available" with no slot was never checked by anything that can
+        hold the booking. Treat it as a lookup failure, not a promise."""
+        if verdict.available and not verdict.slot:
+            raise BookingProviderError(
+                "The calendar did not confirm this time, so it cannot be offered.",
+                code="AVAILABILITY_UNVERIFIED",
+            )
+        return verdict
 
     @property
     def supports_customer_lookup(self) -> bool:  # type: ignore[override]
@@ -310,6 +340,11 @@ class SpaBookingAdapter(BookingAdapter):
 
         if spa.booking_provider == BookingProvider.GOOGLE_CALENDAR:
             if missing_config(spa.booking_provider, config):
+                if SpaBookingAdapter.uses_cara_native_scheduling(spa):
+                    return CaraNativeAdapter(
+                        calendar_label=f"{spa.name}'s CARA calendar",
+                        default_title="Spa Service Appointment",
+                    )
                 return ProviderNotConfiguredAdapter(spa.name, spa.booking_provider.value)
             return fallback
 
@@ -791,8 +826,20 @@ class SpaBookingAdapter(BookingAdapter):
             )
         return AvailabilityVerdict.no(verdict.reason or "unavailable", alternatives=alternatives)
 
+    def _visit_path(self, ctx: BookingContext) -> bool:
+        """Multi-step visits are verified against Square only. Any other
+        calendar cannot prove the whole sequence fits, so refuse to claim it."""
+        if not self.requires_visit_validation(ctx):
+            return False
+        if self.delegate.provider != "square":
+            raise BookingProviderError(
+                "This visit needs staff, resource or multi-service checks this calendar cannot verify.",
+                code="VISIT_UNSUPPORTED",
+            )
+        return True
+
     async def list_openings(self, ctx: BookingContext, range_start, range_end):
-        if self.requires_visit_validation(ctx):
+        if self.delegate.provider == "square" and self.requires_visit_validation(ctx):
             from app.services.visit_booking import list_visits
             return await list_visits(self, ctx, range_start, range_end)
         ctx, staff_block = self._staff_context(ctx)
@@ -818,7 +865,7 @@ class SpaBookingAdapter(BookingAdapter):
 
     # -- BookingAdapter ---------------------------------------------------- #
     async def check_availability(self, ctx: BookingContext) -> AvailabilityVerdict:
-        if self.requires_visit_validation(ctx):
+        if self._visit_path(ctx):
             from app.services.visit_booking import check_visit
             return await check_visit(self, ctx)
         # Square is the operational source of truth.  Do not reject a Square
@@ -862,19 +909,19 @@ class SpaBookingAdapter(BookingAdapter):
             )
 
         if not self.spa.services:
-            return await self.delegate.check_availability(ctx)
+            return self._require_verified(await self.delegate.check_availability(ctx))
 
         requested_service = ctx.service_description or ctx.title
         resolution = self.resolve_service(requested_service)
         if resolution.status != "resolved" or resolution.entry is None:
             return AvailabilityVerdict.no(self._clarification_reason(resolution))
 
-        return await self.delegate.check_availability(
-            self._apply_entry(ctx, resolution.entry)
+        return self._require_verified(
+            await self.delegate.check_availability(self._apply_entry(ctx, resolution.entry))
         )
 
     async def create_booking(self, ctx: BookingContext) -> ExternalBooking:
-        if self.requires_visit_validation(ctx):
+        if self._visit_path(ctx):
             from app.services.visit_booking import create_visit
             return await create_visit(self, ctx)
         canonical_ctx, canonical_name = self._canonicalize_ctx(ctx)

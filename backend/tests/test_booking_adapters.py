@@ -341,9 +341,11 @@ async def test_spa_refuses_bookings_outside_business_hours():
 
 @pytest.mark.asyncio
 async def test_spa_accepts_bookings_inside_business_hours():
+    # CARA-native: an unconnected calendar no longer vouches for any time.
     spa = make_spa(
         business_hours={"wed": [{"open": "09:00", "close": "18:00"}]},
         timezone="UTC",
+        booking_policies={"scheduling_source": "cara_native"},
     )
 
     assert (await SpaBookingAdapter(spa).check_availability(_ctx())).available

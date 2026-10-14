@@ -169,6 +169,7 @@ async def test_thursday_2pm_local_is_inside_business_hours_end_to_end(monkeypatc
         business_hours={"thu": [{"open": "10:00", "close": "18:00"}]},
         timezone="America/Chicago",
         services=[{"name": "Deep tissue massage", "duration_minutes": 60}],
+        booking_policies={"scheduling_source": "cara_native"},
     )
     monkeypatch.setattr(appointment_booking_service, "_load_spa", lambda *_: _async_value(spa))
     monkeypatch.setattr(appointment_booking_service, "_has_conflict", lambda *_a, **_k: _async_value(False))
@@ -218,6 +219,7 @@ async def test_saturday_10am_local_is_inside_business_hours(monkeypatch):
         business_hours={"sat": [{"open": "10:00", "close": "16:00"}]},
         timezone="America/Chicago",
         services=[{"name": "Deep tissue massage", "duration_minutes": 60}],
+        booking_policies={"scheduling_source": "cara_native"},
     )
     monkeypatch.setattr(appointment_booking_service, "_load_spa", lambda *_: _async_value(spa))
     monkeypatch.setattr(appointment_booking_service, "_has_conflict", lambda *_a, **_k: _async_value(False))
