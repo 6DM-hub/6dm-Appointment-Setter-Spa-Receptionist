@@ -10,10 +10,13 @@ import {
 import { useAuth } from "../auth/AuthContext";
 import { PageHeader, Panel, StateBlock } from "../components/ui/Primitives";
 import {
+  SLOT_MINUTES,
+  axisPosition,
+  buildWeekGrid,
   fetchWindow,
+  initialScrollSlot,
   layoutDay,
   todayIn,
-  initialScrollMinute,
   weekDays,
   type DaySegment,
 } from "../lib/calendarLayout";
@@ -23,7 +26,6 @@ import {
   civilDateKey,
   isValidTimeZone,
   sameCivilDate,
-  zonedMinuteOfDay,
   type CivilDate,
 } from "../lib/zonedTime";
 
@@ -45,8 +47,7 @@ const CARD_STATUS_LABELS: Record<string, string> = {
 };
 
 const HOUR_HEIGHT = 56;
-const PX_PER_MINUTE = HOUR_HEIGHT / 60;
-const GRID_HEIGHT = 24 * HOUR_HEIGHT;
+const SLOT_HEIGHT = (HOUR_HEIGHT * SLOT_MINUTES) / 60;
 
 type ZoneState =
   | { status: "loading" }
@@ -59,6 +60,13 @@ interface WeekData {
   complete: boolean;
 }
 
+interface TimeFormats {
+  time: Intl.DateTimeFormat;
+  /** Same, with the zone abbreviation, for times in a repeated (fall-back) hour. */
+  timeWithZone: Intl.DateTimeFormat;
+  zoneName: Intl.DateTimeFormat;
+}
+
 // Civil dates are formatted as UTC midnights so the browser's zone never shifts them.
 const utcFormat = (options: Intl.DateTimeFormatOptions) =>
   new Intl.DateTimeFormat(undefined, { ...options, timeZone: "UTC" });
@@ -67,6 +75,8 @@ const monthDayLabel = utcFormat({ month: "short", day: "numeric" });
 const fullDateLabel = utcFormat({ month: "short", day: "numeric", year: "numeric" });
 const hourLabel = utcFormat({ hour: "numeric" });
 const civilUtc = (d: CivilDate) => Date.UTC(d.year, d.month - 1, d.day);
+const zoneAbbreviation = (format: Intl.DateTimeFormat, instant: number) =>
+  format.formatToParts(instant).find((part) => part.type === "timeZoneName")?.value;
 
 const toolbarButton =
   "rounded-lg border border-slate-700 text-slate-300 transition hover:bg-slate-800 disabled:opacity-40";
@@ -149,6 +159,10 @@ export default function CalendarView({
     const base = anchor ?? today;
     return timeZone && base ? weekDays(base, timeZone) : [];
   }, [anchorKey, todayKey, timeZone]);
+  const grid = useMemo(
+    () => (timeZone && days.length > 0 ? buildWeekGrid(days, timeZone) : null),
+    [days, timeZone]
+  );
 
   useEffect(() => {
     if (days.length === 0) return;
@@ -175,37 +189,62 @@ export default function CalendarView({
 
   const columns = useMemo(
     () =>
-      timeZone
-        ? days.map((day) => ({ day, segments: layoutDay(week?.items ?? [], day, timeZone) }))
+      grid
+        ? grid.columns.map((column) => ({
+            column,
+            segments: layoutDay(week?.items ?? [], column, grid.slots),
+          }))
         : [],
-    [days, week, timeZone]
+    [grid, week]
   );
   // Open the day at its first booking whenever a week's data arrives. The grid
   // only mounts once loading ends, so that has to retrigger this too.
   useEffect(() => {
-    if (loading || !scrollRef.current) return;
-    const minute = initialScrollMinute(columns.flatMap((column) => column.segments));
-    scrollRef.current.scrollTop = minute * PX_PER_MINUTE;
-  }, [columns, loading]);
+    if (loading || !grid || !scrollRef.current) return;
+    const slot = initialScrollSlot(grid.slots, columns.flatMap((c) => c.segments));
+    scrollRef.current.scrollTop = slot * SLOT_HEIGHT;
+  }, [grid, columns, loading]);
   const shownCount = useMemo(
     () => new Set(columns.flatMap((c) => c.segments.map((s) => s.item.id))).size,
     [columns]
   );
-  const timeLabel = useMemo(
+  const formats = useMemo<TimeFormats | null>(
     () =>
       timeZone
-        ? new Intl.DateTimeFormat(undefined, { timeZone, hour: "numeric", minute: "2-digit" })
+        ? {
+            time: new Intl.DateTimeFormat(undefined, { timeZone, hour: "numeric", minute: "2-digit" }),
+            timeWithZone: new Intl.DateTimeFormat(undefined, {
+              timeZone,
+              hour: "numeric",
+              minute: "2-digit",
+              timeZoneName: "short",
+            }),
+            zoneName: new Intl.DateTimeFormat(undefined, { timeZone, timeZoneName: "short" }),
+          }
         : null,
     [timeZone]
   );
 
-  let zoneLabel = "";
-  if (timeZone) {
-    const abbreviation = new Intl.DateTimeFormat(undefined, { timeZone, timeZoneName: "short" })
-      .formatToParts(now)
-      .find((part) => part.type === "timeZoneName")?.value;
-    zoneLabel = abbreviation ? `${timeZone} (${abbreviation})` : timeZone;
-  }
+  // Hour labels; a clock hour that occurs twice this week is labelled with its offset.
+  const hourMarks = useMemo(() => {
+    if (!grid || !formats) return [];
+    const repeatedHours = new Set(
+      grid.slots.filter((s) => s.occurrence > 0).map((s) => Math.floor(s.wallMinute / 60))
+    );
+    return grid.slots.flatMap((slot, index) => {
+      if (slot.wallMinute % 60 !== 0) return [];
+      const hour = slot.wallMinute / 60;
+      const label = hourLabel.format(Date.UTC(2000, 0, 1, hour));
+      const zoneSuffix = repeatedHours.has(hour) ? zoneAbbreviation(formats.zoneName, slot.sample) : "";
+      return [{ index, label: zoneSuffix ? `${label} ${zoneSuffix}` : label }];
+    });
+  }, [grid, formats]);
+
+  const zoneLabel = (() => {
+    if (!timeZone || !formats) return "";
+    const abbreviation = zoneAbbreviation(formats.zoneName, now);
+    return abbreviation ? `${timeZone} (${abbreviation})` : timeZone;
+  })();
   const usingBrowserZone = zone.status === "ready" && zone.source === "browser";
 
   const rangeLabel =
@@ -218,7 +257,7 @@ export default function CalendarView({
     if (days.length > 0) setAnchor(addCivilDays(days[0].date, weeks * 7));
   };
   const isCurrentWeek = !!today && days.some((day) => sameCivilDate(day.date, today));
-  const nowMinute = timeZone ? zonedMinuteOfDay(now, timeZone) : -1;
+  const gridHeight = (grid?.slots.length ?? 0) * SLOT_HEIGHT;
 
   const toolbar = (
     <div className="flex flex-wrap items-center gap-2">
@@ -291,9 +330,15 @@ export default function CalendarView({
               browser's zone.
             </p>
           )}
+          {grid?.hasRepeatedTime && (
+            <p className="border-b border-slate-800 px-5 py-2 text-[11px] text-slate-400">
+              Clocks go back this week: the repeated hour is shown twice, labelled with its time
+              zone.
+            </p>
+          )}
           <div ref={scrollRef} className="max-h-[640px] overflow-auto">
             <div className="min-w-[880px]">
-              <div className="sticky top-0 z-20 grid grid-cols-[56px_repeat(7,minmax(0,1fr))] border-b border-slate-800 bg-[#091525]">
+              <div className="sticky top-0 z-20 grid grid-cols-[64px_repeat(7,minmax(0,1fr))] border-b border-slate-800 bg-[#091525]">
                 <div />
                 {days.map((day) => {
                   const isToday = !!today && sameCivilDate(day.date, today);
@@ -314,43 +359,59 @@ export default function CalendarView({
                 })}
               </div>
 
-              <div className="grid grid-cols-[56px_repeat(7,minmax(0,1fr))]">
-                <div className="relative" style={{ height: GRID_HEIGHT }}>
-                  {Array.from({ length: 23 }, (_, i) => (
-                    <span
-                      key={i}
-                      className="absolute right-2 -translate-y-1/2 text-[10px] text-slate-500"
-                      style={{ top: (i + 1) * HOUR_HEIGHT }}
-                    >
-                      {hourLabel.format(Date.UTC(2000, 0, 1, i + 1))}
-                    </span>
-                  ))}
-                </div>
-                {columns.map(({ day, segments }) => (
-                  <div
-                    key={day.key}
-                    className="relative border-l border-slate-800"
-                    style={{
-                      height: GRID_HEIGHT,
-                      backgroundImage:
-                        "repeating-linear-gradient(to bottom, rgba(51,65,85,.55) 0 1px, transparent 1px 100%)",
-                      backgroundSize: `100% ${HOUR_HEIGHT}px`,
-                    }}
-                  >
-                    {segments.map((segment) => (
-                      <AppointmentBlock key={segment.item.id} segment={segment} timeLabel={timeLabel} />
-                    ))}
-                    {today && sameCivilDate(day.date, today) && (
-                      <div
-                        aria-hidden
-                        className="pointer-events-none absolute inset-x-0 z-10 h-0.5 bg-rose-500"
-                        style={{ top: nowMinute * PX_PER_MINUTE }}
+              <div className="grid grid-cols-[64px_repeat(7,minmax(0,1fr))]">
+                <div className="relative" style={{ height: gridHeight }}>
+                  {hourMarks
+                    .filter((mark) => mark.index > 0)
+                    .map((mark) => (
+                      <span
+                        key={mark.index}
+                        className="absolute right-2 -translate-y-1/2 whitespace-nowrap text-[10px] text-slate-500"
+                        style={{ top: mark.index * SLOT_HEIGHT }}
                       >
-                        <span className="absolute -left-1 -top-[3px] h-2 w-2 rounded-full bg-rose-500" />
-                      </div>
-                    )}
-                  </div>
-                ))}
+                        {mark.label}
+                      </span>
+                    ))}
+                </div>
+                {columns.map(({ column, segments }) => {
+                  const isToday = !!today && sameCivilDate(column.date, today);
+                  return (
+                    <div
+                      key={column.key}
+                      className="relative border-l border-slate-800"
+                      style={{ height: gridHeight }}
+                    >
+                      {hourMarks.map((mark) => (
+                        <div
+                          key={mark.index}
+                          aria-hidden
+                          className="absolute inset-x-0 h-px bg-slate-700/50"
+                          style={{ top: mark.index * SLOT_HEIGHT }}
+                        />
+                      ))}
+                      {column.missing.map(([from, to]) => (
+                        <div
+                          key={from}
+                          title="This time doesn't occur on this day (clock change)"
+                          className="absolute inset-x-0 bg-[repeating-linear-gradient(135deg,rgba(51,65,85,.35)_0_4px,transparent_4px_8px)]"
+                          style={{ top: from * SLOT_HEIGHT, height: (to - from) * SLOT_HEIGHT }}
+                        />
+                      ))}
+                      {segments.map((segment) => (
+                        <AppointmentBlock key={segment.item.id} segment={segment} formats={formats} />
+                      ))}
+                      {isToday && now >= column.start && now < column.end && (
+                        <div
+                          aria-hidden
+                          className="pointer-events-none absolute inset-x-0 z-10 h-0.5 bg-rose-500"
+                          style={{ top: axisPosition(column, now) * SLOT_HEIGHT }}
+                        >
+                          <span className="absolute -left-1 -top-[3px] h-2 w-2 rounded-full bg-rose-500" />
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             </div>
           </div>
@@ -367,19 +428,20 @@ export default function CalendarView({
 
 function AppointmentBlock({
   segment,
-  timeLabel,
+  formats,
 }: {
   segment: DaySegment<Appointment>;
-  timeLabel: Intl.DateTimeFormat | null;
+  formats: TimeFormats | null;
 }) {
-  const { item, startMinute, endMinute, lane, laneCount } = segment;
-  const range = timeLabel
-    ? `${timeLabel.format(new Date(item.start_time))} – ${timeLabel.format(new Date(item.end_time))}`
+  const { item, startSlot, endSlot, lane, laneCount } = segment;
+  const timeFormat = segment.ambiguous ? formats?.timeWithZone : formats?.time;
+  const range = timeFormat
+    ? `${timeFormat.format(new Date(item.start_time))} – ${timeFormat.format(new Date(item.end_time))}`
     : "";
   const card = item.card_status ? CARD_STATUS_LABELS[item.card_status] : undefined;
   const status = item.status.replace(/_/g, " ");
   const tooltip = [item.title, range, status, card, item.description].filter(Boolean).join("\n");
-  const height = (endMinute - startMinute) * PX_PER_MINUTE;
+  const height = (endSlot - startSlot) * SLOT_HEIGHT;
 
   return (
     <div
@@ -388,7 +450,7 @@ function AppointmentBlock({
         STATUS_BLOCK_STYLES[item.status] || STATUS_BLOCK_STYLES.completed
       }`}
       style={{
-        top: startMinute * PX_PER_MINUTE + 1,
+        top: startSlot * SLOT_HEIGHT + 1,
         height: Math.max(height - 2, 14),
         left: `calc(${(lane / laneCount) * 100}% + 2px)`,
         width: `calc(${100 / laneCount}% - 4px)`,
