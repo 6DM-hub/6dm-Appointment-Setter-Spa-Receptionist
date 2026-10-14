@@ -28,6 +28,7 @@ import {
   sameCivilDate,
   type CivilDate,
 } from "../lib/zonedTime";
+import { calendarStatus } from "../lib/calendarStatus";
 
 const STATUS_BLOCK_STYLES: Record<string, string> = {
   scheduled: "border-cyan-400/60 bg-cyan-400/15 text-cyan-100",
@@ -258,6 +259,12 @@ export default function CalendarView({
   };
   const isCurrentWeek = !!today && days.some((day) => sameCivilDate(day.date, today));
   const gridHeight = (grid?.slots.length ?? 0) * SLOT_HEIGHT;
+  const status = calendarStatus({
+    zoneStatus: zone.status,
+    zoneError: zone.status === "error" ? zone.message : null,
+    loading,
+    error,
+  });
 
   const toolbar = (
     <div className="flex flex-wrap items-center gap-2">
@@ -315,8 +322,8 @@ export default function CalendarView({
         padded={false}
       >
         <StateBlock
-          loading={zone.status === "loading" || loading}
-          error={zone.status === "error" ? zone.message : error}
+          loading={status.loading}
+          error={status.error}
         >
           {week && !week.complete && (
             <p className="border-b border-amber-400/20 bg-amber-400/10 px-5 py-2 text-[11px] text-amber-200">
