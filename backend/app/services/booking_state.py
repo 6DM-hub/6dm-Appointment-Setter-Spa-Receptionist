@@ -780,14 +780,26 @@ _MAYBE_MODIFY_RE = re.compile(
     r"\b(?:rather|earlier|later|different (?:time|day|date))\b",
     re.IGNORECASE,
 )
-# Answers to the "change it, or keep it and add another?" question.
+# Answers to the "change it, add another, or keep it as is?" question.
+# "Keep" is NOT a request for anything new: it preserves the booking as it is.
+_ANSWER_KEEP_RE = re.compile(
+    r"\b(?:keep|never ?mind|nevermind|leave (?:it|that|everything)|forget (?:it|that|about it)|"
+    r"as (?:it|that) is|the way (?:it|that) is|as is|stays? the same|the same as before|"
+    r"no changes?|don'?t change|do not change|don'?t bother|the original)\b",
+    re.IGNORECASE,
+)
 _ANSWER_ADDITIONAL_RE = re.compile(
-    r"\b(?:keep|add|adding|new|another|separate|both|additional|second|also|extra)\b",
+    r"\b(?:add|adding|another|separate|both|additional|second|also|extra|"
+    r"new (?:one|appointment|booking)|book (?:a|an|another) (?:new|second|separate|additional|extra)?)\b",
     re.IGNORECASE,
 )
 _ANSWER_MODIFY_RE = re.compile(
-    r"\b(?:change|update|modify|replace|move|reschedule|switch|existing|instead|"
-    r"current|first one|the first|that one|the one i have)\b",
+    r"\b(?:change|update|modify|replace|move|reschedule|switch|instead|"
+    r"first one|the first|that one)\b",
+    re.IGNORECASE,
+)
+_NEGATED_CHANGE_RE = re.compile(
+    r"\b(?:don'?t|do not|no|not|without|never) (?:change|changing|move|moving|update|switch)\b",
     re.IGNORECASE,
 )
 
@@ -802,7 +814,8 @@ def classify_post_booking_request(utterance: str | None) -> str:
     Returns "modify", "maybe_modify", "additional", or "ambiguous". Only the
     caller's own words count. Clear change wording is "modify"; wording like
     "later" or "rather" is only "maybe_modify"; both kinds of cue, or none, is
-    "ambiguous" and CARA must ask before anything changes.
+    "ambiguous" and CARA must ask before anything changes. "Keep it" /
+    "never mind" is recognised separately by `is_keep_request`.
     """
     text = _caller_text(utterance)
     additional = bool(_ADDITIONAL_REQUEST_RE.search(text))
@@ -814,40 +827,77 @@ def classify_post_booking_request(utterance: str | None) -> str:
 
 
 def classify_change_question_answer(utterance: str | None) -> str:
-    """The caller's answer to "change it, or keep it and add another?".
+    """The caller's answer to "change it, add another, or keep it as is?".
 
-    "Keep it", "a new one", "add another" -> "additional"; "change it",
-    "update it", "the first one" -> "modify"; anything else -> "ambiguous".
+    "keep"       - "keep it", "never mind", "leave it alone", "no, keep the
+                   original": preserve the booking, create and change nothing.
+    "additional" - "add another", "a new one", "keep it and add one".
+    "modify"     - "change it", "update it", "the first one".
+    "ambiguous"  - anything else, or conflicting cues; ask again.
     """
     text = _caller_text(utterance)
-    modify = bool(_ANSWER_MODIFY_RE.search(text))
     additional = bool(_ANSWER_ADDITIONAL_RE.search(text))
-    if modify and not additional:
-        return "modify"
+    # "Don't change it" is a keep, not a change request.
+    modify = bool(_ANSWER_MODIFY_RE.search(_NEGATED_CHANGE_RE.sub(" ", text)))
+    keep = bool(_ANSWER_KEEP_RE.search(text)) or bool(_NEGATED_CHANGE_RE.search(text))
     if additional and not modify:
-        return "additional"
+        return "additional"  # "keep it and add one" asks for an additional booking
+    if modify and not additional and not keep:
+        return "modify"
+    if keep and not additional and not modify:
+        return "keep"
     return "ambiguous"
+
+
+def is_keep_request(utterance: str | None) -> bool:
+    """The caller wants the existing booking left exactly as it is."""
+    return classify_change_question_answer(utterance) == "keep"
+
+
+def _booked_when(booked_iso: str | None, tz: Any) -> str:
+    parsed = _parse_provider_iso(booked_iso)
+    if parsed is None:
+        return ""
+    local = parsed.astimezone(tz) if parsed.tzinfo else parsed
+    return f" on {local.strftime('%A')} at {spoken_slot_time(booked_iso, tz)}"
+
+
+def _booked_service(service: str | None) -> str:
+    return re.sub(r"\s*\(\d+\s*min\)", "", (service or "appointment")).strip() or "appointment"
 
 
 def booking_change_question(
     service: str | None, booked_iso: str | None, tz: Any, *, attempt: int = 1
 ) -> str:
-    """The one question that settles change-versus-add, naming the BOOKED visit."""
-    service = re.sub(r"\s*\(\d+\s*min\)", "", (service or "appointment")).strip() or "appointment"
-    parsed = _parse_provider_iso(booked_iso)
-    when = ""
-    if parsed is not None:
-        local = parsed.astimezone(tz) if parsed.tzinfo else parsed
-        when = f" on {local.strftime('%A')} at {spoken_slot_time(booked_iso, tz)}"
+    """The one question that settles change / add / keep, naming the BOOKED visit."""
+    service = _booked_service(service)
+    when = _booked_when(booked_iso, tz)
     if attempt > 1:
         return (
-            "I want to be sure I don't change the wrong thing. Should I change your "
-            f"{service}{when}, or keep it and add a new appointment? You can say "
-            "'change it' or 'add a new one'."
+            "I want to be sure I don't change the wrong thing. For your "
+            f"{service}{when}, you can say 'change it', 'add a new one', or "
+            "'keep it as is'."
         )
     return (
         f"Just to make sure I get this right: would you like to change your {service}"
-        f"{when}, or keep it and book an additional appointment?"
+        f"{when}, book an additional appointment, or keep everything as it is?"
+    )
+
+
+def kept_booking_speech(service: str | None, booked_iso: str | None, tz: Any) -> str:
+    """Confirmation that nothing was changed or added."""
+    return (
+        f"No problem. Your {_booked_service(service)}{_booked_when(booked_iso, tz)} "
+        "stays exactly as it is, and nothing new was booked. Is there anything else "
+        "I can help you with?"
+    )
+
+
+def additional_booking_notice(service: str | None, booked_iso: str | None, tz: Any) -> str:
+    """Said before an additional appointment can be confirmed."""
+    return (
+        "Just to be clear, this would be an additional appointment. Your "
+        f"{_booked_service(service)}{_booked_when(booked_iso, tz)} stays booked as well."
     )
 
 

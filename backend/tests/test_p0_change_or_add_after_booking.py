@@ -74,7 +74,7 @@ def test_caller_words_decide_change_or_add(utterance, kind):
 
 
 @pytest.mark.parametrize("answer,kind", [
-    ("Keep it.", "additional"),
+    ("Keep it.", "keep"),  # keeps the booking as is; asks for nothing new
     ("A new appointment.", "additional"),
     ("Make a new booking.", "additional"),
     ("Keep it and add another.", "additional"),
@@ -236,14 +236,15 @@ async def test_soft_cue_with_a_new_service_never_replaces_the_booking(world, utt
     assert world.square.bookings["sq_1"]["appointment_segments"][0]["service_variation_id"] == "var_swedish_60"
 
 
-async def test_keep_it_answer_books_an_additional_appointment(world):
+async def test_add_a_new_one_answer_books_an_additional_appointment(world):
     voice, row = await _voice_after_booking(world)
     proposal = {"requested_start_iso": local(THU_3PM_UTC + HOUR), "service_description": "Signature Facial",
                 "caller_name": "Ada Lovelace"}
     assert (await _caller_says(voice, "Could I get a facial at 4, or anything later?",
                                operation="schedule", **proposal))["status"] == "needs_clarification"
-    out = await _caller_says(voice, "Keep it.", operation="schedule", **proposal)
+    out = await _caller_says(voice, "Add a new one, please.", operation="schedule", **proposal)
     assert out["status"] == "draft" and out["operation"] == "schedule"
+    assert "additional appointment" in out["spoken"]
     result = await _caller_confirms(world, voice)
     assert result.outcome is BookingOutcome.BOOKED, result.message
     assert _square_starts(world) == ["2026-10-22T19:00:00Z", "2026-10-22T21:00:00Z"]
@@ -256,7 +257,7 @@ async def test_question_names_the_booked_time_and_is_rephrased_if_unanswered(wor
     assert "Thursday at 2 PM" in first["spoken"] and "3 PM" not in first["spoken"]
     second = await _caller_says(voice, "Yes please.", **proposal)
     assert second["status"] == "needs_clarification"
-    assert "'change it' or 'add a new one'" in second["spoken"]
+    assert "'change it', 'add a new one', or 'keep it as is'" in second["spoken"]
     assert world.square.updates == [] and len(world.square.creates) == 1
 
 
