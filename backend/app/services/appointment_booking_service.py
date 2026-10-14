@@ -1063,11 +1063,53 @@ def _service_identity(draft: BookingDraft) -> dict[str, Any]:
 
 
 def _remember_booked_identity(
-    session: CallSession, appointment: Appointment, draft: BookingDraft
+    session: CallSession, appointment: Appointment, draft: BookingDraft, start: datetime
 ) -> None:
+    """Record what the calendar now holds for `appointment`, after a verified write.
+
+    `start` is the verified, timezone-aware start used for the write; a row
+    read back from some databases carries a naive timestamp instead.
+    """
     identities = dict(session.entities.get(BOOKED_SERVICE_IDENTITIES) or {})
-    identities[str(appointment.id)] = _service_identity(draft)
+    identity = _service_identity(draft)
+    identity["start"] = utc_instant(start).isoformat()
+    identity["guest"] = " ".join((draft.guest_name or "").split()).casefold() or None
+    identities[str(appointment.id)] = identity
     session.entities[BOOKED_SERVICE_IDENTITIES] = identities
+
+
+async def _same_call_duplicate(
+    db: AsyncSession,
+    routing: "_Routing",
+    session: CallSession,
+    draft: BookingDraft,
+    start: datetime,
+) -> Appointment | None:
+    """An appointment THIS call already booked that the new one would repeat.
+
+    Same start, same service, same person. A second identical booking in one
+    call is almost always a repeated request or a misrouted change, not a
+    real need; a genuine one is for someone else and carries a guest name.
+    Only still-active appointments count, so rebooking after a cancel works.
+    """
+    requested = _service_identity(draft)
+    guest = " ".join((draft.guest_name or "").split()).casefold() or None
+    target = utc_instant(start).isoformat()
+    for appointment_id, booked in (session.entities.get(BOOKED_SERVICE_IDENTITIES) or {}).items():
+        if appointment_id == draft.appointment_id or booked.get("start") != target:
+            continue
+        if (booked.get("guest") or None) != guest:
+            continue
+        if requested["service_variation_id"] and booked.get("service_variation_id"):
+            same = requested["service_variation_id"] == booked["service_variation_id"]
+        else:
+            same = _same_service_family(requested["title"], booked.get("title"))
+        if not same:
+            continue
+        active = await _load_active_appointment(db, routing.scope, appointment_id)
+        if active is not None:
+            return active
+    return None
 
 
 _SERVICE_FILLER_WORDS = {
@@ -1766,7 +1808,7 @@ async def _move_existing(
     draft.appointment_id = str(existing.id)
     draft.external_booking_id = existing.external_booking_id
     save_draft(session, draft)
-    _remember_booked_identity(session, existing, draft)
+    _remember_booked_identity(session, existing, draft, start)
     consume_confirmation_authorization(session)
     session.booking_status = "rescheduled"
     await _notify_staff_event(
@@ -1990,6 +2032,24 @@ async def confirm_booking(
             routing.adapter, session, _draft_intent(draft), start, end,
             selected_slot=draft.selected_slot,
         )
+        duplicate = await _same_call_duplicate(db, routing, session, draft, start)
+        if duplicate is not None:
+            truth(
+                "DUPLICATE_BOOKING_BLOCKED",
+                call_sid=session.call_sid,
+                existing_appointment_id=str(duplicate.id),
+            )
+            session.booking_status = "collecting_details"
+            return BookingResult(
+                BookingOutcome.MISSING_INFO,
+                message=(
+                    "Nothing new was booked. This caller already has this exact "
+                    f"appointment from this call: {duplicate.title} at "
+                    f"{duplicate.start_time.isoformat()}. Ask whether the additional "
+                    "appointment is for someone else (and get that person's name), or "
+                    "whether they meant the appointment they already have."
+                ),
+            )
         unresolved = await _unresolved_booking(db, routing.scope.tenant_id, ctx.customer_phone, start)
         if unresolved is not None:
             session.entities["booking_reconciliation_required"] = {"request_id": str(unresolved.id)}
@@ -2281,7 +2341,7 @@ async def confirm_booking(
         draft.appointment_id = str(appointment.id)
         draft.external_booking_id = appointment.external_booking_id
         save_draft(session, draft)
-        _remember_booked_identity(session, appointment, draft)
+        _remember_booked_identity(session, appointment, draft, start)
         consume_confirmation_authorization(session)
         session.booking_status = "booked"
         await _notify_staff_event(

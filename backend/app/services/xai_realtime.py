@@ -51,6 +51,8 @@ from app.services.appointment_booking_service import (
     lookup_upcoming_appointments,
     _parse_dt,
     _prepare,
+    _same_service_family,
+    BOOKED_SERVICE_IDENTITIES,
 )
 from app.services.spa_facts import dashboard_facts, lookup_spa_facts
 from app.services.consultation_gate import (
@@ -101,6 +103,11 @@ from app.services.booking_state import (
     supplied_caller_name,
     utterance_modifies_booking,
     _parse_provider_iso,
+    BOOKING_CHANGE_CLARIFICATION,
+    BOOKING_CHANGE_IN_PROGRESS,
+    booking_change_question,
+    classify_change_question_answer,
+    classify_post_booking_request,
 )
 from app.services.business_hours import resolve_timezone
 from app.services.call_state import (
@@ -2651,6 +2658,131 @@ class XAIVoiceSession:
             )
             args.pop("preferred_staff", None)
 
+    def _after_completed_booking(self, draft: Any) -> bool:
+        """A booking succeeded earlier in this call and this is a later turn."""
+        return bool(
+            draft.is_persisted
+            and self._booking_completed_turn is not None
+            and self._user_turn_count > self._booking_completed_turn
+        )
+
+    def _booked_details(self, current: Any) -> tuple[str | None, str | None]:
+        """(service, start ISO) of what this call actually booked, not the draft.
+
+        The draft may already hold a proposed, unconfirmed change; questions
+        and repeat checks must describe the booking the calendar holds.
+        """
+        identity = (
+            self.session.entities.get(BOOKED_SERVICE_IDENTITIES) or {}
+        ).get(str(current.appointment_id)) or {}
+        service = identity.get("title") or current.service_description
+        booked_iso = identity.get("start") or self.session.confirmed_datetime
+        return service, booked_iso
+
+    def _change_in_progress(self, current: Any) -> bool:
+        """The caller chose to change this booking and that change is not done yet."""
+        marker = self.session.entities.get(BOOKING_CHANGE_IN_PROGRESS) or {}
+        return bool(
+            marker
+            and marker.get("appointment_id") == current.appointment_id
+            and int(marker.get("turn", -1)) > int(self._booking_completed_turn or -1)
+        )
+
+    def _proposal_repeats_booking(self, args: dict[str, Any], current: Any) -> bool:
+        """The proposal restates the BOOKED appointment with nothing new."""
+        if self._change_in_progress(current):
+            return False
+        if args.get("guest_name") or args.get("earliest"):
+            return False
+        if args.get("preferred_staff") and args["preferred_staff"] != current.preferred_staff:
+            return False
+        booked_service, booked_iso = self._booked_details(current)
+        requested = args.get("requested_start_iso")
+        if not requested or not booked_iso:
+            return False
+        if self._time_key(requested) != self._time_key(booked_iso):
+            return False
+        service = str(
+            " + ".join(args.get("requested_services") or [])
+            or args.get("service_description") or ""
+        )
+        return not service or _same_service_family(service, booked_service)
+
+    def _post_booking_decision(
+        self,
+        model_operation: str,
+        appointment_id: str | None,
+        args: dict[str, Any],
+        current: Any,
+    ) -> str:
+        """modify | additional | ask | wait | unchanged, after a booking.
+
+        The caller's words decide. The model's `operation` never overrules
+        them; where the two disagree, or the words are unclear, CARA asks.
+        An answer to that question is read as an answer ("keep it", "update
+        it"), and once the caller chose to change the booking, follow-up
+        adjustments are part of that change rather than a new question.
+        """
+        utterance = self._last_user_utterance() or ""
+        pending = self.session.entities.get(BOOKING_CHANGE_CLARIFICATION) or None
+        if pending and int(pending.get("turn", -1)) == self._user_turn_count:
+            return "wait"  # already asked this turn; do not ask twice
+        if pending:
+            kind = classify_change_question_answer(utterance)
+            if kind == "ambiguous":
+                kind = classify_post_booking_request(utterance)
+                if kind == "maybe_modify":
+                    kind = "ambiguous"
+        else:
+            kind = classify_post_booking_request(utterance)
+            if kind != "additional" and self._proposal_repeats_booking(args, current):
+                return "unchanged"
+            if self._change_in_progress(current) and kind != "additional":
+                kind = "modify"
+            elif appointment_id and appointment_id in (current.offered_appointment_ids or []):
+                # The caller picked one of the appointments the backend listed.
+                kind = "modify" if kind != "additional" else "ambiguous"
+            elif kind == "maybe_modify":
+                kind = "modify" if model_operation == "reschedule" else "ambiguous"
+            elif kind == "modify" and model_operation == "schedule":
+                kind = "ambiguous"
+            elif kind == "additional" and model_operation == "reschedule":
+                kind = "ambiguous"
+        if kind == "ambiguous":
+            attempts = int((pending or {}).get("attempts", 0)) + 1
+            self.session.entities[BOOKING_CHANGE_CLARIFICATION] = {
+                "turn": self._user_turn_count,
+                "appointment_id": current.appointment_id,
+                "attempts": attempts,
+            }
+            truth(
+                "BOOKING_CHANGE_CLARIFICATION_ASKED",
+                call_sid=self.call_id,
+                model_operation=model_operation or "none",
+                attempt=attempts,
+            )
+            return "ask"
+        self.session.entities.pop(BOOKING_CHANGE_CLARIFICATION, None)
+        if kind == "modify":
+            self.session.entities[BOOKING_CHANGE_IN_PROGRESS] = {
+                "turn": self._user_turn_count,
+                "appointment_id": current.appointment_id,
+            }
+        else:
+            self.session.entities.pop(BOOKING_CHANGE_IN_PROGRESS, None)
+        truth(
+            "BOOKING_CHANGE_INTENT",
+            call_sid=self.call_id,
+            decision=kind,
+            model_operation=model_operation or "none",
+        )
+        return kind
+
+    def _booking_change_question(self, current: Any) -> str:
+        service, booked_iso = self._booked_details(current)
+        attempt = int((self.session.entities.get(BOOKING_CHANGE_CLARIFICATION) or {}).get("attempts", 1))
+        return booking_change_question(service, booked_iso, self._tz, attempt=attempt)
+
     async def _run_propose_appointment(self, raw_arguments: str) -> str:
         """Stage a new booking or move an explicitly selected existing one."""
         try:
@@ -2663,6 +2795,7 @@ class XAIVoiceSession:
                 args.pop(field, None)
         self._guard_staff_preference(args)
         operation = str(args.pop("operation", "") or "").lower()
+        model_operation = operation
         appointment_id = args.pop("appointment_id", None)
         if operation not in {"schedule", "reschedule"}:
             operation = (
@@ -2672,18 +2805,53 @@ class XAIVoiceSession:
             )
 
         current_before_proposal = get_draft(self.session)
+        if self._after_completed_booking(current_before_proposal):
+            # A booking already succeeded on this call. Whether this request
+            # CHANGES it or ADDS another appointment is decided from the
+            # caller's own words, never from the model's guess alone, and an
+            # unclear request is asked about before anything changes.
+            decision = self._post_booking_decision(
+                model_operation, appointment_id, args, current_before_proposal
+            )
+            if decision == "unchanged":
+                return json.dumps({
+                    "status": "already_booked",
+                    "booked": False,
+                    "spoken": None,
+                    "message": (
+                        "That exact appointment is already booked on this call. Nothing "
+                        "new was created and nothing was changed."
+                    ),
+                })
+            if decision == "wait":
+                return json.dumps({
+                    "status": "awaiting_clarification",
+                    "booked": False,
+                    "spoken": None,
+                    "message": (
+                        "The caller was just asked whether to change the existing "
+                        "appointment or add another. Nothing was changed. Wait for "
+                        "their answer."
+                    ),
+                })
+            if decision == "ask":
+                await self._persist_session()
+                return json.dumps({
+                    "status": "needs_clarification",
+                    "booked": False,
+                    "spoken": self._booking_change_question(current_before_proposal),
+                    "message": (
+                        "Nothing was changed. Wait for the caller to say whether to "
+                        "change the existing appointment or add a separate one."
+                    ),
+                })
+            operation = "reschedule" if decision == "modify" else "schedule"
         if (
             operation == "schedule"
-            and current_before_proposal.is_persisted
-            and self.session.booking_status in {"booked", "rescheduled"}
-            and self._booking_completed_turn is not None
-            and self._user_turn_count > self._booking_completed_turn
+            and self._after_completed_booking(current_before_proposal)
         ):
-            # Once one booking has succeeded, a later ordinary schedule request
-            # is a separate appointment. Explicit change/move language above is
-            # still routed through the reschedule path. This prevents the first
-            # appointment from being silently adopted and moved when the caller
-            # asks for another service in the same call.
+            # The caller explicitly asked for an ADDITIONAL appointment. Open a
+            # separate intent so the first booking is never adopted and moved.
             start_new_intent(self.session)
             self._grounded_exact_times.clear()
             self.session.booking_status = "collecting_details"
@@ -3146,6 +3314,31 @@ class XAIVoiceSession:
 
     async def _run_start_new_appointment(self, _raw_arguments: str = "") -> str:
         """Open a second, explicitly requested booking intent."""
+        current = get_draft(self.session)
+        if self._after_completed_booking(current):
+            # Starting a second appointment is the model's claim that the
+            # caller asked for one. The caller's words must agree.
+            decision = self._post_booking_decision("schedule", None, {}, current)
+            if decision == "modify":
+                return json.dumps({
+                    "status": "modify_existing",
+                    "booked": False,
+                    "message": (
+                        "The caller is changing their existing appointment, not adding "
+                        "one. Nothing was started. Use propose_appointment with "
+                        "operation=reschedule for the existing appointment."
+                    ),
+                })
+            if decision in {"ask", "wait"}:
+                await self._persist_session()
+                return json.dumps({
+                    "status": "needs_clarification",
+                    "booked": False,
+                    "message": (
+                        "Nothing was started. Ask the caller exactly this and wait for "
+                        "the answer: " + self._booking_change_question(current)
+                    ),
+                })
         start_new_intent(self.session)
         self._grounded_exact_times.clear()
         self._clear_caller_requested_date()

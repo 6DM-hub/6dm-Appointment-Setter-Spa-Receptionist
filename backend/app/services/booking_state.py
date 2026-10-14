@@ -748,6 +748,109 @@ def start_new_intent(session: Any) -> BookingDraft:
     return draft
 
 
+# --------------------------------------------------------------------------- #
+# After a booking: change the existing appointment, or add another one?
+# --------------------------------------------------------------------------- #
+# Session entity set while CARA is waiting for the caller to answer the
+# "change it or add another?" question.
+BOOKING_CHANGE_CLARIFICATION = "booking_change_clarification"
+# Session entity set once the caller has chosen to change the existing
+# appointment, so follow-up adjustments ("how about 4 then?") are not asked
+# about again while that change is still being arranged.
+BOOKING_CHANGE_IN_PROGRESS = "booking_change_in_progress"
+
+_ADDITIONAL_REQUEST_RE = re.compile(
+    r"\b(?:another|second|additional|one more|also|as well|in addition|separate|"
+    r"extra|new one|both|add(?:ing)?\s+(?:a|an|another|one)|book\s+(?:a|an|another)|"
+    r"for my (?:wife|husband|partner|friend|mom|mum|mother|dad|father|daughter|son|"
+    r"sister|brother|boyfriend|girlfriend|colleague)|for (?:him|her|them))\b",
+    re.IGNORECASE,
+)
+# Unmistakable "change what I have" wording.
+_MODIFY_REQUEST_RE = re.compile(
+    r"\b(?:instead|change|changing|move|moving|reschedule|switch|swap|push|"
+    r"bump|make (?:it|that)|i meant|i mean|meant to say|existing|"
+    r"not (?:on |at )?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"today|tomorrow|\d)|can'?t make|cannot make|won'?t make)\b",
+    re.IGNORECASE,
+)
+# Words that often, but not always, mean a change: "anything later?" can
+# just as well be shopping for a second appointment.
+_MAYBE_MODIFY_RE = re.compile(
+    r"\b(?:rather|earlier|later|different (?:time|day|date))\b",
+    re.IGNORECASE,
+)
+# Answers to the "change it, or keep it and add another?" question.
+_ANSWER_ADDITIONAL_RE = re.compile(
+    r"\b(?:keep|add|adding|new|another|separate|both|additional|second|also|extra)\b",
+    re.IGNORECASE,
+)
+_ANSWER_MODIFY_RE = re.compile(
+    r"\b(?:change|update|modify|replace|move|reschedule|switch|existing|instead|"
+    r"current|first one|the first|that one|the one i have)\b",
+    re.IGNORECASE,
+)
+
+
+def _caller_text(utterance: str | None) -> str:
+    return (utterance or "").replace("’", "'")
+
+
+def classify_post_booking_request(utterance: str | None) -> str:
+    """After a booking exists: does the caller want to change it or add one?
+
+    Returns "modify", "maybe_modify", "additional", or "ambiguous". Only the
+    caller's own words count. Clear change wording is "modify"; wording like
+    "later" or "rather" is only "maybe_modify"; both kinds of cue, or none, is
+    "ambiguous" and CARA must ask before anything changes.
+    """
+    text = _caller_text(utterance)
+    additional = bool(_ADDITIONAL_REQUEST_RE.search(text))
+    if _MODIFY_REQUEST_RE.search(text):
+        return "ambiguous" if additional else "modify"
+    if _MAYBE_MODIFY_RE.search(text):
+        return "ambiguous" if additional else "maybe_modify"
+    return "additional" if additional else "ambiguous"
+
+
+def classify_change_question_answer(utterance: str | None) -> str:
+    """The caller's answer to "change it, or keep it and add another?".
+
+    "Keep it", "a new one", "add another" -> "additional"; "change it",
+    "update it", "the first one" -> "modify"; anything else -> "ambiguous".
+    """
+    text = _caller_text(utterance)
+    modify = bool(_ANSWER_MODIFY_RE.search(text))
+    additional = bool(_ANSWER_ADDITIONAL_RE.search(text))
+    if modify and not additional:
+        return "modify"
+    if additional and not modify:
+        return "additional"
+    return "ambiguous"
+
+
+def booking_change_question(
+    service: str | None, booked_iso: str | None, tz: Any, *, attempt: int = 1
+) -> str:
+    """The one question that settles change-versus-add, naming the BOOKED visit."""
+    service = re.sub(r"\s*\(\d+\s*min\)", "", (service or "appointment")).strip() or "appointment"
+    parsed = _parse_provider_iso(booked_iso)
+    when = ""
+    if parsed is not None:
+        local = parsed.astimezone(tz) if parsed.tzinfo else parsed
+        when = f" on {local.strftime('%A')} at {spoken_slot_time(booked_iso, tz)}"
+    if attempt > 1:
+        return (
+            "I want to be sure I don't change the wrong thing. Should I change your "
+            f"{service}{when}, or keep it and add a new appointment? You can say "
+            "'change it' or 'add a new one'."
+        )
+    return (
+        f"Just to make sure I get this right: would you like to change your {service}"
+        f"{when}, or keep it and book an additional appointment?"
+    )
+
+
 def proposal_fingerprint(draft: BookingDraft) -> str:
     """Stable hash of the CURRENT proposal the provider would create."""
     slot = draft.selected_slot or {}
