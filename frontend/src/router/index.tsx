@@ -72,13 +72,14 @@ export default function AppRoutes() {
         <Route path="spa/settings" element={guard("/spa/settings", <SpaSettings />)} />
         <Route
           path="spa/calendar"
-          element={
+          element={guard(
+            "/spa/calendar",
             <CalendarView
               eyebrow="Spa Receptionist"
               title="Service calendar"
               subtitle="Appointments booked by your AI receptionist."
             />
-          }
+          )}
         />
 
         <Route path="*" element={<NotFound />} />

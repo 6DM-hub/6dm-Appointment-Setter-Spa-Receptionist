@@ -102,6 +102,13 @@ export const NAV_SECTIONS: NavSection[] = [
         description: "Call log and transcripts",
       },
       {
+        label: "Calendar",
+        path: "/spa/calendar",
+        icon: CalendarDays,
+        roles: SPA_VIEWERS,
+        description: "Week view of booked appointments",
+      },
+      {
         label: "Guests",
         path: "/spa/guests",
         icon: UsersRound,

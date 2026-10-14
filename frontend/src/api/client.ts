@@ -1,4 +1,5 @@
 import axios, { type AxiosInstance } from "axios";
+import { collectAllPages } from "../lib/paging";
 
 type ApiErrorDetail = string | { msg?: string; loc?: Array<string | number> }[];
 
@@ -596,6 +597,19 @@ export const fetchAppointments = async (params?: {
   const { data } = await apiClient.get<Page<Appointment>>("/api/v1/appointments", { params });
   return data.items;
 };
+
+/**
+ * Every appointment whose start falls in [from, to] (both inclusive, ISO
+ * instants), read across all pages at the API's maximum page size. Check
+ * `complete` before treating the result as the whole range.
+ */
+export const fetchAppointmentsInRange = (from: string, to: string) =>
+  collectAllPages<Appointment>(async (page, size) => {
+    const { data } = await apiClient.get<Page<Appointment>>("/api/v1/appointments", {
+      params: { from_time: from, to_time: to, page, size },
+    });
+    return data;
+  });
 
 // --- Analytics ---
 export const fetchAnalytics = async (): Promise<AnalyticsSummary> => {
