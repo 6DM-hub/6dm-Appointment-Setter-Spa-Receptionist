@@ -98,7 +98,15 @@ class GoogleCalendarAdapter(LocalCalendarAdapter):
             raise BookingProviderError(str(exc)) from exc
         if busy:
             return AvailabilityVerdict.no("That time is already occupied on the calendar.")
-        return AvailabilityVerdict.ok()
+        # Free/busy is a real check against the connected calendar; record it
+        # so the spa router can tell it apart from an unchecked default.
+        return AvailabilityVerdict.ok(
+            {
+                "start": ctx.start.isoformat(),
+                "duration_minutes": max(int((ctx.end - ctx.start).total_seconds() // 60), 1),
+                "source": "google_freebusy",
+            }
+        )
 
     async def move_booking(self, booking, start, end):
         if not self.is_configured or not booking.external_id:

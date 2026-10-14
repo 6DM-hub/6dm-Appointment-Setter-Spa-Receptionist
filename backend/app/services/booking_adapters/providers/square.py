@@ -185,6 +185,7 @@ class SquareAdapter(VerticalProviderAdapter):
     supports_customer_creation = True
     supports_saved_payment_method_lookup = True
     supports_save_card_on_file = True
+    supports_list_openings = True
 
     def __init__(
         self,

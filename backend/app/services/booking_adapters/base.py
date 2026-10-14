@@ -14,6 +14,7 @@ boundary in one place — `app.services.appointment_booking_service` — and mea
 an appointment is confirmed locally only after the provider returns success.
 Failed creates are escalated for staff review; they are never reported as booked.
 """
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
@@ -163,6 +164,10 @@ class BookingAdapter(ABC):
     #: Saving a card on file. False until the adapter can call the provider's
     #: card-create API. This does not charge the card.
     supports_save_card_on_file: bool = False
+    #: Whether `list_openings` returns a real provider search. When False the
+    #: inherited `[]` means "cannot search", never "fully booked", and callers
+    #: must walk candidate times through `check_availability` instead.
+    supports_list_openings: bool = False
 
     async def booking_timezone_name(self) -> str | None:
         return None
@@ -243,3 +248,37 @@ class LocalCalendarAdapter(BookingAdapter):
 
     async def create_booking(self, ctx: BookingContext) -> ExternalBooking:
         return ExternalBooking(provider=self.provider, external_id=None)
+
+
+class CaraNativeAdapter(LocalCalendarAdapter):
+    """CARA's own appointments table is the spa's calendar of record.
+
+    Only selected when the spa has explicitly opted in
+    (`booking_policies.scheduling_source == "cara_native"`), because it is only
+    honest when no other calendar takes bookings for that spa.
+
+    This adapter does not decide availability by itself. `SpaBookingAdapter`
+    checks dashboard hours and the service menu before delegating here, and the
+    booking service then checks the local `appointments` table against staff
+    capacity, inside the per-tenant advisory lock at confirmation. The slot
+    returned here marks the time as verified by that CARA-native pipeline.
+    """
+
+    provider = "cara_native"
+
+    async def create_booking(self, ctx: BookingContext) -> ExternalBooking:
+        # The CARA appointment row is the booking of record. Its own reference
+        # stands in for a provider ID so the "no ID, no confirmation" guard
+        # stays strict for every real provider.
+        reference = ctx.booking_reference or uuid.uuid4().hex
+        return ExternalBooking(provider=self.provider, external_id=f"cara:{reference}")
+
+    async def check_availability(self, ctx: BookingContext) -> AvailabilityVerdict:
+        minutes = max(int((ctx.end - ctx.start).total_seconds() // 60), 1)
+        return AvailabilityVerdict.ok(
+            {
+                "start": ctx.start.isoformat(),
+                "duration_minutes": minutes,
+                "source": "cara_native",
+            }
+        )

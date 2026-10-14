@@ -706,6 +706,23 @@ def _capacity(spa: SpaAccount | None) -> int:
     return max(len(spa.staff or []), 1) if spa else 1
 
 
+def _searches_openings(adapter: BookingAdapter) -> bool:
+    """Whether `list_openings` is a real search for this adapter.
+
+    Every adapter inherits a `list_openings` that returns `[]`, so "is it
+    callable" was always true and an unconnected calendar's empty list was
+    reported as "no openings". Adapters that cannot search are walked slot by
+    slot through `check_availability` and the local capacity check instead.
+    """
+    if isinstance(adapter, SpaBookingAdapter):
+        return adapter.supports_list_openings
+    if getattr(adapter, "supports_list_openings", False):
+        return True
+    if isinstance(adapter, BookingAdapter):
+        return type(adapter).list_openings is not BookingAdapter.list_openings
+    return callable(getattr(adapter, "list_openings", None))
+
+
 def _duration_minutes(adapter: BookingAdapter, service_description: str | None) -> int:
     if isinstance(adapter, SpaBookingAdapter):
         return adapter.duration_for_service(service_description)
@@ -1175,7 +1192,7 @@ async def _stage_earliest(
     )
     list_fn = getattr(routing.adapter, "list_openings", None)
     openings: list[dict[str, Any]] = []
-    if callable(list_fn):
+    if callable(list_fn) and _searches_openings(routing.adapter):
         openings = await _calendar_call(
             "list_openings",
             session.call_sid,
@@ -1279,7 +1296,7 @@ async def search_day_part(
     )
     list_fn = getattr(routing.adapter, "list_openings", None)
     suggestions: list[tuple[datetime, dict[str, Any] | None]] = []
-    if callable(list_fn):
+    if callable(list_fn) and _searches_openings(routing.adapter):
         openings = await _calendar_call(
             "list_openings",
             session.call_sid,
