@@ -477,6 +477,12 @@ def stage(session: Any, intent: Any) -> BookingDraft:
             draft.square_variation_version = None
             draft.service_id = None
             draft.duration_minutes = None
+            # The end time belonged to the previous service. Keeping it would
+            # make "same time, but the 90-minute hot stone instead" inherit
+            # the old 60-minute end. Let the new service's duration decide,
+            # unless the caller stated an explicit end in this same request.
+            if new_end is None:
+                draft.end_iso = None
             draft.service_description = intent.service_description
         elif not draft.service_description:
             draft.service_description = intent.service_description

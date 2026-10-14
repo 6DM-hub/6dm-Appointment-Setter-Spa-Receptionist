@@ -114,6 +114,9 @@ class ExternalBooking:
     # "reused" when an existing provider customer was kept, "created" when
     # a new one was made after a confirmed zero-match search.
     customer_resolution: str | None = None
+    # Set by a verified move when the provider now holds a different SERVICE
+    # than before (compared against the provider's own stored booking).
+    service_changed: bool = False
 
 
 @dataclass(frozen=True)
@@ -168,6 +171,15 @@ class BookingAdapter(ABC):
     #: inherited `[]` means "cannot search", never "fully booked", and callers
     #: must walk candidate times through `check_availability` instead.
     supports_list_openings: bool = False
+    #: How a change of SERVICE on an already-booked appointment is handled.
+    #:   "provider"    - `move_booking(..., ctx=...)` writes the new service to
+    #:                   the provider and verifies the provider's response.
+    #:   "local"       - the CARA appointment row is the booking of record, so
+    #:                   updating that row is the complete change.
+    #:   "unsupported" - the provider cannot change the service in place. The
+    #:                   booking engine must refuse rather than report a change
+    #:                   the external calendar never received.
+    service_change_mode: str = "unsupported"
 
     async def booking_timezone_name(self) -> str | None:
         return None
@@ -235,6 +247,9 @@ class LocalCalendarAdapter(BookingAdapter):
 
     provider = "internal"
     calendar_label = "the internal calendar"
+    # The appointments row is the whole booking; there is nothing external to
+    # update when the caller switches service.
+    service_change_mode = "local"
 
     def __init__(
         self,

@@ -24,6 +24,9 @@ class GoogleCalendarAdapter(LocalCalendarAdapter):
     calendar_label = "the Google Calendar"
 
     write_back_supported = True
+    # The Google event title would keep the old service while the local row
+    # changed, so a same-booking service switch is refused, not half-applied.
+    service_change_mode = "unsupported"
     # Google Calendar stores events, not a customer directory or saved cards.
     supports_customer_lookup = False
     supports_customer_creation = False

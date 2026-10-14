@@ -244,6 +244,10 @@ class SpaBookingAdapter(BookingAdapter):
     def supports_list_openings(self) -> bool:  # type: ignore[override]
         return bool(getattr(self.delegate, "supports_list_openings", False))
 
+    @property
+    def service_change_mode(self) -> str:  # type: ignore[override]
+        return str(getattr(self.delegate, "service_change_mode", "unsupported") or "unsupported")
+
     @staticmethod
     def _require_verified(verdict: AvailabilityVerdict) -> AvailabilityVerdict:
         """An "available" with no slot was never checked by anything that can
@@ -938,9 +942,12 @@ class SpaBookingAdapter(BookingAdapter):
             raise
 
     async def move_booking(
-        self, booking: ExternalBooking, start, end
+        self, booking: ExternalBooking, start, end, ctx: BookingContext | None = None
     ) -> ExternalBooking:
         try:
+            if ctx is not None:
+                # Only providers that verify a service change take the context.
+                return await self.delegate.move_booking(booking, start, end, ctx=ctx)
             return await self.delegate.move_booking(booking, start, end)
         except BookingProviderError:
             logger.exception(

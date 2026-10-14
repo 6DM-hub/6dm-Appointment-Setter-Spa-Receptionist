@@ -50,6 +50,7 @@ from app.services.card_status import card_status_for_booked_appointment
 from app.services.phone_numbers import canonical_customer_phone, is_non_phone_caller_id
 from app.services.booking_state import (
     BookingDraft,
+    _same_service_phrase,
     bind_verified_slot,
     confirmation_block_reason,
     consume_confirmation_authorization,
@@ -1041,6 +1042,99 @@ async def _routing_timezone(routing: _Routing):
     return timezone.utc
 
 
+# Session entity: appointment_id -> the service identity that provider
+# actually holds for it (recorded only after a verified create or move).
+BOOKED_SERVICE_IDENTITIES = "booked_service_identities"
+
+
+def _service_identity(draft: BookingDraft) -> dict[str, Any]:
+    """What the current proposal would book: service wording, variation, length."""
+    slot = draft.selected_slot or {}
+    minutes = slot.get("duration_minutes")
+    try:
+        minutes = int(minutes) if minutes is not None else None
+    except (TypeError, ValueError):
+        minutes = None
+    return {
+        "title": _draft_intent(draft).service_description,
+        "service_variation_id": str(slot.get("service_variation_id") or "") or None,
+        "duration_minutes": minutes,
+    }
+
+
+def _remember_booked_identity(
+    session: CallSession, appointment: Appointment, draft: BookingDraft
+) -> None:
+    identities = dict(session.entities.get(BOOKED_SERVICE_IDENTITIES) or {})
+    identities[str(appointment.id)] = _service_identity(draft)
+    session.entities[BOOKED_SERVICE_IDENTITIES] = identities
+
+
+_SERVICE_FILLER_WORDS = {
+    "a", "an", "the", "my", "for", "appointment", "session", "service",
+    "minute", "minutes", "min", "mins", "hour", "hours", "hr", "hrs",
+}
+
+
+def _service_words(text: str | None) -> set[str]:
+    """Words that name the service itself, without length or filler."""
+    words = re.findall(r"[a-z]+", (text or "").casefold())
+    return {word for word in words if word not in _SERVICE_FILLER_WORDS}
+
+
+def _service_minutes(text: str | None) -> set[int]:
+    """Lengths named in a service phrase: "60 minute", "(90 min)", "Swedish 90"."""
+    return {int(value) for value in re.findall(r"\b(\d{2,3})\b", text or "")}
+
+
+def _same_service_family(left: str | None, right: str | None) -> bool:
+    """"60 minute deep tissue massage" and "Deep tissue massage" are one service.
+
+    Used only when no provider variation id is available to compare. One
+    wording containing the other's words counts as the same service; disjoint
+    or conflicting words ("facial" vs "swedish massage") do not.
+    """
+    if _same_service_phrase(left, right):
+        return True
+    left_minutes, right_minutes = _service_minutes(left), _service_minutes(right)
+    if left_minutes and right_minutes and not (left_minutes & right_minutes):
+        return False  # "Swedish Massage 90" is not "Swedish Massage (60 min)"
+    left_words, right_words = _service_words(left), _service_words(right)
+    if not left_words or not right_words:
+        return True  # nothing to compare: not evidence of a change
+    return left_words <= right_words or right_words <= left_words
+
+
+def _requested_service_change(
+    session: CallSession, draft: BookingDraft, existing: Appointment
+) -> bool:
+    """Whether confirming the current proposal would change the booked SERVICE.
+
+    Times alone cannot answer this: "same time, but a facial instead" keeps the
+    start and end identical. Compared against what this call verified it
+    booked when known; otherwise against the appointment's own title.
+    """
+    requested = _service_identity(draft)
+    booked = (session.entities.get(BOOKED_SERVICE_IDENTITIES) or {}).get(str(existing.id))
+    if booked:
+        if requested["service_variation_id"] and booked.get("service_variation_id"):
+            if requested["service_variation_id"] != booked["service_variation_id"]:
+                return True
+            wanted, held = requested["duration_minutes"], booked.get("duration_minutes")
+            return wanted is not None and held is not None and wanted != held
+        return bool(
+            requested["title"]
+            and booked.get("title")
+            and not _same_service_family(requested["title"], booked["title"])
+        )
+    return bool(
+        draft.service_description
+        and requested["title"]
+        and getattr(existing, "title", None)
+        and not _same_service_family(requested["title"], existing.title)
+    )
+
+
 def _provider_authoritative_end(
     start: datetime,
     fallback_end: datetime,
@@ -1544,6 +1638,22 @@ async def stage_booking(
         return await _failure(db, session, exc)
 
 
+def _service_change_refused(existing: Appointment, reason: str) -> BookingResult:
+    """Nothing was written. Say so plainly; the original booking stands."""
+    truth("SERVICE_CHANGE_REFUSED", appointment_id=str(existing.id), reason=reason)
+    return BookingResult(
+        BookingOutcome.CONFLICT,
+        message=(
+            "Nothing was changed. The caller's existing "
+            f"{existing.title} at {existing.start_time.isoformat()} is still booked "
+            "exactly as before. The service on that booking could not be switched "
+            f"automatically ({reason}). Tell the caller this, and ask whether they "
+            "want to keep the current appointment or have staff make the change. "
+            "Do not say the appointment was changed."
+        ),
+    )
+
+
 async def _move_existing(
     db: AsyncSession,
     session: CallSession,
@@ -1552,9 +1662,28 @@ async def _move_existing(
     existing: Appointment,
     start: datetime,
     end: datetime,
+    *,
+    service_change: bool = False,
 ) -> BookingResult:
-    """Move the appointment this intent already owns. Never creates a second."""
-    ctx = _context(routing.adapter, session, _draft_intent(draft), start, end)
+    """Move the appointment this intent already owns. Never creates a second.
+
+    ``service_change`` means the caller also switched the SERVICE ("a facial
+    instead of the massage"). That is only reported once the calendar of
+    record holds the new service: Square verifies and writes it, CARA's own
+    calendar is the row itself, and a calendar that cannot change a service in
+    place is refused with the original booking left untouched.
+    """
+    mode = str(getattr(routing.adapter, "service_change_mode", "unsupported") or "unsupported")
+    if service_change and mode not in {"provider", "local"}:
+        return _service_change_refused(existing, "this calendar cannot change the service of a booking")
+    previous_title = existing.title
+    # A service change must re-verify the exact therapist/variation/time the
+    # caller heard read back. A time-only move keeps the provider's own
+    # booking-scoped reschedule search.
+    ctx = _context(
+        routing.adapter, session, _draft_intent(draft), start, end,
+        selected_slot=draft.selected_slot if service_change else None,
+    )
     await _lock_slot(db, routing.scope, start, end)
     verdict = await _calendar_call(
         "check_availability", session.call_sid, routing.adapter.check_availability(ctx)
@@ -1587,36 +1716,82 @@ async def _move_existing(
             ),
         )
 
-    moved = await _calendar_call(
-        "move_booking",
-        session.call_sid,
-        routing.adapter.move_booking(external_booking_of(existing), start, end),
+    provider_compares = bool(
+        mode == "provider"
+        and draft.service_description
+        and (draft.selected_slot or {}).get("service_variation_id")
     )
+    if service_change or provider_compares:
+        # The provider compares the verified slot with the booking it actually
+        # stores, so a change our wording check missed (a booking from an
+        # earlier call: "Swedish 60" -> "Swedish 90") still reaches it. A move
+        # where the caller named no service passes nothing: never guess one.
+        ctx = _context(
+            routing.adapter, session, _draft_intent(draft), start, end,
+            selected_slot=draft.selected_slot,
+        )
+    if mode == "provider" and (service_change or provider_compares):
+        move_call = routing.adapter.move_booking(external_booking_of(existing), start, end, ctx=ctx)
+    else:
+        move_call = routing.adapter.move_booking(external_booking_of(existing), start, end)
+    try:
+        moved = await _calendar_call("move_booking", session.call_sid, move_call)
+    except BookingProviderError as exc:
+        if exc.code == "SERVICE_CHANGE_UNSUPPORTED":
+            return _service_change_refused(existing, str(exc))
+        if exc.code == "SLOT_UNAVAILABLE":
+            invalidate_booking_proposal(session, "reschedule_unavailable")
+            session.booking_status = "conflict"
+            return BookingResult(
+                BookingOutcome.CONFLICT,
+                message=(
+                    f"{exc} Nothing was changed; the existing {previous_title} at "
+                    f"{existing.start_time.isoformat()} is still booked. Ask for another time."
+                ),
+            )
+        raise
     existing.start_time = start
     existing.end_time = end
     existing.status = AppointmentStatus.SCHEDULED
     existing.external_booking_id = moved.external_id
+    service_change = service_change or bool(getattr(moved, "service_changed", False))
+    if service_change:
+        existing.title = ctx.title
+        existing.description = (
+            f"{existing.description or ''} Service changed during call "
+            f"{session.call_sid} from {previous_title} to {ctx.title}."
+        ).strip()
     await db.commit()
     await db.refresh(existing)
     draft.appointment_id = str(existing.id)
     draft.external_booking_id = existing.external_booking_id
     save_draft(session, draft)
+    _remember_booked_identity(session, existing, draft)
     consume_confirmation_authorization(session)
     session.booking_status = "rescheduled"
     await _notify_staff_event(
         routing.spa,
         "rescheduled",
-        f"Appointment rescheduled for {draft.service_description or existing.title}.",
+        (
+            f"Appointment changed from {previous_title} to {existing.title}."
+            if service_change
+            else f"Appointment rescheduled for {draft.service_description or existing.title}."
+        ),
     )
-    return BookingResult(
-        BookingOutcome.RESCHEDULED,
-        appointment=existing,
-        message=(
+    if service_change:
+        message = (
+            f"The SAME appointment was changed on {routing.adapter.calendar_label} to "
+            f"{existing.title} from {start.isoformat()} to {end.isoformat()}; the "
+            "calendar confirmed the new service and time. No second appointment was "
+            f"created. Confirm the updated {existing.title} back to the caller."
+        )
+    else:
+        message = (
             f"The SAME appointment was moved on {routing.adapter.calendar_label} to "
             f"{start.isoformat()} to {end.isoformat()}. No second appointment was "
             f"created. Confirm the updated {existing.title} back to the caller."
-        ),
-    )
+        )
+    return BookingResult(BookingOutcome.RESCHEDULED, appointment=existing, message=message)
 
 
 async def confirm_booking(
@@ -1745,7 +1920,8 @@ async def confirm_booking(
             draft.appointment_id = str(existing.id)
             draft.external_booking_id = existing.external_booking_id
             save_draft(session, draft)
-            if existing.start_time == start and existing.end_time == end:
+            service_change = _requested_service_change(session, draft, existing)
+            if existing.start_time == start and existing.end_time == end and not service_change:
                 # Case (A) from the brief: the "existing" booking is this very
                 # call's own. That is a success to report, not a clash.
                 logger.info(
@@ -1770,7 +1946,10 @@ async def confirm_booking(
                         "not a clash. Confirm the current appointment details to the caller."
                     ),
                 )
-            return await _move_existing(db, session, routing, draft, existing, start, end)
+            return await _move_existing(
+                db, session, routing, draft, existing, start, end,
+                service_change=service_change,
+            )
 
         # ---------------------------------------------------- first commit
         #
@@ -2074,6 +2253,7 @@ async def confirm_booking(
         draft.appointment_id = str(appointment.id)
         draft.external_booking_id = appointment.external_booking_id
         save_draft(session, draft)
+        _remember_booked_identity(session, appointment, draft)
         consume_confirmation_authorization(session)
         session.booking_status = "booked"
         await _notify_staff_event(

@@ -5674,7 +5674,12 @@ class XAIVoiceSession:
         self._grounded_exact_times.clear()
         self.session.entities.pop("caller_grounded_exact_times", None)
 
-        confirmation_key = str(payload["external_booking_id"]) + ":" + str(self.session.confirmed_datetime)
+        # The service is part of the key: a same-time switch to a different
+        # service is a new confirmation the caller must hear, not a repeat.
+        confirmation_key = (
+            str(payload["external_booking_id"]) + ":" + str(self.session.confirmed_datetime)
+            + ":" + (self.session.selected_service or "").strip().casefold()
+        )
         if self.session.entities.get("spoken_booking_confirmation") == confirmation_key:
             return ""
         self.session.entities["spoken_booking_confirmation"] = confirmation_key

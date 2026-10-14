@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 import hashlib
 import logging
 import re
@@ -186,6 +187,9 @@ class SquareAdapter(VerticalProviderAdapter):
     supports_saved_payment_method_lookup = True
     supports_save_card_on_file = True
     supports_list_openings = True
+    # UpdateBooking accepts new appointment_segments; `move_booking` writes
+    # them and verifies Square's response before anything is reported.
+    service_change_mode = "provider"
 
     def __init__(
         self,
@@ -2409,7 +2413,23 @@ class SquareAdapter(VerticalProviderAdapter):
         booking: ExternalBooking,
         start: datetime,
         end: datetime,
+        ctx: BookingContext | None = None,
     ) -> ExternalBooking:
+        """Move a Square booking, optionally to a different service.
+
+        Two paths, chosen by comparing the live Square booking with the
+        provider-verified slot the caller heard (``ctx.selected_slot``):
+
+        * same service  -> time-only update (Square's own reschedule search,
+          scoped to this booking, decides whether the new time is valid);
+        * new service   -> the exact pinned team member / variation / time is
+          re-verified and written as new ``appointment_segments``.
+
+        Either way, nothing is returned until Square's response shows the
+        requested start time AND service on this same booking id. A response
+        that does not match raises ``BOOKING_OUTCOME_UNKNOWN`` so the caller is
+        never told about a change Square did not confirm.
+        """
         if not booking.external_id:
             raise BookingProviderError(
                 "Cannot reschedule a booking "
@@ -2437,6 +2457,13 @@ class SquareAdapter(VerticalProviderAdapter):
                 "Existing Square booking belongs to a different location"
             )
 
+        current_status = str(current.get("status") or "").upper()
+        if current_status and current_status not in {"ACCEPTED", "PENDING"}:
+            raise BookingProviderError(
+                f"Square booking is not active (status {current_status})",
+                code="BOOKING_NOT_ACTIVE",
+            )
+
         version = current.get("version")
 
         if version is None:
@@ -2444,38 +2471,125 @@ class SquareAdapter(VerticalProviderAdapter):
                 "Square booking has no version"
             )
 
-        # Confirm Square says the new slot is valid.
-        availability = (
-            await self._find_reschedule_availability(
-                booking_id,
-                start,
-            )
+        current_segments = list(current.get("appointment_segments") or [])
+        pinned = dict((ctx.selected_slot if ctx is not None else None) or {})
+        wanted_variation = str(pinned.get("service_variation_id") or "")
+        service_change = bool(wanted_variation) and self._segments_differ(
+            current_segments, pinned
         )
 
-        if not availability:
-            raise BookingProviderError(
-                "The requested reschedule time "
-                "is not available in Square"
+        if service_change:
+            if len(current_segments) != 1 or pinned.get("visit_segments"):
+                # A multi-service visit cannot be safely re-shaped segment by
+                # segment from one caller sentence.
+                raise BookingProviderError(
+                    "Changing the services of a multi-service Square visit "
+                    "is not supported automatically",
+                    code="SERVICE_CHANGE_UNSUPPORTED",
+                )
+            team_member_id = pinned.get("team_member_id")
+            variation_version = pinned.get("service_variation_version")
+            new_start = pinned.get("start")
+            if not team_member_id or variation_version is None or not new_start:
+                raise BookingProviderError(
+                    "Selected Square slot is missing required booking fields",
+                    code="SERVICE_CHANGE_UNVERIFIED",
+                )
+            if self._parse_square_datetime(str(new_start)) != start.astimezone(timezone.utc):
+                raise BookingProviderError(
+                    "The verified Square slot does not match the requested time",
+                    code="SERVICE_CHANGE_UNVERIFIED",
+                )
+            # Same rule as create: re-confirm THIS exact therapist + variation
+            # + time is still free before writing it.
+            still_free = await self._verify_pinned_slot(
+                replace(ctx, start=start, end=end)
             )
-
-        new_start = availability.get(
-            "start_at"
-        )
-
-        if not new_start:
-            raise BookingProviderError(
-                "Square reschedule availability "
-                "has no start time"
-            )
-
-        idempotency_key = (
-            self._idempotency_key(
-                "reschedule",
+            if not still_free:
+                raise BookingProviderError(
+                    "The requested service is no longer available at that time in Square",
+                    code="SLOT_UNAVAILABLE",
+                )
+            segment = {
+                "team_member_id": team_member_id,
+                "service_variation_id": wanted_variation,
+                "service_variation_version": variation_version,
+            }
+            if pinned.get("duration_minutes") is not None:
+                segment["duration_minutes"] = int(pinned["duration_minutes"])
+            body = {
+                "version": version,
+                "start_at": new_start,
+                "appointment_segments": [segment],
+            }
+            idempotency_key = self._idempotency_key(
+                "reschedule-service",
                 booking_id,
                 version,
                 new_start,
+                wanted_variation,
+                team_member_id,
             )
-        )
+            expected_variations = [wanted_variation]
+            expected_team = str(team_member_id)
+        else:
+            current_start_raw = current.get("start_at")
+            if (
+                current_start_raw
+                and self._parse_square_datetime(str(current_start_raw))
+                == start.astimezone(timezone.utc)
+            ):
+                # Nothing to write: Square already holds this exact service at
+                # this exact time on this booking. Report the verified booking.
+                truth(
+                    "RESCHEDULE_SUCCESS",
+                    provider="square",
+                    external_booking_id=booking_id,
+                    unchanged=True,
+                )
+                return ExternalBooking(provider=self.provider, external_id=booking_id)
+
+            # Confirm Square says the new slot is valid.
+            availability = (
+                await self._find_reschedule_availability(
+                    booking_id,
+                    start,
+                )
+            )
+
+            if not availability:
+                raise BookingProviderError(
+                    "The requested reschedule time "
+                    "is not available in Square"
+                )
+
+            new_start = availability.get(
+                "start_at"
+            )
+
+            if not new_start:
+                raise BookingProviderError(
+                    "Square reschedule availability "
+                    "has no start time"
+                )
+
+            body = {
+                "version": version,
+                "start_at": new_start,
+            }
+            idempotency_key = (
+                self._idempotency_key(
+                    "reschedule",
+                    booking_id,
+                    version,
+                    new_start,
+                )
+            )
+            expected_variations = [
+                str(segment.get("service_variation_id") or "")
+                for segment in current_segments
+            ]
+            expected_team = None
 
         data = await self._request(
             "PUT",
@@ -2484,10 +2598,7 @@ class SquareAdapter(VerticalProviderAdapter):
                 "idempotency_key": (
                     idempotency_key
                 ),
-                "booking": {
-                    "version": version,
-                    "start_at": new_start,
-                },
+                "booking": body,
             },
         )
 
@@ -2502,16 +2613,98 @@ class SquareAdapter(VerticalProviderAdapter):
                 "booking update"
             )
 
+        if not updated.get("start_at") or (
+            service_change and not updated.get("appointment_segments")
+        ):
+            # A thin response proves nothing about what Square stored.
+            updated = await self._retrieve_booking(booking_id)
+
+        self._verify_updated_booking(
+            updated,
+            booking_id=booking_id,
+            start_at=str(new_start),
+            variations=expected_variations,
+            team_member_id=expected_team,
+        )
+
         truth(
             "RESCHEDULE_SUCCESS",
             provider="square",
             external_booking_id=updated.get("id") or booking_id,
+            service_changed=service_change,
         )
 
         return ExternalBooking(
             provider=self.provider,
             external_id=booking_id,
+            service_changed=service_change,
         )
+
+    @staticmethod
+    def _segments_differ(
+        current_segments: list[dict[str, Any]],
+        pinned: dict[str, Any],
+    ) -> bool:
+        """Whether the verified slot names a different service than Square holds."""
+        if len(current_segments) != 1:
+            return True
+        segment = current_segments[0] or {}
+        if str(segment.get("service_variation_id") or "") != str(
+            pinned.get("service_variation_id") or ""
+        ):
+            return True
+        wanted_minutes = pinned.get("duration_minutes")
+        held_minutes = segment.get("duration_minutes")
+        if wanted_minutes is not None and held_minutes is not None:
+            try:
+                return int(wanted_minutes) != int(held_minutes)
+            except (TypeError, ValueError):
+                return True
+        return False
+
+    def _verify_updated_booking(
+        self,
+        updated: dict[str, Any],
+        *,
+        booking_id: str,
+        start_at: str,
+        variations: list[str],
+        team_member_id: str | None,
+    ) -> None:
+        """Raise unless Square's stored booking is exactly what was requested."""
+        problems: list[str] = []
+        if str(updated.get("id") or "") != booking_id:
+            problems.append("booking id")
+        raw_start = updated.get("start_at")
+        try:
+            same_start = bool(raw_start) and (
+                self._parse_square_datetime(str(raw_start))
+                == self._parse_square_datetime(start_at)
+            )
+        except ValueError:
+            same_start = False
+        if not same_start:
+            problems.append("start time")
+        segments = list(updated.get("appointment_segments") or [])
+        stored = [str(segment.get("service_variation_id") or "") for segment in segments]
+        if [value for value in variations if value] and stored != variations:
+            problems.append("service")
+        if team_member_id and (
+            not segments or str(segments[0].get("team_member_id") or "") != team_member_id
+        ):
+            problems.append("team member")
+        if problems:
+            truth(
+                "RESCHEDULE_UNVERIFIED",
+                provider="square",
+                external_booking_id=booking_id,
+                mismatched=",".join(problems),
+            )
+            raise BookingProviderError(
+                "Square did not confirm the requested " + ", ".join(problems)
+                + " for this booking",
+                code="BOOKING_OUTCOME_UNKNOWN",
+            )
 
     # ------------------------------------------------------------------
     # CANCEL
