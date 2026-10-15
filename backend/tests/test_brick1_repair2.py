@@ -758,3 +758,49 @@ async def test_move_reply_is_checked_segment_by_segment(monkeypatch, corruption)
     await p.says("Yes, please.")
     flagged = bool(p.session.entities.get("booking_reconciliation_required"))
     assert flagged is (corruption != "pending_ok"), (corruption, p.session.booking_status)
+
+
+# --------------------------------------------------------------------------- #
+# R2-F7: a voice change only ever touches the caller's own appointment
+# --------------------------------------------------------------------------- #
+from app.services.booking_state import get_draft as _get_draft, save_draft as _save_draft  # noqa: E402
+from app.services.call_state import CallSession  # noqa: E402
+
+
+def _other_caller(world, sid="CA-other", phone="+15559990000"):
+    return CallSession(sid, "inbound", phone, "+15550000001",
+                       tenant_id=str(world.spa.id), timezone="America/Chicago")
+
+
+async def test_contaminated_offer_cannot_cancel_another_callers_booking(monkeypatch):
+    w = make_world(monkeypatch)
+    cancellation_transport(monkeypatch, w)
+    await booked_call(w)
+    victim = w.store.live[0]
+    q = Phone(w, _other_caller(w))
+    draft = _get_draft(q.session)
+    draft.offered_appointment_ids = [str(victim.id)]
+    draft.target_appointment_id = str(victim.id)
+    _save_draft(q.session, draft)
+    await q.says("Please cancel my appointment.")
+    out = await q.tool("cancel_appointment", appointment_id=str(victim.id))
+    assert out["status"] != "cancellation_confirmation_required", out
+    await q.says("Yes.")
+    await q.tool("cancel_appointment", appointment_id=str(victim.id))
+    assert not cancels(w) and len(w.square.active()) == 1
+
+
+async def test_same_caller_on_a_later_call_can_still_cancel_their_booking(monkeypatch):
+    w = make_world(monkeypatch)
+    cancellation_transport(monkeypatch, w)
+    await booked_call(w)
+    own = w.store.live[0]
+    later = Phone(w, _other_caller(w, sid="CA-later", phone="+15550000002"))
+    draft = _get_draft(later.session)
+    draft.offered_appointment_ids = [str(own.id)]
+    _save_draft(later.session, draft)
+    await later.says("Please cancel my appointment.")
+    out = await later.tool("cancel_appointment", appointment_id=str(own.id))
+    assert out["status"] == "cancellation_confirmation_required", out
+    await later.says("Yes.")
+    assert len(cancels(w)) == 1 and not w.square.active()

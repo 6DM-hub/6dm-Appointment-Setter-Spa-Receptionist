@@ -2055,6 +2055,9 @@ async def _confirm_booking(
             existing = await _load_active_appointment(
                 db, routing.scope, draft.target_appointment_id
             )
+            if existing is not None and not await _caller_owns(db, routing, session, existing):
+                truth("RESCHEDULE_TARGET_NOT_OWNED", call_sid=session.call_sid)
+                existing = None
             if existing is None:
                 truth(
                     "RESCHEDULE_TARGET_MISSING",
@@ -2509,6 +2512,20 @@ async def _confirm_booking(
 CANCELLATION_KEPT_MARKER = "[CANCELLATION_REFUSED_KEEP]"
 
 
+async def _caller_owns(db: AsyncSession, routing: _Routing, session: CallSession, appointment: Appointment) -> bool:
+    """The appointment belongs to the caller on this call.
+
+    Either this very call booked it, or it belongs to the contact found for
+    the caller's own number in this tenant. A list of "offered" ids in the
+    session is not proof on its own: session state can be stale or wrong.
+    """
+    key = str(getattr(appointment, "booking_intent_key", None) or "")
+    if key.startswith(f"{session.call_sid}:"):
+        return True
+    contact = await _find_contact_by_phone(db, routing.scope, session)
+    return bool(contact is not None and appointment.contact_id == contact.id)
+
+
 class StaffChangeRefused(Exception):
     """A dashboard change the calendar of record did not (provably) accept."""
 
@@ -2732,6 +2749,18 @@ async def cancel_booking(
             return BookingResult(
                 BookingOutcome.NOT_FOUND,
                 message="No upcoming appointment found for this caller to cancel. Let them know politely.",
+            )
+        if not await _caller_owns(db, routing, session, existing):
+            # However the target was reached (an offered list, the draft, the
+            # session), it must belong to THIS caller.
+            session.entities.pop(guard.PENDING_CANCELLATION, None)
+            save_draft(session, draft)
+            return BookingResult(
+                BookingOutcome.MISSING_INFO,
+                message=(
+                    "That appointment does not belong to this caller, so nothing was "
+                    "cancelled. Ask which of their own appointments they mean."
+                ),
             )
 
         if decision != "confirmed" or str(existing.id) != str((pending or {}).get("appointment_id")):

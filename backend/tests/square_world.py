@@ -328,7 +328,11 @@ def wire(monkeypatch, spa=None, adapter=None):
     monkeypatch.setattr(svc, "_load_by_intent_key", _by_key)
     monkeypatch.setattr(svc, "_load_active_appointment", _by_id)
     monkeypatch.setattr(svc, "_load_call_owned_appointment", _noop)
-    monkeypatch.setattr(svc, "_find_contact_by_phone", lambda *_a, **_k: _value(None))
+    async def _contact_for(_db, _scope, session):
+        # The caller's own number finds their contact, as the real lookup does.
+        return contact if getattr(session, "from_number", None) == contact.phone else None
+
+    monkeypatch.setattr(svc, "_find_contact_by_phone", _contact_for)
     monkeypatch.setattr(svc, "_has_conflict", _conflict)
     return SimpleNamespace(spa=spa, square=square, adapter=adapter, store=store, db=db, contact=contact)
 

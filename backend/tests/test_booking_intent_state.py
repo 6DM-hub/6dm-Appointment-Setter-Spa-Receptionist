@@ -221,7 +221,11 @@ def world(monkeypatch):
     monkeypatch.setattr(svc, "_load_call_owned_appointment", _by_call)
     monkeypatch.setattr(svc, "_find_upcoming_appointment", _upcoming)
     monkeypatch.setattr(svc, "_find_upcoming_appointments", lambda *_a, **_k: _value([]))
-    monkeypatch.setattr(svc, "_find_contact_by_phone", lambda *_a, **_k: _value(None))
+    async def _contact_for(_db, _scope, session):
+        # The caller's own number finds their contact, as the real lookup does.
+        return _Contact() if getattr(session, "from_number", None) == "+15550000002" else None
+
+    monkeypatch.setattr(svc, "_find_contact_by_phone", _contact_for)
     monkeypatch.setattr(svc, "_has_conflict", _conflict)
 
     session = CallSession(
