@@ -423,13 +423,16 @@ def test_a_backend_statement_between_question_and_yes_keeps_the_binding():
     assert answers_backend_question(s, history_len=0, question=Q, trusted=[hold]) is True
 
 
-def test_a_backend_question_between_question_and_yes_unbinds():
-    other = "Would you like me to text you our address?"
+def test_a_backend_question_unbinds_a_cancellation_yes_but_not_a_booking_follow_up():
+    other = "Would you like me to text you our address"
     s = _session(("assistant", Q), ("assistant", other), ("user", "Yes."))
-    assert answers_backend_question(s, history_len=0, question=Q, trusted=[other]) is False
-    s = _session(("assistant", Q), ("assistant", "Would you like me to text you our address"), ("user", "Yes."))
-    assert answers_backend_question(s, history_len=0, question=Q,
-                                    trusted=["Would you like me to text you our address"]) is False
+    assert answers_backend_question(s, history_len=0, question=Q, trusted=[other],
+                                    trust_backend_questions=False) is False
+    # Booking: the backend's own consent follow-ups ("Would you like me to go
+    # ahead?", a translated read-back) are questions and must keep binding.
+    follow_up = "Would you like me to go ahead?"
+    s = _session(("assistant", Q), ("assistant", follow_up), ("user", "Yes."))
+    assert answers_backend_question(s, history_len=0, question=Q, trusted=[follow_up]) is True
 
 
 def test_cancellation_yes_survives_a_backend_hold_line_but_not_a_backend_question():

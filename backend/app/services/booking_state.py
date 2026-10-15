@@ -380,6 +380,7 @@ def _trailing_non_dialogue(tail: list) -> int:
 
 def answers_backend_question(
     session: Any, *, history_len: int, question: str | None, trusted: list | None = None,
+    trust_backend_questions: bool = True,
 ) -> bool | None:
     """Does the latest caller turn answer the question asked at ``history_len``,
     with no other question asked since?
@@ -407,8 +408,16 @@ def answers_backend_question(
         # itself or another line the backend spoke unbinds the yes.
         if question and same_question(said, question):
             continue
-        if not _is_question_line(said) and any(same_question(said, p) for p in (trusted or [])):
-            continue   # a backend statement ("one moment..."), not another question
+        if (trust_backend_questions or not _is_question_line(said)) and any(
+            same_question(said, p) for p in (trusted or [])
+        ):
+            # A line the backend itself spoke. For a booking these include its
+            # own consent questions (a silence follow-up, a translated read-back,
+            # "would you like to continue with the original?"), and any other
+            # backend question has a dedicated handler that answers its yes
+            # first. A cancellation is resolved BEFORE those handlers, so there
+            # only backend statements ("one moment...") keep the yes bound.
+            continue
         return False
     return True
 

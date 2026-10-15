@@ -527,11 +527,12 @@ def _caller_turns(session: Any) -> list[str]:
 
 
 def answers_backend_question(session: Any, *, history_len: int, question: str | None,
-                             trusted: list | None = None) -> bool:
+                             trusted: list | None = None, trust_backend_questions: bool = True) -> bool:
     """See `booking_state.answers_backend_question`; no caller turn means no."""
     from app.services.booking_state import answers_backend_question as _answers
 
-    return bool(_answers(session, history_len=history_len, question=question, trusted=trusted))
+    return bool(_answers(session, history_len=history_len, question=question, trusted=trusted,
+                         trust_backend_questions=trust_backend_questions))
 
 
 def cancellation_question(service: str | None, start_iso: str | None, tz: Any) -> str:
@@ -582,6 +583,7 @@ def cancellation_decision(session: Any) -> str:
             # Backend STATEMENTS in between ("one moment...") keep the binding;
             # any question, even one the backend asked, unbinds it.
             trusted=list(session.entities.get("backend_prompts") or []),
+            trust_backend_questions=False,
         )
     ):
         return "confirmed"
