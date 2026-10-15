@@ -621,7 +621,13 @@ async def test_an_adapter_without_write_back_refuses_external_bookings(action):
     ("Thursday at 2 PM is available. Would you like me to book that? Would you like our address?", True),
     ("Shall I book Thursday at 2 PM? Also, do you need directions?", True),
     ("Shall I book Thursday at 2 PM? Would you like a coffee when you arrive?", True),
-    ("Does Thursday at 2 PM work for you? Shall I book it?", False),
+    ("Does Thursday at 2 PM work for you? Shall I book it?", True),     # two questions: re-ask
+    ("Would you like me to book that, and would you like me to text you our address?", True),
+    ("thursday at 2 pm is available would you like me to book that would you like our address", True),
+    ("Shall I book Thursday at 2 PM? Shall I have a provider call you back?", True),
+    ("Would you like me to book that? Do you want me to add a gratuity?", True),
+    ("Do you want me to book Thursday at 2 PM?", False),
+    ("Shall I go ahead and book Thursday at 2 PM for you?", False),
 ])
 def test_compound_read_back_is_ambiguous(line, ambiguous):
     from app.services.booking_state import _asks_something_else
@@ -631,10 +637,12 @@ def test_compound_read_back_is_ambiguous(line, ambiguous):
 def test_a_backend_authored_read_back_is_not_second_guessed():
     from app.services.booking_state import _asks_something_else, note_backend_prompt
     line = "¿Le parece bien el jueves a las 2 PM? ¿Quiere que lo reserve?"
-    s = _session()
+    s = _session(("user", "El jueves a las 2."))
     assert _asks_something_else(s, line) is True     # model wording: fail closed
     note_backend_prompt(s, line)
-    assert _asks_something_else(s, line) is False    # the backend's own read-back
+    assert _asks_something_else(s, line) is False    # the backend's own read-back, just now
+    s.history.append({"role": "user", "content": "Hmm."})
+    assert _asks_something_else(s, line) is True     # an OLD backend line repeated later
 
 
 # --- Review fix: a Google delete is never a silent success ------------------

@@ -349,21 +349,34 @@ def note_booking_question(session: Any, text: str | None = None) -> None:
 
 
 _SENTENCE_RE = re.compile(r"[^.?!¿¡]+[.?!]?")
+# Ways a spoken question opens. Counted ANYWHERE in the line, so neither a
+# missing "?" nor joining two questions with "and" hides the second one.
+_QUESTION_OPENER_RE = re.compile(
+    r"\b(?:would you|wouldn'?t you|will you|shall i|shall we|should i|should we|"
+    r"do you|did you|does that|does this|does it|can i|can we|can you|could i|could you|"
+    r"may i|is that|is this|is it|are you|have you|how about|what about)\b",
+    re.IGNORECASE,
+)
 
 
 def _asks_something_else(session: Any, text: str) -> bool:
-    """A model-worded line that asks the booking question AND another question.
+    """A model-worded line that asks MORE than one question.
 
-    Lines the backend itself authored (its read-back, possibly translated)
-    are its own wording and are not second-guessed here.
+    Then a yes may answer any of them, so it is not consent to the booking
+    (fail closed: "Does that work? Shall I book it?" costs one re-ask; the
+    realtime re-ask is the backend's own single-question read-back). Lines
+    the backend itself authored since the caller last spoke (its read-back,
+    possibly translated) are its own wording and are not second-guessed.
     """
-    if any(same_question(text, record["text"])
+    history = list(getattr(session, "history", None) or [])
+    since_caller = max((i + 1 for i, item in enumerate(history) if item.get("role") == "user"), default=0)
+    if any(record["at"] >= since_caller and same_question(text, record["text"])
            for record in _prompt_records(session.entities.get(BACKEND_PROMPTS))):
         return False
+    if len(_QUESTION_OPENER_RE.findall(text)) >= 2:
+        return True
     questions = [s.strip() for s in _SENTENCE_RE.findall(text) if _is_question_line(s.strip())]
-    if len(questions) < 2:
-        return False
-    return any(_OTHER_TOPIC_RE.search(q) or not _BOOKING_QUESTION_RE.search(q) for q in questions)
+    return len(questions) >= 2
 
 
 def note_backend_prompt(session: Any, text: str | None) -> None:
