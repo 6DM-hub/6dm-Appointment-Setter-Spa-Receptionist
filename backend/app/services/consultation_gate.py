@@ -1031,9 +1031,16 @@ def _duration_offer_text(kind: str, choices: Sequence[Mapping[str, Any]]) -> str
         elif minutes == 60:
             benefit = (
                 "allows more time for the treatment" if kind == FACIAL
-                else "gives the therapist more time to work thoroughly"
+                else "gives you an hour to unwind"
             )
             parts.append(f"The 60-minute {name} {benefit}.")
+        elif minutes == 90 and kind == MASSAGE:
+            parts.append(
+                f"For a more unhurried experience, I'd recommend the 90-minute {name}. "
+                "It gives your therapist more time to focus on tense areas, like your "
+                "shoulders or back, while still allowing time for a full-body massage. "
+                "You have more time to settle in and unwind without feeling rushed."
+            )
         else:
             parts.append(f"We also have a {minutes}-minute {name}.")
     lengths = " or ".join(f"{minutes}-minute" for minutes in durations)
