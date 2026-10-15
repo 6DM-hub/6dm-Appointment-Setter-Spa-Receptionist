@@ -2509,6 +2509,83 @@ async def _confirm_booking(
 CANCELLATION_KEPT_MARKER = "[CANCELLATION_REFUSED_KEEP]"
 
 
+class StaffChangeRefused(Exception):
+    """A dashboard change the calendar of record did not (provably) accept."""
+
+    def __init__(self, status_code: int, detail: str) -> None:
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+
+
+async def apply_staff_change(
+    db: AsyncSession,
+    scope: TenantScope,
+    appointment: Appointment,
+    *,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    cancel: bool = False,
+) -> None:
+    """Write a business user's change to the provider before the local row.
+
+    An appointment mirrored in an external calendar (it has an
+    external_booking_id) is changed there first, through the same adapter and
+    verification as a voice booking; the caller of this function only updates
+    the local row after this returns. A refusal or an unknown outcome leaves
+    the local row untouched, so CARA and the calendar never silently diverge.
+    Appointments that only exist in CARA are not touched here.
+    """
+    if not appointment.external_booking_id:
+        return
+    spa = await _load_spa(db, scope)
+    if spa is None:
+        raise StaffChangeRefused(404, "Business not found")
+    adapter = get_booking_adapter(is_outbound_sales=False, spa=spa)
+    held_by = str(appointment.booking_provider or "")
+    if held_by and held_by != str(getattr(adapter, "provider", "")):
+        raise StaffChangeRefused(
+            409,
+            f"This appointment is held in {held_by}, which is not this business's "
+            "current calendar. Change it there.",
+        )
+    operation = "cancel_booking" if cancel else "move_booking"
+    try:
+        if cancel:
+            await _calendar_call(
+                operation, f"staff:{appointment.id}",
+                adapter.cancel_booking(external_booking_of(appointment)),
+            )
+        else:
+            mover = adapter.move_booking
+            import inspect
+
+            if "staff_override" in inspect.signature(mover).parameters:
+                moved = await _calendar_call(
+                    operation, f"staff:{appointment.id}",
+                    mover(external_booking_of(appointment), start, end, staff_override=True),
+                )
+            else:
+                moved = await _calendar_call(
+                    operation, f"staff:{appointment.id}",
+                    mover(external_booking_of(appointment), start, end),
+                )
+            if getattr(moved, "external_id", None):
+                appointment.external_booking_id = moved.external_id
+    except BookingProviderError as exc:
+        truth("STAFF_CHANGE_REFUSED", appointment_id=str(appointment.id),
+              operation=operation, code=exc.code)
+        if exc.code in UNCERTAIN_OUTCOME_CODES:
+            raise StaffChangeRefused(
+                502,
+                "The calendar did not confirm this change, so its outcome is unknown. "
+                "Check the appointment in the calendar before changing it again.",
+            ) from exc
+        raise StaffChangeRefused(
+            409, f"The calendar did not accept this change: {exc}"
+        ) from exc
+
+
 async def cancel_booking(
     db: AsyncSession,
     session: CallSession,

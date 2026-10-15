@@ -2432,6 +2432,8 @@ class SquareAdapter(VerticalProviderAdapter):
         start: datetime,
         end: datetime,
         ctx: BookingContext | None = None,
+        *,
+        staff_override: bool = False,
     ) -> ExternalBooking:
         """Move a Square booking, optionally to a different service.
 
@@ -2585,9 +2587,13 @@ class SquareAdapter(VerticalProviderAdapter):
                 )
                 return ExternalBooking(provider=self.provider, external_id=booking_id)
 
-            # Confirm Square says the new slot is valid.
+            # Confirm Square says the new slot is valid. A business user moving
+            # a booking from the dashboard decides availability themselves,
+            # exactly as in Square's own dashboard; the result is still verified.
             availability = (
-                await self._find_reschedule_availability(
+                {"start_at": self._square_datetime(start)}
+                if staff_override
+                else await self._find_reschedule_availability(
                     booking_id,
                     start,
                 )
@@ -2866,4 +2872,10 @@ class SquareAdapter(VerticalProviderAdapter):
             raise BookingProviderError(
                 "Square did not confirm the "
                 "booking cancellation"
+            )
+        status = str(cancelled.get("status") or "").upper()
+        if status and not status.startswith("CANCELLED") and status != "DECLINED":
+            raise BookingProviderError(
+                f"Square answered the cancellation with status {status}",
+                code="BOOKING_OUTCOME_UNKNOWN",
             )

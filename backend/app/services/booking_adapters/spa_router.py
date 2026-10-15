@@ -942,9 +942,16 @@ class SpaBookingAdapter(BookingAdapter):
             raise
 
     async def move_booking(
-        self, booking: ExternalBooking, start, end, ctx: BookingContext | None = None
+        self, booking: ExternalBooking, start, end, ctx: BookingContext | None = None,
+        *, staff_override: bool = False,
     ) -> ExternalBooking:
         try:
+            if staff_override:
+                import inspect
+
+                if "staff_override" in inspect.signature(self.delegate.move_booking).parameters:
+                    return await self.delegate.move_booking(booking, start, end, staff_override=True)
+                return await self.delegate.move_booking(booking, start, end)
             if ctx is not None:
                 # Only providers that verify a service change take the context.
                 return await self.delegate.move_booking(booking, start, end, ctx=ctx)

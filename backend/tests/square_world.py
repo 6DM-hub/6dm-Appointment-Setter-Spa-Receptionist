@@ -131,6 +131,8 @@ class FakeSquare:
             return {"booking": copy.deepcopy(booking)}
         if path.startswith("/v2/bookings/") and method == "PUT":
             return {"booking": self._update(path.rsplit("/", 1)[-1], body)}
+        if path.startswith("/v2/bookings/") and path.endswith("/cancel") and method == "POST":
+            return {"booking": self._cancel(path.split("/")[-2], body)}
         raise AssertionError(f"unexpected Square call {method} {path}")
 
     # -- behaviour ------------------------------------------------------ #
@@ -189,6 +191,19 @@ class FakeSquare:
         self.bookings[booking["id"]] = booking
         self._idempotent[key] = copy.deepcopy(booking)
         return copy.deepcopy(booking)
+
+    def _cancel(self, booking_id: str, body: dict) -> dict:
+        """CancelBooking: version-checked, idempotent, like Square."""
+        key = body.get("idempotency_key")
+        if key in self._idempotent:
+            return copy.deepcopy(self._idempotent[key])
+        stored = self.bookings[booking_id]
+        if body.get("booking_version") != stored["version"]:
+            raise BookingProviderError("version mismatch", code="CONFLICT")
+        stored["status"] = "CANCELLED_BY_SELLER"
+        stored["version"] += 1
+        self._idempotent[key] = copy.deepcopy(stored)
+        return copy.deepcopy(stored)
 
     def _update(self, booking_id: str, body: dict) -> dict:
         key = body.get("idempotency_key")

@@ -10,6 +10,7 @@ from app.api.deps import get_db, get_tenant_scope
 from app.core.tenancy import TenantScope, owns, scope_columns, scope_filter
 from app.models import Appointment, AppointmentStatus, Contact
 from app.schemas import AppointmentCreate, AppointmentRead, AppointmentUpdate, Page
+from app.services.appointment_booking_service import StaffChangeRefused, apply_staff_change
 
 router = APIRouter(prefix="/appointments", tags=["appointments"])
 
@@ -167,10 +168,27 @@ async def update_appointment(
     appointment = await db.get(Appointment, appointment_id)
     if not appointment or not owns(scope, appointment):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appointment not found")
-    for field, value in payload.model_dump(exclude_unset=True).items():
-        setattr(appointment, field, value)
-    if appointment.end_time <= appointment.start_time:
+    changes = payload.model_dump(exclude_unset=True)
+    new_start = changes.get("start_time", appointment.start_time)
+    new_end = changes.get("end_time", appointment.end_time)
+    if new_end <= new_start:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "end_time must be after start_time")
+    # A booking mirrored in an external calendar changes there first; the
+    # local row follows only once the calendar has verifiably accepted it.
+    cancelling = (
+        changes.get("status") == AppointmentStatus.CANCELLED
+        and appointment.status != AppointmentStatus.CANCELLED
+    )
+    moving = (new_start, new_end) != (appointment.start_time, appointment.end_time)
+    if cancelling or moving:
+        try:
+            await apply_staff_change(
+                db, scope, appointment, start=new_start, end=new_end, cancel=cancelling
+            )
+        except StaffChangeRefused as exc:
+            raise HTTPException(exc.status_code, exc.detail) from exc
+    for field, value in changes.items():
+        setattr(appointment, field, value)
     await db.commit()
     await db.refresh(appointment)
     return appointment
@@ -185,5 +203,10 @@ async def cancel_appointment(
     appointment = await db.get(Appointment, appointment_id)
     if not appointment or not owns(scope, appointment):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appointment not found")
+    if appointment.status != AppointmentStatus.CANCELLED:
+        try:
+            await apply_staff_change(db, scope, appointment, cancel=True)
+        except StaffChangeRefused as exc:
+            raise HTTPException(exc.status_code, exc.detail) from exc
     appointment.status = AppointmentStatus.CANCELLED
     await db.commit()

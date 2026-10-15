@@ -399,3 +399,102 @@ async def test_move_that_lands_with_the_wrong_staff_is_not_reported_as_done(monk
     heard = await p.says("Yes, go ahead.")
     assert p.session.entities.get("booking_reconciliation_required")
     assert not any("all set" in line or "has been moved" in line for line in heard), heard
+
+
+# --------------------------------------------------------------------------- #
+# F8: dashboard edits keep the calendar of record and CARA in agreement
+# --------------------------------------------------------------------------- #
+from datetime import timedelta  # noqa: E402
+
+from fastapi import HTTPException  # noqa: E402
+
+from app.models import AppointmentStatus  # noqa: E402
+from app.schemas import AppointmentUpdate  # noqa: E402
+from tests.square_world import THU_2PM_UTC  # noqa: E402
+from tests.test_cara_native_double_booking import rubyz_db  # noqa: E402,F401
+from tests.test_codex_brick1_tenant_boundaries import book, session_for, setup_tenants  # noqa: E402
+
+
+async def test_dashboard_move_refused_by_the_calendar_changes_nothing_locally(rubyz_db, monkeypatch):
+    from app.api.v1.appointments import update_appointment
+
+    db, a, _b, squares = await setup_tenants(rubyz_db, monkeypatch)
+    session = session_for(a, "refused")
+    row = await book(db, a, session)
+    square = squares["fake-cleaning-token"]
+    original = square.__call__
+
+    async def refuse(method, path, *, json=None):
+        if method == "PUT":
+            raise BookingProviderError("Square API request failed: BAD_REQUEST", code="BAD_REQUEST")
+        return await original(method, path, json=json)
+
+    squares["fake-cleaning-token"] = refuse
+    with pytest.raises(HTTPException) as raised:
+        await update_appointment(row.id, AppointmentUpdate(
+            start_time=THU_2PM_UTC + timedelta(hours=2), end_time=THU_2PM_UTC + timedelta(hours=3),
+        ), scope=session.scope, db=db)
+    assert raised.value.status_code == 409
+    await db.refresh(row)
+    assert row.start_time.replace(tzinfo=None) == THU_2PM_UTC.replace(tzinfo=None)
+    assert square.active()[0]["start_at"] == Z2
+
+
+async def test_dashboard_move_with_unknown_outcome_leaves_the_row_and_says_so(rubyz_db, monkeypatch):
+    from app.api.v1.appointments import update_appointment
+
+    db, a, _b, squares = await setup_tenants(rubyz_db, monkeypatch)
+    session = session_for(a, "unknown")
+    row = await book(db, a, session)
+    square = squares["fake-cleaning-token"]
+
+    async def lost(method, path, *, json=None):
+        result = await square(method, path, json=json)
+        if method == "PUT":
+            raise asyncio.TimeoutError("response lost")
+        return result
+
+    squares["fake-cleaning-token"] = lost
+    with pytest.raises(HTTPException) as raised:
+        await update_appointment(row.id, AppointmentUpdate(
+            start_time=THU_2PM_UTC + timedelta(hours=2), end_time=THU_2PM_UTC + timedelta(hours=3),
+        ), scope=session.scope, db=db)
+    assert raised.value.status_code == 502 and "unknown" in raised.value.detail
+    await db.refresh(row)
+    assert row.start_time.replace(tzinfo=None) == THU_2PM_UTC.replace(tzinfo=None)
+
+
+async def test_dashboard_status_cancel_reaches_the_calendar(rubyz_db, monkeypatch):
+    from app.api.v1.appointments import update_appointment
+
+    db, a, _b, squares = await setup_tenants(rubyz_db, monkeypatch)
+    session = session_for(a, "status")
+    row = await book(db, a, session)
+    await update_appointment(row.id, AppointmentUpdate(status=AppointmentStatus.CANCELLED),
+                             scope=session.scope, db=db)
+    assert not squares["fake-cleaning-token"].active()
+    assert row.status == AppointmentStatus.CANCELLED
+
+
+async def test_dashboard_title_edit_does_not_touch_the_calendar(rubyz_db, monkeypatch):
+    from app.api.v1.appointments import update_appointment
+
+    db, a, _b, squares = await setup_tenants(rubyz_db, monkeypatch)
+    session = session_for(a, "title")
+    row = await book(db, a, session)
+    calls = len(squares["fake-cleaning-token"].calls)
+    await update_appointment(row.id, AppointmentUpdate(title="House Cleaning (side door)"),
+                             scope=session.scope, db=db)
+    assert len(squares["fake-cleaning-token"].calls) == calls
+    assert row.title == "House Cleaning (side door)"
+
+
+async def test_dashboard_cannot_change_another_tenants_appointment(rubyz_db, monkeypatch):
+    from app.api.v1.appointments import cancel_appointment
+
+    db, a, b, squares = await setup_tenants(rubyz_db, monkeypatch)
+    row = await book(db, a, session_for(a, "owner"))
+    with pytest.raises(HTTPException) as raised:
+        await cancel_appointment(row.id, scope=session_for(b, "other").scope, db=db)
+    assert raised.value.status_code == 404
+    assert len(squares["fake-cleaning-token"].active()) == 1
