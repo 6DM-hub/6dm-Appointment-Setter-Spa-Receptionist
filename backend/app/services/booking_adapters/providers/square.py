@@ -339,6 +339,9 @@ class SquareAdapter(VerticalProviderAdapter):
             "/v2/customers/search",
         }
         attempts = 2 if safe_to_retry else 1
+        # A booking create/update/cancel: once sent, only Square's explicit
+        # answer says whether it happened.
+        booking_write = not safe_to_retry and path.startswith("/v2/bookings")
 
         # Below `CALENDAR_TIMEOUT_SECONDS`. Booking and customer creates are
         # not retried: a timeout can mean Square already accepted the write.
@@ -400,6 +403,15 @@ class SquareAdapter(VerticalProviderAdapter):
                 error_code,
             )
 
+            if booking_write and (response.status_code >= 500 or response.status_code == 408):
+                # A gateway/server error is not a refusal: Square may already
+                # have applied the change. Never treat it as "nothing changed".
+                raise BookingProviderError(
+                    f"Square answered a booking change with HTTP {response.status_code}; "
+                    "its outcome is unknown",
+                    code="BOOKING_OUTCOME_UNKNOWN",
+                    retryable=False,
+                )
             raise BookingProviderError(
                 f"Square API request failed: {detail}",
                 code=error_code,
@@ -420,6 +432,13 @@ class SquareAdapter(VerticalProviderAdapter):
         try:
             return response.json()
         except ValueError as exc:
+            if booking_write:
+                raise BookingProviderError(
+                    "Square accepted a booking change but its reply was unreadable; "
+                    "its outcome is unknown",
+                    code="BOOKING_OUTCOME_UNKNOWN",
+                    retryable=False,
+                ) from exc
             raise BookingProviderError(
                 "Square returned an invalid response"
             ) from exc

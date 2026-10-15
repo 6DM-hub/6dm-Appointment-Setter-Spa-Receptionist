@@ -295,3 +295,64 @@ async def test_fence_is_exclusive_per_appointment(rubyz_db):
     assert await open_change_fence(db, spa.id, "call-3", {"appointment_id": "a-2"})  # other appointment
     await close_change_fence(db, first, own_transaction=True)
     assert await open_change_fence(db, spa.id, "call-2", {"appointment_id": "a-1"})
+
+
+# --- Review fix: a server error on a Square booking write is never "refused" -
+import httpx  # noqa: E402
+from types import SimpleNamespace as _NS  # noqa: E402
+
+from app.services.booking_adapters.providers.square import SquareAdapter  # noqa: E402
+
+_REAL_SQUARE_REQUEST = SquareAdapter._request   # before any world patches it
+
+
+async def _square_answers(monkeypatch, method, path, status, body="<html>Gateway Timeout</html>"):
+    import app.services.booking_adapters.providers.square as sq
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def request(self, verb, url, **kw):
+            return httpx.Response(status, text=body, request=httpx.Request(verb, url))
+
+    monkeypatch.setattr(sq.httpx, "AsyncClient", _Client)
+    adapter = _NS(_validate_config=lambda: None, base_url="https://square.test", _headers=lambda: {},
+                  spa_name="test", _safe_square_error=lambda r: f"HTTP {r.status_code}",
+                  _first_square_error_code=SquareAdapter._first_square_error_code)
+    return await _REAL_SQUARE_REQUEST(adapter, method, path, json={})
+
+
+@pytest.mark.parametrize("method,path", [
+    ("POST", "/v2/bookings/B1/cancel"), ("PUT", "/v2/bookings/B1"), ("POST", "/v2/bookings"),
+])
+@pytest.mark.parametrize("status", [500, 502, 503, 504, 408])
+async def test_square_server_error_on_a_booking_write_is_unknown(monkeypatch, method, path, status):
+    with pytest.raises(BookingProviderError) as err:
+        await _square_answers(monkeypatch, method, path, status)
+    assert err.value.code == "BOOKING_OUTCOME_UNKNOWN"
+
+
+async def test_square_unreadable_success_reply_to_a_booking_write_is_unknown(monkeypatch):
+    with pytest.raises(BookingProviderError) as err:
+        await _square_answers(monkeypatch, "POST", "/v2/bookings/B1/cancel", 200, body="not json")
+    assert err.value.code == "BOOKING_OUTCOME_UNKNOWN"
+
+
+async def test_square_explicit_refusal_stays_a_refusal(monkeypatch):
+    body = '{"errors":[{"code":"FORBIDDEN","detail":"no"}]}'
+    with pytest.raises(BookingProviderError) as err:
+        await _square_answers(monkeypatch, "POST", "/v2/bookings/B1/cancel", 403, body=body)
+    assert err.value.code == "FORBIDDEN"
+
+
+async def test_square_server_error_on_a_read_is_not_a_write_outcome(monkeypatch):
+    with pytest.raises(BookingProviderError) as err:
+        await _square_answers(monkeypatch, "GET", "/v2/bookings/B1", 503)
+    assert err.value.code != "BOOKING_OUTCOME_UNKNOWN"
