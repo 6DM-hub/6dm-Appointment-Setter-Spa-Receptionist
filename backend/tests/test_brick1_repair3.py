@@ -356,3 +356,61 @@ async def test_square_server_error_on_a_read_is_not_a_write_outcome(monkeypatch)
     with pytest.raises(BookingProviderError) as err:
         await _square_answers(monkeypatch, "GET", "/v2/bookings/B1", 503)
     assert err.value.code != "BOOKING_OUTCOME_UNKNOWN"
+
+
+# --- Review fix: fence lifecycle -------------------------------------------
+async def test_a_fence_whose_ack_was_lost_is_discarded_and_does_not_block(rubyz_db, monkeypatch):
+    import asyncio
+    from app.api.v1.appointments import cancel_appointment
+    from app.services import appointment_booking_service as booking
+    db, a, b, squares = await setup_tenants(rubyz_db, monkeypatch)
+    call = session_for(a, "r3-lost-ack")
+    row = await book(db, a, call)
+    row_id, scope = row.id, call.scope
+    real_open = booking._open_change_fence
+
+    async def slow_ack(*args, **kwargs):
+        fence = await real_open(*args, **kwargs)   # committed...
+        await asyncio.sleep(0.2)                    # ...but the answer comes too late
+        return fence
+
+    monkeypatch.setattr(booking, "FENCE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(booking, "_open_change_fence", slow_ack)
+    with pytest.raises(HTTPException) as err:
+        await cancel_appointment(row_id, scope=scope, db=db)
+    assert err.value.status_code == 503
+    await db.rollback()
+    assert not [r for r in await _escalations(db) if r.details.get("appointment_id") == str(row_id)]
+    monkeypatch.setattr(booking, "_open_change_fence", real_open)
+    monkeypatch.setattr(booking, "FENCE_TIMEOUT_SECONDS", 5.0)
+    await cancel_appointment(row_id, scope=scope, db=db)   # a retry is not blocked
+
+
+async def test_staff_cannot_resolve_a_change_still_being_sent(rubyz_db):
+    from app.services.booking_escalations import (
+        mark_change_unknown, open_change_fence, resolve,
+    )
+    db, spa = rubyz_db
+    fence = await open_change_fence(db, spa.id, "call-x", {"appointment_id": "a-1"})
+    [row] = await _escalations(db)
+    with pytest.raises(HTTPException) as err:
+        await resolve(db, spa.id, fence, "staff-1", "unable_to_book", row.version, "checked")
+    assert err.value.status_code == 409
+    await mark_change_unknown(db, fence, {"code": "BOOKING_OUTCOME_UNKNOWN"})
+    [row] = await _escalations(db)
+    await db.refresh(row)
+    resolved = await resolve(db, spa.id, fence, "staff-1", "unable_to_book", row.version, "checked in Square")
+    assert resolved.status == "unable_to_book"   # an alert (outcome unknown) can be resolved
+
+
+async def test_promotion_never_overwrites_an_unknown_outcome(rubyz_db):
+    from app.services.booking_escalations import (
+        mark_change_unknown, open_change_fence, promote_stale_change_fences,
+    )
+    db, spa = rubyz_db
+    fence = await open_change_fence(db, spa.id, "call-x", {"appointment_id": "a-1"})
+    await mark_change_unknown(db, fence, {"code": "BOOKING_OUTCOME_UNKNOWN"})
+    assert not await promote_stale_change_fences(db, older_than=timedelta(0))
+    [row] = await _escalations(db)
+    await db.refresh(row)
+    assert row.details["stage"] == "unknown_outcome" and row.details["code"] == "BOOKING_OUTCOME_UNKNOWN"

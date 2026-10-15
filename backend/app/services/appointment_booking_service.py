@@ -1808,6 +1808,18 @@ _CHANGE_IN_FLIGHT = (
 )
 
 
+async def _discard_unsent_fence(db: AsyncSession, fence_id) -> None:
+    """Opening the fence failed or timed out, and nothing was sent. Its commit
+    may still have landed: remove it, so it does not block the appointment.
+    If that fails too, the record stays (blocked, staff alerted): fail closed."""
+    try:
+        await asyncio.wait_for(
+            _close_change_fence(db, fence_id, own_transaction=True), timeout=FENCE_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        logger.exception("Could not discard an unsent change record %s", fence_id)
+
+
 def _fence_of(pending: dict | None):
     try:
         return uuid.UUID(str(pending["fence_id"])) if pending and pending.get("fence_id") else None
@@ -1831,9 +1843,10 @@ async def _begin_provider_change(
     if not existing.external_booking_id:
         return None   # CARA-only appointment: no external write to fence
     pending = session.entities[PENDING_PROVIDER_MUTATION]
+    planned = uuid.uuid4()
     try:
         fence_id = await asyncio.wait_for(
-            _open_change_fence(db, _tenant_uuid(session), session.call_sid, pending),
+            _open_change_fence(db, _tenant_uuid(session), session.call_sid, pending, fence_id=planned),
             timeout=FENCE_TIMEOUT_SECONDS,
         )
     except _ChangeInFlight:
@@ -1844,6 +1857,7 @@ async def _begin_provider_change(
         logger.exception("Could not record a change before sending it: call_sid=%s", session.call_sid)
         truth("CHANGE_FENCE_NOT_RECORDED", call_sid=session.call_sid, operation=operation)
         session.entities.pop(PENDING_PROVIDER_MUTATION, None)
+        await _discard_unsent_fence(db, planned)
         return _FENCE_UNAVAILABLE
     if fence_id:
         pending["fence_id"] = str(fence_id)
@@ -2714,9 +2728,11 @@ async def apply_staff_change(
     }
     # Write-ahead: durably record the change BEFORE it is sent (see
     # booking_escalations.open_change_fence). No record, no send.
+    planned = uuid.uuid4()
     try:
         fence_id = await asyncio.wait_for(
-            _open_change_fence(db, scope.tenant_id, "staff", record), timeout=FENCE_TIMEOUT_SECONDS,
+            _open_change_fence(db, scope.tenant_id, "staff", record, fence_id=planned),
+            timeout=FENCE_TIMEOUT_SECONDS,
         )
     except _ChangeInFlight as exc:
         raise StaffChangeRefused(
@@ -2727,6 +2743,7 @@ async def apply_staff_change(
     except Exception as exc:
         logger.exception("Could not record a dashboard change before sending it: %s", appointment.id)
         truth("CHANGE_FENCE_NOT_RECORDED", appointment_id=str(appointment.id), operation=operation)
+        await _discard_unsent_fence(db, planned)
         raise StaffChangeRefused(
             503, "This change could not be recorded safely before sending it, so nothing was "
             "changed. Try again in a moment.",

@@ -146,6 +146,11 @@ async def resolve(db, tenant_id, request_id, actor_id, status, expected_version,
         raise HTTPException(409, "Request changed. Refresh before updating.")
     if status not in {"pending", "contacted", "booked", "unable_to_book"}:
         raise HTTPException(422, "Invalid request status")
+    if (row.category == UNRESOLVED_CHANGE and row.delivery_status == "held"
+            and status not in _OPEN_STATUSES):
+        # Still being sent: its outcome is not known yet, so it cannot be
+        # resolved (that would unblock the appointment mid-write).
+        raise HTTPException(409, "This change is still being sent to the calendar. Try again shortly.")
     if status == "booked" and not booking_id:
         raise HTTPException(422, "Record the provider booking reference from manual scheduling.")
     row.history = [*row.history, {"at": now().isoformat(), "actor": str(actor_id),
@@ -275,7 +280,7 @@ class ChangeInFlight(Exception):
     """Another change of this appointment is in flight or unresolved."""
 
 
-async def open_change_fence(db, tenant_id, call_reference, details):
+async def open_change_fence(db, tenant_id, call_reference, details, *, fence_id=None):
     """Durably record a provider change before it is sent; returns its id.
 
     Exclusive per appointment: while one change is in flight or unresolved,
@@ -297,6 +302,7 @@ async def open_change_fence(db, tenant_id, call_reference, details):
         if await unresolved_change_for(fence_db, tenant_id, appointment_id) is not None:
             raise ChangeInFlight(appointment_id)
         row = BookingEscalation(
+            id=fence_id or uuid.uuid4(),   # known in advance, so a lost ack can be cleaned up
             tenant_id=tenant_id, call_reference=reference, status="pending", priority="urgent",
             category=UNRESOLVED_CHANGE,
             details=_change_details(details, stage="in_flight", opened_at=now().isoformat()),
@@ -333,6 +339,7 @@ async def mark_change_unknown(db, fence_id, details):
             return None
         row.details = {**(row.details or {}), **_change_details(details, stage="unknown_outcome")}
         row.delivery_status = "pending"
+        row.status = "pending"   # an unknown outcome always (re)opens the block
         await fence_db.commit()
         return row
 
@@ -340,19 +347,23 @@ async def mark_change_unknown(db, fence_id, details):
 async def promote_stale_change_fences(db, *, older_than=FENCE_STALE_AFTER):
     """A change still in flight long after it was sent was interrupted: alert staff."""
     cutoff = now() - older_than
-    rows = list((await db.execute(select(BookingEscalation).where(
+    rows = list((await db.execute(select(
+        BookingEscalation.id, BookingEscalation.created_at, BookingEscalation.details,
+    ).where(
         BookingEscalation.category == UNRESOLVED_CHANGE,
         BookingEscalation.delivery_status == "held",
-    ))).scalars())
+    ))).all())
     changed = False
-    for row in rows:
-        created = row.created_at
+    for row_id, created, details in rows:
         if created is not None and created.tzinfo is None:
             created = created.replace(tzinfo=timezone.utc)
-        if created is None or created <= cutoff:
-            row.details = {**(row.details or {}), "stage": "interrupted"}
-            row.delivery_status = "pending"
-            changed = True
+        if created is not None and created > cutoff:
+            continue
+        # Conditional: a fence settled or marked unknown meanwhile is left alone.
+        result = await db.execute(update(BookingEscalation).where(
+            BookingEscalation.id == row_id, BookingEscalation.delivery_status == "held",
+        ).values(details={**(details or {}), "stage": "interrupted"}, delivery_status="pending"))
+        changed = changed or bool(result.rowcount)
     if changed:
         await db.commit()
     return changed
