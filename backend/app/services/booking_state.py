@@ -271,6 +271,7 @@ _CONSENT_FOLLOW_UP = _CONFIRMATION_FILLER | {
     "so", "much", "lovely", "wonderful", "awesome", "cool", "dear", "sir",
     "maam", "ma'am", "please", "thankyou", "very", "is", "would", "be",
     "sounds", "great", "good", "perfect", "ok", "okay", "yes",
+    "that'd", "thatd", "i'd", "id", "love", "like", "to", "appreciate", "that's",
 }
 
 # A question CARA asks about the booking itself. A plain "yes" answers the

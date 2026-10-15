@@ -159,6 +159,7 @@ async def _offered(world):
 @pytest.mark.parametrize("consent", [
     "Yes.", "Yes please.", "Yes, please book it.", "Yeah, that works for me, thanks.",
     "Yes, that sounds great, thank you so much.", "Okay, go ahead.",
+    "Yes please, that'd be great.", "Yes, I'd like that.",
 ])
 async def test_real_consent_still_books(monkeypatch, consent):
     w = make_world(monkeypatch)
@@ -170,6 +171,7 @@ async def test_real_consent_still_books(monkeypatch, consent):
 @pytest.mark.parametrize("utterance", [
     "Yes, what's the cancellation policy?", "Yes, is there parking?", "Yes, hold on a second.",
     "Yeah, I'm driving right now.", "Sure, what do I need to bring?",
+    "Yes, I'd like to know the price first.",
 ])
 async def test_yes_followed_by_something_else_is_not_consent(monkeypatch, utterance):
     w = make_world(monkeypatch)
