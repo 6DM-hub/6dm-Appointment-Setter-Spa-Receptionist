@@ -218,9 +218,15 @@ async def record_unresolved_change(db, tenant_id, call_reference, details):
         BookingEscalation.call_reference == reference))).scalar_one_or_none()
     if existing:
         return existing
+    row_details = clean(dict(details))
+    # Identifiers are not payment text: payment redaction can mistake a UUID's
+    # digit run for a card number, and the block is looked up by these values.
+    for key in ("appointment_id", "external_booking_id"):
+        if details.get(key) is not None:
+            row_details[key] = str(details[key])
     row = BookingEscalation(
         tenant_id=tenant_id, call_reference=reference, status="pending", priority="urgent",
-        category=UNRESOLVED_CHANGE, details=clean(dict(details)), delivery={}, history=[],
+        category=UNRESOLVED_CHANGE, details=row_details, delivery={}, history=[],
     )
     db.add(row)
     try:

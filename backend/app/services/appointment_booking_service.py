@@ -2639,6 +2639,26 @@ async def apply_staff_change(
         truth("STAFF_CHANGE_REFUSED", appointment_id=str(appointment.id),
               operation=operation, code=exc.code)
         if exc.code in UNCERTAIN_OUTCOME_CODES:
+            # Durable, per appointment: the calendar may already hold this
+            # change, so every later voice or dashboard change of this
+            # appointment stays blocked until staff resolve it.
+            record = {
+                "code": exc.code, "details": str(exc), "source": "dashboard",
+                "operation": "cancel" if cancel else "move",
+                "appointment_id": str(appointment.id),
+                "external_booking_id": appointment.external_booking_id,
+                "from_start": appointment.start_time.isoformat() if appointment.start_time else None,
+                "to_start": start.isoformat() if start else None,
+            }
+            await _safe_rollback(db)  # (expires ORM rows: use only `record` below)
+            try:
+                await _record_unresolved_change(
+                    db, scope.tenant_id, f"staff:{uuid.uuid4().hex[:12]}", record,
+                )
+            except Exception:
+                logger.exception("Could not record an unresolved dashboard change for %s",
+                                 record["appointment_id"])
+                truth("UNRESOLVED_CHANGE_NOT_RECORDED", appointment_id=record["appointment_id"])
             raise StaffChangeRefused(
                 502,
                 "The calendar did not confirm this change, so its outcome is unknown. "
