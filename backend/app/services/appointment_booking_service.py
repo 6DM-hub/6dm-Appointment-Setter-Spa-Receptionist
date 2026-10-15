@@ -2537,7 +2537,7 @@ async def apply_staff_change(
     Appointments that only exist in CARA are not touched here.
     """
     if not appointment.external_booking_id:
-        return
+        return  # exists only in CARA: the caller updates the row, nothing else
     spa = await _load_spa(db, scope)
     if spa is None:
         raise StaffChangeRefused(404, "Business not found")
@@ -2757,11 +2757,14 @@ async def cancel_booking(
         await _lock_slot(db, routing.scope, existing.start_time, existing.end_time)
         _note_pending_mutation(session, "cancel", existing)
         try:
-            await _calendar_call(
-                "cancel_booking",
-                session.call_sid,
-                routing.adapter.cancel_booking(external_booking_of(existing)),
-            )
+            if existing.external_booking_id:
+                await _calendar_call(
+                    "cancel_booking",
+                    session.call_sid,
+                    routing.adapter.cancel_booking(external_booking_of(existing)),
+                )
+            # An appointment that only exists in CARA (no external booking id)
+            # is cancelled here only; no provider is asked to cancel it.
         except BookingProviderError as exc:
             if exc.code in UNCERTAIN_OUTCOME_CODES:
                 await _observe_after_uncertain_write(session, routing, existing)

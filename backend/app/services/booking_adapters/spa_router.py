@@ -977,3 +977,6 @@ class SpaBookingAdapter(BookingAdapter):
                 self.delegate.provider,
                 self.spa.name,
             )
+            # Never swallowed: a cancellation the provider refused, or whose
+            # outcome is unknown, must not be recorded or reported as done.
+            raise

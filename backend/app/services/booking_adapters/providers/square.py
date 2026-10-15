@@ -2868,14 +2868,20 @@ class SquareAdapter(VerticalProviderAdapter):
             or {}
         )
 
-        if not cancelled.get("id"):
+        if str(cancelled.get("id") or "") != booking_id:
+            # No id, or another booking's id, proves nothing about THIS one.
             raise BookingProviderError(
-                "Square did not confirm the "
-                "booking cancellation"
-            )
-        status = str(cancelled.get("status") or "").upper()
-        if status and not status.startswith("CANCELLED") and status != "DECLINED":
-            raise BookingProviderError(
-                f"Square answered the cancellation with status {status}",
+                "Square's cancellation reply does not identify the booking that was cancelled",
                 code="BOOKING_OUTCOME_UNKNOWN",
+                retryable=False,
+            )
+        if not cancelled.get("status"):
+            # A thin reply: read the booking back before believing it.
+            cancelled = await self._retrieve_booking(booking_id)
+        status = str(cancelled.get("status") or "").upper()
+        if not (status.startswith("CANCELLED") or status == "DECLINED"):
+            raise BookingProviderError(
+                f"Square did not confirm the cancellation (status {status or 'missing'})",
+                code="BOOKING_OUTCOME_UNKNOWN",
+                retryable=False,
             )

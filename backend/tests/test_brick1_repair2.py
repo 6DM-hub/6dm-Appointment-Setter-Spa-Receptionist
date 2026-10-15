@@ -649,3 +649,81 @@ def test_policy_question_mentioning_book_does_not_arm_a_read_back(monkeypatch):
     text = "Would you like me to explain our cancellation policy before you book?"
     # The pattern alone would match; the read-back also has to name the time.
     assert not _CONFIRMATION_QUESTION_RE.search(text) or "PM" not in text
+
+
+# --------------------------------------------------------------------------- #
+# R2-F4 / R2-F5: a cancellation is done only when Square says so, exactly
+# --------------------------------------------------------------------------- #
+def cancel_reply(monkeypatch, world, *, raise_code=None, reply=None):
+    original = world.square.__call__
+
+    async def request(method, path, *, json=None):
+        if method == "POST" and path.endswith("/cancel"):
+            world.square.calls.append((method, path, json or {}))
+            if raise_code:
+                raise BookingProviderError("simulated Square answer", code=raise_code)
+            return {"booking": copy.deepcopy(reply)}
+        return await original(method, path, json=json)
+
+    monkeypatch.setattr(world.adapter.delegate, "_request", request)
+
+
+async def _confirmed_cancel(p):
+    await p.says("Please cancel my appointment.")
+    await p.tool("cancel_appointment")
+    return await p.says("Yes.")
+
+
+@pytest.mark.parametrize("code", ["FORBIDDEN", "CONFLICT", "BOOKING_OUTCOME_UNKNOWN"])
+async def test_voice_cancel_square_refusal_is_never_reported_as_done(monkeypatch, code):
+    w = make_world(monkeypatch)
+    p = await booked_call(w)
+    cancel_reply(monkeypatch, w, raise_code=code)
+    heard = await _confirmed_cancel(p)
+    assert cancels(w), "the confirmed cancellation was sent"
+    assert len(w.square.active()) == 1 and w.store.live, "Square and CARA both still hold it"
+    assert not any("has been cancelled" in line for line in heard), heard
+    if code == "BOOKING_OUTCOME_UNKNOWN":
+        assert p.session.entities["booking_reconciliation_required"]["operation"] == "cancel"
+
+
+@pytest.mark.parametrize("reply", [
+    {"id": "sq_1"},                                                   # thin: read back
+    {"id": "other", "status": "CANCELLED_BY_CUSTOMER"},              # someone else's booking
+    {"id": "sq_1", "status": "ACCEPTED"},                            # not cancelled
+])
+async def test_voice_cancel_reply_must_name_this_booking_cancelled(monkeypatch, reply):
+    w = make_world(monkeypatch)
+    p = await booked_call(w)
+    cancel_reply(monkeypatch, w, reply=reply)
+    heard = await _confirmed_cancel(p)
+    assert w.store.live, "CARA keeps the row while Square has not confirmed"
+    assert not any("has been cancelled" in line for line in heard), heard
+    assert p.session.entities.get("booking_reconciliation_required")
+
+
+async def test_voice_cancel_thin_reply_that_reads_back_cancelled_is_done(monkeypatch):
+    w = make_world(monkeypatch)
+    p = await booked_call(w)
+    original = w.square.__call__
+
+    async def thin(method, path, *, json=None):
+        result = await original(method, path, json=json)
+        if method == "POST" and path.endswith("/cancel"):
+            return {"booking": {"id": result["booking"]["id"]}}
+        return result
+
+    monkeypatch.setattr(w.adapter.delegate, "_request", thin)
+    heard = await _confirmed_cancel(p)
+    assert not w.square.active() and not w.store.live
+    assert any("cancelled" in line for line in heard), heard
+
+
+async def test_legacy_cancel_square_refusal_keeps_the_row_and_says_so(monkeypatch):
+    w = make_world(monkeypatch)
+    c = await _legacy_booked(w, monkeypatch)
+    cancel_reply(monkeypatch, w, raise_code="FORBIDDEN")
+    await c.says("Please cancel my appointment.", intent=_intent("cancel", T2, w.first))
+    said = await c.says("Yes.", intent=None, reply="Your appointment has been cancelled.")
+    assert "has been cancelled" not in said.lower() and "still booked" in said
+    assert len(w.square.active()) == 1 and w.store.live
