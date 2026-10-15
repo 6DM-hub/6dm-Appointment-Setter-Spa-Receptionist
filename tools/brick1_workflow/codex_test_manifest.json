@@ -1,0 +1,10 @@
+{
+  "description": "SHA-256 of Codex's independent test modules as Codex delivered them. Verification refuses a commit where any of these differ.",
+  "backend/tests": {
+    "test_codex_brick1_adversarial.py": "fbba02de925f1e93688e1fd809c849196a0de7ac845875858a6e4f6e48e8c137",
+    "test_codex_brick1_tenant_boundaries.py": "57138b13d2a8b47b55d29c8ebfc9aba0a851615c9a977f42661acd1429c9213c",
+    "test_codex_brick1_r2_independent.py": "cf7a7ed136740b6599a057ddc5ad612a14e3100295e2a1224fe0e798b67cd404",
+    "test_codex_r3_challenges.py": "c04bb2ee1f3061f08974984a2674f9fbd77a5ecfb925b1670ef16fece3d3749c",
+    "test_codex_r4_challenges.py": "6880f7be06b7c06e20bc1fc420155d9012c2bdb715d3ef120395e2f2d6499745"
+  }
+}
