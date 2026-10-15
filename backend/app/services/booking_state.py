@@ -342,7 +342,28 @@ def note_booking_question(session: Any, text: str | None = None) -> None:
         "history_len": len(getattr(session, "history", None) or []),
         "fingerprint": proposal_fingerprint(draft),
         "text": text,
+        # "...Would you like me to book that? Would you like our address?" is
+        # not a booking question: a yes to it may answer the other question.
+        "ambiguous": bool(text) and _asks_something_else(session, text),
     }
+
+
+_SENTENCE_RE = re.compile(r"[^.?!¿¡]+[.?!]?")
+
+
+def _asks_something_else(session: Any, text: str) -> bool:
+    """A model-worded line that asks the booking question AND another question.
+
+    Lines the backend itself authored (its read-back, possibly translated)
+    are its own wording and are not second-guessed here.
+    """
+    if any(same_question(text, record["text"])
+           for record in _prompt_records(session.entities.get(BACKEND_PROMPTS))):
+        return False
+    questions = [s.strip() for s in _SENTENCE_RE.findall(text) if _is_question_line(s.strip())]
+    if len(questions) < 2:
+        return False
+    return any(_OTHER_TOPIC_RE.search(q) or not _BOOKING_QUESTION_RE.search(q) for q in questions)
 
 
 def note_backend_prompt(session: Any, text: str | None) -> None:
@@ -458,6 +479,8 @@ def booking_consent_context(session: Any) -> bool:
     if isinstance(question, dict):
         if question.get("fingerprint") != proposal_fingerprint(get_draft(session)):
             return False  # the question was about a different proposal
+        if question.get("ambiguous"):
+            return False  # it also asked something else: the yes may answer that
         bound = answers_backend_question(
             session,
             history_len=int(question.get("history_len", 0)),

@@ -613,3 +613,25 @@ async def test_an_adapter_without_write_back_refuses_external_bookings(action):
         assert await CaraNativeAdapter().move_booking(native, now, now) is native
     else:
         assert await CaraNativeAdapter().cancel_booking(native) is None
+
+
+# --- Review fix: a read-back that also asks something else is not consent ---
+@pytest.mark.parametrize("line,ambiguous", [
+    ("Thursday at 2 PM is available. Would you like me to book that?", False),
+    ("Thursday at 2 PM is available. Would you like me to book that? Would you like our address?", True),
+    ("Shall I book Thursday at 2 PM? Also, do you need directions?", True),
+    ("Shall I book Thursday at 2 PM? Would you like a coffee when you arrive?", True),
+    ("Does Thursday at 2 PM work for you? Shall I book it?", False),
+])
+def test_compound_read_back_is_ambiguous(line, ambiguous):
+    from app.services.booking_state import _asks_something_else
+    assert _asks_something_else(_session(), line) is ambiguous
+
+
+def test_a_backend_authored_read_back_is_not_second_guessed():
+    from app.services.booking_state import _asks_something_else, note_backend_prompt
+    line = "¿Le parece bien el jueves a las 2 PM? ¿Quiere que lo reserve?"
+    s = _session()
+    assert _asks_something_else(s, line) is True     # model wording: fail closed
+    note_backend_prompt(s, line)
+    assert _asks_something_else(s, line) is False    # the backend's own read-back
