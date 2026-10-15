@@ -939,9 +939,15 @@ async def voice_respond(
     reply = _authoritative_reply(session, reply)
     reply = _authoritative_availability_reply(session, reply)
     reply = _with_gratuity_reminder(session, reply, result)
+    from app.services.booking_state import caller_name_required_for, supplied_caller_name
+
+    draft_now = get_draft(session)
     read_back = (
         _asks_for_confirmation(reply) and not guard_statement
         and _reads_back_current_proposal(session, reply, tz)
+        # While a required caller name is missing, the model's line (asking
+        # for it) is what the caller must hear; nothing is armed until then.
+        and not (caller_name_required_for(draft_now) and not supplied_caller_name(draft_now))
     )
     if read_back:
         # The caller hears the BACKEND's own single-question read-back, not the

@@ -404,8 +404,13 @@ def _prompt_records(trusted: list | None) -> list[dict]:
     return records
 
 
+_MERIDIEM_RE = re.compile(r"\b([ap])\s*\.?\s*m\b\.?", re.IGNORECASE)
+
+
 def _plain_words(text: str | None) -> str:
-    return " ".join(re.sub(r"[^a-z0-9 ]+", " ", (text or "").casefold()).split())
+    # "2 p.m." / "2 P. M." / "2 PM" are the same spoken time in a transcript.
+    text = _MERIDIEM_RE.sub(lambda m: f"{m.group(1)}m", text or "")
+    return " ".join(re.sub(r"[^a-z0-9 ]+", " ", text.casefold()).split())
 
 
 def same_question(said: str | None, asked: str | None) -> bool:
@@ -1633,14 +1638,15 @@ def canonical_read_back(session: Any, tz: Any) -> str | None:
     draft = get_draft(session)
     if not (draft.selected_slot and draft.provider_verified):
         return None
-    label = spoken_slot_time(draft.selected_slot.get("start"), tz)
-    if not label:
+    start = draft.selected_slot.get("start")
+    if not spoken_slot_time(start, tz):
         return None
-    service = (draft.service_description or "your appointment").strip()
+    when = _booked_when(start, tz).strip()   # "on Thursday at 2 PM": the day is always heard
+    service = _booked_service(draft.service_description)
     if getattr(draft, "operation_mode", None) == "reschedule":
-        return (f"{label} is available for {service}. Nothing has been changed yet. "
+        return (f"{service} {when} is available. Nothing has been changed yet. "
                 "Would you like me to move your appointment to that time?")
-    return f"{label} is available for {service}. Nothing is booked yet. Would you like me to book that?"
+    return f"{service} {when} is available. Nothing is booked yet. Would you like me to book that?"
 
 
 def authoritative_availability_speech(session: Any, tz: Any) -> str | None:

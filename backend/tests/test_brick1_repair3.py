@@ -699,3 +699,21 @@ async def test_realtime_model_read_back_never_binds_but_the_re_ask_does(monkeypa
     p.session.add_turn("assistant", reasked[-1])   # the transcript of what was spoken
     await p.says("Yes.")                           # answers the backend's own read-back
     assert len(w.square.creates) == 1
+
+
+def test_transcript_meridiem_variants_are_the_same_line():
+    from app.services.booking_state import same_question
+    assert same_question("Thursday at 2 p.m. is available.", "Thursday at 2 PM is available.")
+    assert same_question("thursday at 2 P. M. is available", "Thursday at 2 PM is available.")
+    assert not same_question("Thursday at 2 PM is available. Would you like our address?",
+                             "Thursday at 2 PM is available.")
+
+
+async def test_legacy_read_back_names_the_day_and_waits_for_a_required_name(monkeypatch):
+    from tests.test_brick1_booking_change_guard import LegacyCall, _intent, T2 as _T2
+    w = make_world(monkeypatch)
+    c = LegacyCall(w, monkeypatch)
+    heard = await c.says(f"I'd like a {w.first} Thursday at 2 PM, I'm Ada Lovelace.",
+                         intent=_intent("schedule", _T2, w.first),
+                         reply="Thursday at 2 PM is available. Would you like me to book that?")
+    assert " on Thursday at 2 PM " in f" {heard} ", heard
