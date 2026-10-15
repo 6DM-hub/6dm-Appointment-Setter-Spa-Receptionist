@@ -414,3 +414,41 @@ async def test_promotion_never_overwrites_an_unknown_outcome(rubyz_db):
     [row] = await _escalations(db)
     await db.refresh(row)
     assert row.details["stage"] == "unknown_outcome" and row.details["code"] == "BOOKING_OUTCOME_UNKNOWN"
+
+
+# --- Review fix: backend lines and the unbound fallback ---------------------
+def test_a_backend_statement_between_question_and_yes_keeps_the_binding():
+    hold = "One moment, I'm still checking that."
+    s = _session(("assistant", Q), ("assistant", hold), ("user", "Yes."))
+    assert answers_backend_question(s, history_len=0, question=Q, trusted=[hold]) is True
+
+
+def test_a_backend_question_between_question_and_yes_unbinds():
+    other = "Would you like me to text you our address?"
+    s = _session(("assistant", Q), ("assistant", other), ("user", "Yes."))
+    assert answers_backend_question(s, history_len=0, question=Q, trusted=[other]) is False
+    s = _session(("assistant", Q), ("assistant", "Would you like me to text you our address"), ("user", "Yes."))
+    assert answers_backend_question(s, history_len=0, question=Q,
+                                    trusted=["Would you like me to text you our address"]) is False
+
+
+def test_cancellation_yes_survives_a_backend_hold_line_but_not_a_backend_question():
+    from app.services import booking_change_guard as guard
+    question = "Just to confirm, would you like me to cancel your House Cleaning on Thursday at 2 PM?"
+    for between, expected in (("One moment, please.", "confirmed"),
+                              ("Would you like our address", "none")):
+        s = _session(("user", "Please cancel my appointment."))
+        s.entities[guard.PENDING_CANCELLATION] = {"appointment_id": "a-1", "question": question,
+                                                  "history_len": 1, "turn": 1}
+        s.entities["backend_prompts"] = [between]
+        s.history += [{"role": "assistant", "content": question},
+                      {"role": "assistant", "content": between},
+                      {"role": "user", "content": "Yes."}]
+        assert guard.cancellation_decision(s) == expected, between
+
+
+def test_unbound_fallback_mid_sentence_and_other_topic_questions_are_unrelated():
+    assert answering_unrelated_question(_session(("assistant", "Sure, would you like our address"),
+                                                 ("user", "Yes."))) is True
+    assert answering_unrelated_question(_session(("assistant", "Want me to text you our address?"),
+                                                 ("user", "Yes."))) is True

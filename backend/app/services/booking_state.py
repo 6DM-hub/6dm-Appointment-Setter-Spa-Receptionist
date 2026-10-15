@@ -284,8 +284,15 @@ _BOOKING_QUESTION_RE = re.compile(
     re.IGNORECASE,
 )
 _LOOKS_LIKE_QUESTION_RE = re.compile(
-    r"(?:^|[.!]\s+)(?:would|should|shall|do|does|did|can|could|will|is|are|"
+    r"(?:^|[.!,;:]\s+)(?:would|should|shall|do|does|did|can|could|will|is|are|"
     r"may|have|has|what|where|when|which|who|how|want)\b",
+    re.IGNORECASE,
+)
+# Topics that make a question about something OTHER than the booking, even
+# when it also uses booking words ("want me to text you our address").
+_OTHER_TOPIC_RE = re.compile(
+    r"\b(?:address|directions|parking|located|location|text you|email you|send you|"
+    r"link|website|policy|policies|price|prices|cost|fee|fees|hours|menu|gift)\b",
     re.IGNORECASE,
 )
 _REFUSAL_START_RE = re.compile(r"^(?:no|nope|nah|not|don'?t|do not|never)\b")
@@ -312,7 +319,7 @@ def answering_unrelated_question(session: Any) -> bool:
             # is treated as one (fail closed).
             if not text.endswith("?") and not _LOOKS_LIKE_QUESTION_RE.search(text):
                 return False
-            return not _BOOKING_QUESTION_RE.search(text)
+            return bool(_OTHER_TOPIC_RE.search(text)) or not _BOOKING_QUESTION_RE.search(text)
     return False
 
 
@@ -400,10 +407,15 @@ def answers_backend_question(
         # itself or another line the backend spoke unbinds the yes.
         if question and same_question(said, question):
             continue
-        if any(same_question(said, prompt) for prompt in (trusted or [])):
-            continue
+        if not _is_question_line(said) and any(same_question(said, p) for p in (trusted or [])):
+            continue   # a backend statement ("one moment..."), not another question
         return False
     return True
+
+
+def _is_question_line(text: str) -> bool:
+    text = (text or "").strip()
+    return "?" in text or bool(_LOOKS_LIKE_QUESTION_RE.search(text))
 
 
 def booking_consent_context(session: Any) -> bool:

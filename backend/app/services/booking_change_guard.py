@@ -579,6 +579,9 @@ def cancellation_decision(session: Any) -> str:
         and answers_backend_question(
             session, history_len=int(pending.get("history_len", 0)),
             question=pending.get("question"),
+            # Backend STATEMENTS in between ("one moment...") keep the binding;
+            # any question, even one the backend asked, unbinds it.
+            trusted=list(session.entities.get("backend_prompts") or []),
         )
     ):
         return "confirmed"
