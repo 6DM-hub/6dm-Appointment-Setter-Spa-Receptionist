@@ -2901,7 +2901,21 @@ class SquareAdapter(VerticalProviderAdapter):
             )
         if not cancelled.get("status"):
             # A thin reply: read the booking back before believing it.
-            cancelled = await self._retrieve_booking(booking_id)
+            try:
+                cancelled = await self._retrieve_booking(booking_id) or {}
+            except BookingProviderError as exc:
+                raise BookingProviderError(
+                    "Square's cancellation could not be read back",
+                    code="BOOKING_OUTCOME_UNKNOWN",
+                    retryable=False,
+                ) from exc
+            # The read-back is now the proof, so it must be THIS booking too.
+            if str(cancelled.get("id") or "") != booking_id:
+                raise BookingProviderError(
+                    "Square's cancellation read-back is for a different booking",
+                    code="BOOKING_OUTCOME_UNKNOWN",
+                    retryable=False,
+                )
         status = str(cancelled.get("status") or "").upper()
         if not (status.startswith("CANCELLED") or status == "DECLINED"):
             raise BookingProviderError(
