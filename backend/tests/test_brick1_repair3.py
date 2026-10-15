@@ -455,3 +455,62 @@ def test_unbound_fallback_mid_sentence_and_other_topic_questions_are_unrelated()
                                                  ("user", "Yes."))) is True
     assert answering_unrelated_question(_session(("assistant", "Want me to text you our address?"),
                                                  ("user", "Yes."))) is True
+
+
+# --- R4-F2: Google Calendar never reports a failed change as done ----------
+async def _google_world(rubyz_db, monkeypatch, *, configured=True, external_id="google-event-1"):
+    from types import SimpleNamespace as NS
+    from app.models import BookingProvider
+    from app.services import appointment_booking_service as booking
+    from app.services.booking_adapters.google_calendar import GoogleCalendarAdapter
+    db, a, b, squares = await setup_tenants(rubyz_db, monkeypatch)
+    call = session_for(a, "r4-own-google")
+    row = await book(db, a, call)
+    row.booking_provider = BookingProvider.GOOGLE_CALENDAR.value
+    row.external_booking_id = external_id
+    await db.commit()
+    adapter = GoogleCalendarAdapter(calendar_id="cal", connection=NS() if configured else None)
+    monkeypatch.setattr(booking, "get_booking_adapter", lambda **kw: adapter)
+    return db, row.id, call.scope, row
+
+
+@pytest.mark.parametrize("operation", ["move", "cancel"])
+async def test_google_server_error_is_unknown_and_keeps_the_block(rubyz_db, monkeypatch, operation):
+    from app.api.v1.appointments import cancel_appointment, update_appointment
+    from app.schemas import AppointmentUpdate
+    from app.services.booking_adapters import google_calendar as gcal
+    from app.services.google_calendar import GoogleCalendarError
+    db, row_id, scope, row = await _google_world(rubyz_db, monkeypatch)
+
+    async def lost(*args, **kwargs):
+        raise GoogleCalendarError("google_api_error")
+
+    monkeypatch.setattr(gcal, "update_event", lost)
+    monkeypatch.setattr(gcal, "delete_event", lost)
+    with pytest.raises(HTTPException) as err:
+        if operation == "cancel":
+            await cancel_appointment(row_id, scope=scope, db=db)
+        else:
+            await update_appointment(row_id, AppointmentUpdate(start_time=T3, end_time=T3 + timedelta(hours=1)),
+                                     scope=scope, db=db)
+    assert err.value.status_code == 502
+    await db.rollback()
+    [fence] = [r for r in await _escalations(db) if r.details.get("appointment_id") == str(row_id)]
+    assert fence.details["stage"] == "unknown_outcome"
+
+
+async def test_google_success_still_changes_the_local_row(rubyz_db, monkeypatch):
+    from app.api.v1.appointments import cancel_appointment
+    from app.models import AppointmentStatus
+    from app.services.booking_adapters import google_calendar as gcal
+    db, row_id, scope, row = await _google_world(rubyz_db, monkeypatch)
+    deleted = []
+
+    async def ok(connection, event_id):
+        deleted.append(event_id)
+
+    monkeypatch.setattr(gcal, "delete_event", ok)
+    await cancel_appointment(row_id, scope=scope, db=db)
+    await db.refresh(row)
+    assert deleted == ["google-event-1"] and row.status == AppointmentStatus.CANCELLED
+    assert not [r for r in await _escalations(db) if r.details.get("appointment_id") == str(row_id)]

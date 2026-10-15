@@ -18,6 +18,34 @@ from app.services.google_calendar import (
 
 logger = logging.getLogger(__name__)
 
+# Google failures that happen before, or instead of, the change being applied.
+# Anything else (a generic API/server error) may have been applied: unknown.
+_DEFINITE_GOOGLE_REFUSALS = {
+    "authorization_required", "token_expired_or_revoked", "insufficient_permissions",
+    "calendar_not_found", "calendar_not_selected",
+}
+
+
+def _change_error(exc: GoogleCalendarError, action: str) -> BookingProviderError:
+    status = str(getattr(exc, "status", "") or "google_api_error")
+    if status == "google_api_error":
+        return BookingProviderError(
+            f"Google Calendar did not confirm the {action}; its outcome is unknown",
+            code="BOOKING_OUTCOME_UNKNOWN", retryable=False,
+        )
+    code = status.upper() if status in _DEFINITE_GOOGLE_REFUSALS else "GOOGLE_REFUSED"
+    return BookingProviderError(f"Google Calendar refused the {action}: {exc}", code=code)
+
+
+def _disconnected(action: str) -> BookingProviderError:
+    # The event lives in a Google calendar CARA can no longer reach: nothing
+    # was sent, and the local mirror must not pretend it changed.
+    return BookingProviderError(
+        f"The Google Calendar holding this appointment is not connected, so the {action} "
+        "was not made. Reconnect the calendar or change it there.",
+        code="CALENDAR_DISCONNECTED",
+    )
+
 
 class GoogleCalendarAdapter(LocalCalendarAdapter):
     provider = "google_calendar"
@@ -112,8 +140,10 @@ class GoogleCalendarAdapter(LocalCalendarAdapter):
         )
 
     async def move_booking(self, booking, start, end):
-        if not self.is_configured or not booking.external_id:
-            return booking
+        if not booking.external_id:
+            return booking   # exists only in CARA: nothing to change in Google
+        if not self.is_configured:
+            raise _disconnected("move")
         try:
             await update_event(
                 self.connection,
@@ -122,14 +152,18 @@ class GoogleCalendarAdapter(LocalCalendarAdapter):
                 end=end,
                 timezone_name=self.timezone_name,
             )
-        except GoogleCalendarError:
+        except GoogleCalendarError as exc:
             logger.exception("Google Calendar update failed for %s", booking.external_id)
+            raise _change_error(exc, "move") from exc
         return booking
 
     async def cancel_booking(self, booking) -> None:
-        if not self.is_configured or not booking.external_id:
-            return
+        if not booking.external_id:
+            return   # exists only in CARA: nothing to cancel in Google
+        if not self.is_configured:
+            raise _disconnected("cancellation")
         try:
             await delete_event(self.connection, booking.external_id)
-        except GoogleCalendarError:
+        except GoogleCalendarError as exc:
             logger.exception("Google Calendar delete failed for %s", booking.external_id)
+            raise _change_error(exc, "cancellation") from exc
