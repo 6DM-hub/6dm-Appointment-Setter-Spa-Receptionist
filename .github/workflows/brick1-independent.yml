@@ -26,7 +26,25 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  ci-contracts:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Check proposed CI runner contracts
+        run: |
+          python ci/brick1/test_runner.py -v
+          python -c 'import sys; sys.path.insert(0,"ci/brick1"); import run; run.check_integrity(run.HERE)'
   verify:
+    # The bootstrap PR adds the referee to main; main cannot supply it yet.
+    # Its push run proves environment setup; its PR job checks the proposed runner.
+    if: github.event_name != 'pull_request' || github.head_ref != 'codex/brick1-ci-setup'
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     env:
@@ -99,7 +117,7 @@ jobs:
         if: always() && env.PG_ROOT != ''
         run: |
           /usr/lib/postgresql/16/bin/pg_ctl -D "$PG_ROOT/data" -m immediate -w stop || true
-          sudo cp "$PG_ROOT/server.log" evidence/postgres-server.log || true
+          cat "$PG_ROOT/server.log" > evidence/postgres-server.log || true
       - name: Publish readable status
         if: always()
         run: |
