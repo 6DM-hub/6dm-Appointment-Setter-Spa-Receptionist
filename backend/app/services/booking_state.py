@@ -283,6 +283,11 @@ _BOOKING_QUESTION_RE = re.compile(
     r"is that (?:right|correct))\b",
     re.IGNORECASE,
 )
+_LOOKS_LIKE_QUESTION_RE = re.compile(
+    r"(?:^|[.!]\s+)(?:would|should|shall|do|does|did|can|could|will|is|are|"
+    r"may|have|has|what|where|when|which|who|how|want)\b",
+    re.IGNORECASE,
+)
 _REFUSAL_START_RE = re.compile(r"^(?:no|nope|nah|not|don'?t|do not|never)\b")
 
 
@@ -303,7 +308,9 @@ def answering_unrelated_question(session: Any) -> bool:
             continue
         if role == "assistant" and seen_caller:
             text = str(turn.get("content") or "").strip()
-            if not text.endswith("?"):
+            # A transcript may drop the "?": a line that opens like a question
+            # is treated as one (fail closed).
+            if not text.endswith("?") and not _LOOKS_LIKE_QUESTION_RE.search(text):
                 return False
             return not _BOOKING_QUESTION_RE.search(text)
     return False
@@ -381,8 +388,11 @@ def answers_backend_question(
         if item.get("role") != "assistant":
             continue
         said = str(item.get("content") or "")
-        if "?" not in said:
+        if not _plain_words(said):
             continue
+        # Fail closed: punctuation in a voice transcript is not a consent
+        # boundary, so ANY assistant line that is not exactly the question
+        # itself or another line the backend spoke unbinds the yes.
         if question and same_question(said, question):
             continue
         if any(same_question(said, prompt) for prompt in (trusted or [])):
