@@ -208,12 +208,21 @@ class BookingAdapter(ABC):
     async def move_booking(
         self, booking: ExternalBooking, start: datetime, end: datetime
     ) -> ExternalBooking:
-        """Reschedule a mirrored booking. Defaults to a no-op for providers
-        with no write-back."""
+        """Reschedule a mirrored booking.
+
+        Without write-back there is nothing to change for a booking that only
+        exists in CARA. A booking that lives in an EXTERNAL calendar (it has an
+        external id) cannot be changed by this adapter: refuse, never report
+        the local mirror's change as the calendar's.
+        """
+        if getattr(booking, "external_id", None):
+            raise _no_write_back(self, "move")
         return booking
 
     async def cancel_booking(self, booking: ExternalBooking) -> None:
-        """Cancel a mirrored booking. Defaults to a no-op."""
+        """Cancel a mirrored booking (see `move_booking`)."""
+        if getattr(booking, "external_id", None):
+            raise _no_write_back(self, "cancellation")
         return None
 
     async def retrieve_booking(self, booking: ExternalBooking) -> dict[str, Any] | None:
@@ -247,6 +256,14 @@ class BookingAdapter(ABC):
         self, external_customer_id: str
     ) -> SavedPaymentLookup:
         return SavedPaymentLookup(outcome=SavedPaymentLookupOutcome.UNSUPPORTED)
+
+
+def _no_write_back(adapter: "BookingAdapter", action: str) -> "BookingProviderError":
+    return BookingProviderError(
+        f"{getattr(adapter, 'calendar_label', 'This calendar')} cannot make this {action}: the "
+        "appointment is held in another calendar. Nothing was changed; change it there.",
+        code="WRITE_BACK_UNSUPPORTED",
+    )
 
 
 class LocalCalendarAdapter(BookingAdapter):
@@ -296,6 +313,18 @@ class CaraNativeAdapter(LocalCalendarAdapter):
         # stays strict for every real provider.
         reference = ctx.booking_reference or uuid.uuid4().hex
         return ExternalBooking(provider=self.provider, external_id=f"cara:{reference}")
+
+    async def move_booking(self, booking, start, end):
+        # A CARA reference: the appointments row IS the booking, and the
+        # booking service updates it. Any other external id lives elsewhere.
+        if str(getattr(booking, "external_id", "") or "").startswith("cara:"):
+            return booking
+        return await super().move_booking(booking, start, end)
+
+    async def cancel_booking(self, booking) -> None:
+        if str(getattr(booking, "external_id", "") or "").startswith("cara:"):
+            return None
+        return await super().cancel_booking(booking)
 
     async def check_availability(self, ctx: BookingContext) -> AvailabilityVerdict:
         minutes = max(int((ctx.end - ctx.start).total_seconds() // 60), 1)

@@ -585,3 +585,31 @@ async def test_a_backend_question_about_something_else_withdraws_a_pending_cance
     assert guard.PENDING_CANCELLATION in session.entities
     await voice._send_force_message("May I ask a service provider to call you back?")
     assert guard.PENDING_CANCELLATION not in session.entities       # superseded
+
+
+# --- R4-F2 (all adapters): no write-back means no silent success ------------
+@pytest.mark.parametrize("action", ["move", "cancel"])
+async def test_an_adapter_without_write_back_refuses_external_bookings(action):
+    from datetime import datetime, timezone
+    from app.services.booking_adapters.base import (
+        BookingProviderError as Err, CaraNativeAdapter, ExternalBooking, LocalCalendarAdapter,
+    )
+    now = datetime.now(timezone.utc)
+    for adapter in (LocalCalendarAdapter(), CaraNativeAdapter()):
+        held_elsewhere = ExternalBooking(provider="square", external_id="sq_123")
+        with pytest.raises(Err) as err:
+            if action == "move":
+                await adapter.move_booking(held_elsewhere, now, now)
+            else:
+                await adapter.cancel_booking(held_elsewhere)
+        assert err.value.code == "WRITE_BACK_UNSUPPORTED"
+        cara_only = ExternalBooking(provider="internal", external_id=None)
+        if action == "move":
+            assert await adapter.move_booking(cara_only, now, now) is cara_only
+        else:
+            assert await adapter.cancel_booking(cara_only) is None
+    native = ExternalBooking(provider="cara_native", external_id="cara:abc")
+    if action == "move":
+        assert await CaraNativeAdapter().move_booking(native, now, now) is native
+    else:
+        assert await CaraNativeAdapter().cancel_booking(native) is None
