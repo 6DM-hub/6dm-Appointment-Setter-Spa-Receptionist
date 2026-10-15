@@ -580,10 +580,12 @@ def cancellation_decision(session: Any) -> str:
         and answers_backend_question(
             session, history_len=int(pending.get("history_len", 0)),
             question=pending.get("question"),
-            # Backend STATEMENTS in between ("one moment...") keep the binding;
-            # any question, even one the backend asked, unbinds it.
+            # Lines the backend itself spoke INSIDE this question's window keep
+            # the binding (a hold line, the question re-spoken in the caller's
+            # language). An unrelated backend question withdraws the pending
+            # cancellation when it is spoken (xai_realtime._send_force_message),
+            # and an old backend line repeated by the model vouches for nothing.
             trusted=list(session.entities.get("backend_prompts") or []),
-            trust_backend_questions=False,
         )
     ):
         return "confirmed"

@@ -103,6 +103,8 @@ from app.services.booking_state import (
     refuses_offer,
     booking_consent_context,
     note_backend_prompt,
+    same_question as booking_state_same_question,
+    _is_question_line as booking_state_is_question_line,
     save_draft,
     start_new_intent,
     supplied_caller_name,
@@ -5947,8 +5949,18 @@ class XAIVoiceSession:
             message = message.replace(CARD_LINK_PERMISSION_QUESTION,
                 "Are you okay with me emailing the secure card link to the address you just confirmed?")
         spoken_message = await self._localized_force_message(message)
-        # CARA's own backend lines are not "another question" a later yes
-        # could be answering instead of the booking question.
+        pending_cancel = self.session.entities.get(booking_guard.PENDING_CANCELLATION)
+        if (
+            isinstance(pending_cancel, dict)
+            and not booking_state_same_question(message, pending_cancel.get("question"))
+            and booking_state_is_question_line(message)
+        ):
+            # The backend is asking something else: a later yes would answer
+            # THAT, so the cancellation question is no longer pending.
+            self.session.entities.pop(booking_guard.PENDING_CANCELLATION, None)
+            truth("CANCELLATION_QUESTION_SUPERSEDED", call_sid=self.call_id)
+        # CARA's own backend lines (this occurrence only) are not "another
+        # question" a later yes could be answering instead.
         note_backend_prompt(self.session, spoken_message)
         await self._send(
             {

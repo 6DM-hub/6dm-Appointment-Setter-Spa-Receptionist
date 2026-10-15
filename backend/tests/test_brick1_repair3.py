@@ -435,19 +435,40 @@ def test_a_backend_question_unbinds_a_cancellation_yes_but_not_a_booking_follow_
     assert answers_backend_question(s, history_len=0, question=Q, trusted=[{"text": follow_up, "at": 1}]) is True
 
 
-def test_cancellation_yes_survives_a_backend_hold_line_but_not_a_backend_question():
+def test_cancellation_yes_survives_a_backend_line_spoken_in_its_window_only():
     from app.services import booking_change_guard as guard
+    from app.services.booking_state import note_backend_prompt
     question = "Just to confirm, would you like me to cancel your House Cleaning on Thursday at 2 PM?"
-    for between, expected in (("One moment, please.", "confirmed"),
-                              ("Would you like our address", "none")):
+
+    def pending(*between, noted_in_window=True, noted_before=False):
         s = _session(("user", "Please cancel my appointment."))
+        if noted_before:
+            for line in between:
+                note_backend_prompt(s, line)      # an EARLIER phase of the call
+                s.history += [{"role": "assistant", "content": line},
+                              {"role": "user", "content": "No, thank you."},
+                              {"role": "user", "content": "Please cancel my appointment."}]
         s.entities[guard.PENDING_CANCELLATION] = {"appointment_id": "a-1", "question": question,
-                                                  "history_len": 1, "turn": 1}
-        s.entities["backend_prompts"] = [{"text": between, "at": 2}]
-        s.history += [{"role": "assistant", "content": question},
-                      {"role": "assistant", "content": between},
-                      {"role": "user", "content": "Yes."}]
-        assert guard.cancellation_decision(s) == expected, between
+                                                  "history_len": len(s.history), "turn": 1}
+        s.history.append({"role": "assistant", "content": question})
+        for line in between:
+            if noted_in_window:
+                note_backend_prompt(s, line)
+            s.history.append({"role": "assistant", "content": line})
+        s.history.append({"role": "user", "content": "Yes."})
+        return s
+
+    assert guard.cancellation_decision(pending("One moment, please.")) == "confirmed"
+    assert guard.cancellation_decision(pending("¿Quiere que cancele su cita del jueves?")) == "confirmed"
+    # Not spoken by the backend in this window: the yes may answer it instead.
+    assert guard.cancellation_decision(pending("Would you like our address", noted_in_window=False)) == "none"
+    # Spoken by the backend EARLIER and repeated by the model now: no authority.
+    assert guard.cancellation_decision(pending("May I ask a service provider to call you back?",
+                                               noted_in_window=False, noted_before=True)) == "none"
+    # One record vouches for one occurrence only.
+    s = pending("One moment, please.")
+    s.history.insert(-1, {"role": "assistant", "content": "One moment, please."})
+    assert guard.cancellation_decision(s) == "none"
 
 
 def test_unbound_fallback_mid_sentence_and_other_topic_questions_are_unrelated():
@@ -542,3 +563,25 @@ async def test_owner_scoped_dashboard_change_of_an_external_booking_is_refused(m
 async def _async(value):
     return value
 
+
+async def test_a_backend_question_about_something_else_withdraws_a_pending_cancellation():
+    from app.services import booking_change_guard as guard
+    from app.services.call_state import CallSession
+    from app.services.xai_realtime import XAIVoiceSession
+    session = CallSession("CA-r4-supersede", "inbound", "+15550000002", "+15550001000")
+    question = "Just to confirm, would you like me to cancel your House Cleaning on Thursday at 2 PM?"
+    session.entities[guard.PENDING_CANCELLATION] = {"appointment_id": "a-1", "question": question,
+                                                    "history_len": 0, "turn": 1}
+    voice = XAIVoiceSession("CA-r4-supersede", session)
+    sent = []
+
+    async def _send(payload):
+        sent.append(payload)
+
+    voice._send = _send
+    await voice._send_force_message(question)                        # the question itself
+    assert guard.PENDING_CANCELLATION in session.entities
+    await voice._send_force_message("One moment, please.")           # a statement
+    assert guard.PENDING_CANCELLATION in session.entities
+    await voice._send_force_message("May I ask a service provider to call you back?")
+    assert guard.PENDING_CANCELLATION not in session.entities       # superseded
