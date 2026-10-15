@@ -957,6 +957,10 @@ class SpaBookingAdapter(BookingAdapter):
             )
             raise
 
+    async def retrieve_booking(self, booking: ExternalBooking):
+        reader = getattr(self.delegate, "retrieve_booking", None)
+        return await reader(booking) if reader is not None else None
+
     async def cancel_booking(self, booking: ExternalBooking) -> None:
         try:
             await self.delegate.cancel_booking(booking)

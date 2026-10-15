@@ -402,6 +402,14 @@ async def _lock_call(db: AsyncSession, call_sid: str) -> None:
         )
 
 
+# Calls that change a booking. If one of these times out or breaks after it
+# was sent, the calendar may already hold the change: its outcome is unknown.
+_WRITE_OPERATIONS = {"create_booking", "move_booking", "cancel_booking"}
+_CHANGE_OPERATIONS = {"move_booking", "cancel_booking"}
+UNCERTAIN_OUTCOME_CODES = {"BOOKING_OUTCOME_UNKNOWN", "PARTIAL_BOOKING_UNRESOLVED"}
+PENDING_PROVIDER_MUTATION = "pending_provider_mutation"
+
+
 async def _calendar_call(operation: str, call_sid: str, awaitable):
     logger.info("Calendar request: call_sid=%s operation=%s", call_sid, operation)
     truth("BOOKING_PROVIDER", operation=operation, call_sid=call_sid)
@@ -414,11 +422,17 @@ async def _calendar_call(operation: str, call_sid: str, awaitable):
     except asyncio.TimeoutError as exc:
         raise BookingProviderError(
             f"{operation} timed out",
-            code="BOOKING_OUTCOME_UNKNOWN" if operation == "create_booking" else "PROVIDER_TIMEOUT",
-            retryable=operation != "create_booking",
+            code="BOOKING_OUTCOME_UNKNOWN" if operation in _WRITE_OPERATIONS else "PROVIDER_TIMEOUT",
+            retryable=operation not in _WRITE_OPERATIONS,
         ) from exc
     except Exception as exc:
         logger.exception("Calendar error: call_sid=%s operation=%s error=%s", call_sid, operation, exc)
+        if operation in _CHANGE_OPERATIONS:
+            raise BookingProviderError(
+                f"{operation} outcome unknown: {exc}",
+                code="BOOKING_OUTCOME_UNKNOWN",
+                retryable=False,
+            ) from exc
         raise BookingProviderError(f"{operation} failed: {exc}") from exc
     logger.info("Calendar response: call_sid=%s operation=%s response=%s", call_sid, operation, result)
     return result
@@ -1000,9 +1014,20 @@ async def _failure(db: AsyncSession, session: CallSession, exc: Exception) -> Bo
         await _safe_rollback(db)
         session.booking_status = "collecting_details"
         return BookingResult(BookingOutcome.MISSING_INFO, message=str(exc))
-    if isinstance(exc, BookingProviderError) and exc.code in {"BOOKING_OUTCOME_UNKNOWN", "PARTIAL_BOOKING_UNRESOLVED"}:
+    if isinstance(exc, BookingProviderError) and exc.code in UNCERTAIN_OUTCOME_CODES:
         await _safe_rollback(db)
-        session.entities["booking_reconciliation_required"] = {"code": exc.code, "details": str(exc)}
+        # Keep exactly which change was in flight (and what the provider showed
+        # afterwards, if it could be read) so nothing later asserts the old
+        # state, and staff can reconcile it.
+        pending = session.entities.pop(PENDING_PROVIDER_MUTATION, None) or {}
+        session.entities["booking_reconciliation_required"] = {
+            "code": exc.code, "details": str(exc), **pending,
+        }
+        truth("BOOKING_RECONCILIATION_REQUIRED", call_sid=session.call_sid,
+              code=exc.code, operation=pending.get("operation"))
+        await _notify_provider_error(
+            session, "A booking change has an unknown outcome and needs staff verification.",
+        )
         session.booking_status = "follow_up_required"
         return BookingResult(BookingOutcome.ERROR, message="I cannot verify the complete visit yet. May a staff member call you to help with it?")
     if isinstance(exc, (BookingProviderError, asyncio.TimeoutError)):
@@ -1730,6 +1755,38 @@ def _service_change_refused(existing: Appointment, reason: str) -> BookingResult
     )
 
 
+def _note_pending_mutation(
+    session: CallSession, operation: str, existing: Appointment, *,
+    to_start: datetime | None = None, service: str | None = None,
+) -> None:
+    """Record a change before it is sent, so an unknown outcome is never lost."""
+    session.entities[PENDING_PROVIDER_MUTATION] = {
+        "operation": operation,
+        "appointment_id": str(existing.id),
+        "external_booking_id": existing.external_booking_id,
+        "service": service or existing.title,
+        "from_start": existing.start_time.isoformat() if existing.start_time else None,
+        "to_start": to_start.isoformat() if to_start else None,
+    }
+
+
+async def _observe_after_uncertain_write(session: CallSession, routing: _Routing, existing: Appointment) -> None:
+    """Read (never write) what the calendar holds after an unanswered change."""
+    pending = session.entities.get(PENDING_PROVIDER_MUTATION)
+    reader = getattr(routing.adapter, "retrieve_booking", None)
+    if not isinstance(pending, dict) or reader is None:
+        return
+    try:
+        observed = await asyncio.wait_for(
+            reader(external_booking_of(existing)), timeout=CALENDAR_TIMEOUT_SECONDS
+        )
+    except Exception:
+        logger.exception("Read-back after an uncertain change failed: call_sid=%s", session.call_sid)
+        return
+    if observed:
+        pending["provider_observed"] = observed
+
+
 async def _move_existing(
     db: AsyncSession,
     session: CallSession,
@@ -1810,9 +1867,14 @@ async def _move_existing(
         move_call = routing.adapter.move_booking(external_booking_of(existing), start, end, ctx=ctx)
     else:
         move_call = routing.adapter.move_booking(external_booking_of(existing), start, end)
+    _note_pending_mutation(session, "move", existing, to_start=start, service=draft.service_description)
     try:
         moved = await _calendar_call("move_booking", session.call_sid, move_call)
     except BookingProviderError as exc:
+        if exc.code in UNCERTAIN_OUTCOME_CODES:
+            await _observe_after_uncertain_write(session, routing, existing)
+            raise
+        session.entities.pop(PENDING_PROVIDER_MUTATION, None)
         if exc.code == "SERVICE_CHANGE_UNSUPPORTED":
             return _service_change_refused(existing, str(exc))
         if exc.code == "SLOT_UNAVAILABLE":
@@ -1826,6 +1888,7 @@ async def _move_existing(
                 ),
             )
         raise
+    session.entities.pop(PENDING_PROVIDER_MUTATION, None)
     existing.start_time = start
     existing.end_time = end
     existing.status = AppointmentStatus.SCHEDULED
@@ -2489,6 +2552,13 @@ async def cancel_booking(
                 "cancel_appointment after they clearly say to cancel it."
             ),
         )
+    if session.entities.get("booking_reconciliation_required"):
+        # An earlier change has an unknown outcome: no further write until
+        # staff have reconciled it with the calendar.
+        return BookingResult(
+            BookingOutcome.ERROR,
+            message="This booking needs staff verification before another change. May a staff member call you to help?",
+        )
     draft = get_draft(session)
     draft.operation_mode = "cancel"
     try:
@@ -2577,11 +2647,20 @@ async def cancel_booking(
 
         await _lock_call(db, session.call_sid)
         await _lock_slot(db, routing.scope, existing.start_time, existing.end_time)
-        await _calendar_call(
-            "cancel_booking",
-            session.call_sid,
-            routing.adapter.cancel_booking(external_booking_of(existing)),
-        )
+        _note_pending_mutation(session, "cancel", existing)
+        try:
+            await _calendar_call(
+                "cancel_booking",
+                session.call_sid,
+                routing.adapter.cancel_booking(external_booking_of(existing)),
+            )
+        except BookingProviderError as exc:
+            if exc.code in UNCERTAIN_OUTCOME_CODES:
+                await _observe_after_uncertain_write(session, routing, existing)
+            else:
+                session.entities.pop(PENDING_PROVIDER_MUTATION, None)
+            raise
+        session.entities.pop(PENDING_PROVIDER_MUTATION, None)
         existing.status = AppointmentStatus.CANCELLED
         await db.commit()
 

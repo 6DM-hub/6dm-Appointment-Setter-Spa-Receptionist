@@ -216,6 +216,15 @@ class BookingAdapter(ABC):
         """Cancel a mirrored booking. Defaults to a no-op."""
         return None
 
+    async def retrieve_booking(self, booking: ExternalBooking) -> dict[str, Any] | None:
+        """Read-only: what the calendar of record holds for this booking now.
+
+        Used only to describe the state after a write whose outcome is unknown.
+        Returns {"start", "status", "staff", "services"} or None when the
+        provider cannot be read. Never writes.
+        """
+        return None
+
     async def find_customers_by_phone(self, phone: str) -> CustomerLookupResult:
         return CustomerLookupResult(outcome=CustomerLookupOutcome.UNSUPPORTED)
 

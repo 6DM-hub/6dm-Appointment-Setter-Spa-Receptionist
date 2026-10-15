@@ -249,8 +249,21 @@ def kept_this_turn(session: Any, turn: int) -> bool:
 def keep_existing_booking(session: Any, tz: Any, *, turn: int, call_sid: str | None = None) -> str:
     """Restore the booked state exactly; withdraw every pending proposal.
 
-    Returns the line to say. Writes nothing to any calendar.
+    Returns the line to say. Writes nothing to any calendar. When an earlier
+    change has an unknown outcome, the booked snapshot no longer proves what
+    the calendar holds: nothing is restored or promised, and the caller is
+    told honestly that it is being checked.
     """
+    if reconciliation_pending(session):
+        for key in (BOOKING_CHANGE_CLARIFICATION, BOOKING_CHANGE_IN_PROGRESS, ADDITIONAL_BOOKING):
+            session.entities.pop(key, None)
+        for key in _STALE_OFFER_KEYS:
+            session.entities.pop(key, None)
+        consume_confirmation_authorization(session)
+        session.entities[BOOKING_KEPT_TURN] = int(turn)
+        session.entities["callback_offer_pending"] = True
+        truth("BOOKING_KEEP_DURING_RECONCILIATION", call_sid=call_sid)
+        return uncertain_change_speech(session, tz)
     service, booked_iso = booked_details(session)
     snapshot = session.entities.get(BOOKED_DRAFT_SNAPSHOT) or {}
     for key in (BOOKING_CHANGE_CLARIFICATION, BOOKING_CHANGE_IN_PROGRESS, ADDITIONAL_BOOKING):
@@ -530,3 +543,42 @@ def retire_refused_offer(session: Any, tz: Any, *, turn: int, call_sid: str | No
         session.entities.pop(key, None)
     truth("BOOKING_OFFER_REFUSED", call_sid=call_sid)
     return True
+
+
+# --------------------------------------------------------------------------- #
+# A change whose outcome is unknown
+# --------------------------------------------------------------------------- #
+RECONCILIATION_REQUIRED = "booking_reconciliation_required"
+
+
+def reconciliation_pending(session: Any) -> bool:
+    return bool(session.entities.get(RECONCILIATION_REQUIRED))
+
+
+def uncertain_change_speech(session: Any, tz: Any) -> str:
+    """Honest words when a change may or may not have reached the calendar."""
+    from app.services.booking_state import _booked_service, _booked_when
+
+    marker = session.entities.get(RECONCILIATION_REQUIRED) or {}
+    service = _booked_service(marker.get("service") or booked_details(session)[0])
+    observed = (marker.get("provider_observed") or {}) if isinstance(marker, dict) else {}
+    if marker.get("operation") == "cancel":
+        line = (
+            f"I'm sorry, I can't confirm right now whether your {service}"
+            f"{_booked_when(marker.get('from_start'), tz)} was cancelled, because the "
+            "booking system didn't confirm it."
+        )
+    else:
+        old = _booked_when(marker.get("from_start"), tz)
+        new = _booked_when(marker.get("to_start"), tz)
+        line = (
+            f"I'm sorry, I can't confirm right now whether your {service} is"
+            f"{old or ' at the original time'} or{new or ' at the new time'}, because the "
+            "booking system didn't confirm the change."
+        )
+    if observed.get("start") and str(observed.get("status") or "").upper() == "ACCEPTED":
+        line += f" Right now it shows the appointment{_booked_when(observed['start'], tz)}."
+    return (
+        line + " I won't make any other changes until a team member has checked it. "
+        "May a team member call you to confirm it?"
+    )

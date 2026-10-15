@@ -361,6 +361,14 @@ class SquareAdapter(VerticalProviderAdapter):
                         self.spa_name,
                         path,
                     )
+                    if not safe_to_retry and not isinstance(exc, httpx.ConnectError):
+                        # The write may already have reached Square: the
+                        # outcome is unknown, never "failed, try again".
+                        raise BookingProviderError(
+                            "Square did not answer a booking change; its outcome is unknown",
+                            code="BOOKING_OUTCOME_UNKNOWN",
+                            retryable=False,
+                        ) from exc
                     raise BookingProviderError(
                         "Unable to communicate with Square",
                         retryable=True,
@@ -2709,6 +2717,19 @@ class SquareAdapter(VerticalProviderAdapter):
     # ------------------------------------------------------------------
     # CANCEL
     # ------------------------------------------------------------------
+
+    async def retrieve_booking(self, booking: ExternalBooking) -> dict[str, Any] | None:
+        """Read-only snapshot of the booking as Square holds it now."""
+        if not booking.external_id:
+            return None
+        current = await self._retrieve_booking(str(booking.external_id))
+        segments = current.get("appointment_segments") or []
+        return {
+            "start": current.get("start_at"),
+            "status": current.get("status"),
+            "staff": [segment.get("team_member_id") for segment in segments],
+            "services": [segment.get("service_variation_id") for segment in segments],
+        }
 
     async def cancel_booking(
         self,

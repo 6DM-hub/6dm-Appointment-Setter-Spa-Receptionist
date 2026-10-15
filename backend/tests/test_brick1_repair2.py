@@ -230,3 +230,104 @@ async def test_service_correction_books_the_corrected_service_after_fresh_consen
     assert out["status"] == "draft", out
     await p.says("Yes, please.")
     assert p.variations() == [w.second_var] and len(w.square.creates) == 1
+
+
+# --------------------------------------------------------------------------- #
+# F4: a change whose outcome is unknown is never described from memory
+# --------------------------------------------------------------------------- #
+import asyncio  # noqa: E402
+
+import httpx  # noqa: E402
+
+from app.services.booking_adapters.base import BookingProviderError  # noqa: E402
+
+
+def lose_response(monkeypatch, world, method, *, apply=True, exc=None):
+    original = world.square.__call__
+
+    async def request(verb, path, *, json=None):
+        if verb == method and (method != "POST" or path.endswith("/cancel")):
+            if apply:
+                await original(verb, path, json=json)
+            raise exc or asyncio.TimeoutError("response lost")
+        return await original(verb, path, json=json)
+
+    monkeypatch.setattr(world.adapter.delegate, "_request", request)
+
+
+async def test_lost_move_response_is_reported_honestly_and_blocks_further_writes(monkeypatch):
+    w = make_world(monkeypatch)
+    p = await booked_call(w)
+    lose_response(monkeypatch, w, "PUT")
+    await p.says("Move my appointment to Thursday at 3 PM instead.")
+    await p.propose(operation="reschedule", requested_start_iso=local(T3), service_description=w.first)
+    heard = await p.says("Yes, go ahead.")
+    assert p.starts() == ["2026-10-22T20:00:00Z"]
+    marker = p.session.entities["booking_reconciliation_required"]
+    assert marker["operation"] == "move" and marker["provider_observed"]["start"] == "2026-10-22T20:00:00Z"
+    said = " ".join(heard)
+    assert "can't confirm" in said and "all set" not in said and "has been moved" not in said
+    assert "Right now it shows the appointment on Thursday at 3 PM" in said
+    # No further write is accepted until staff reconcile it.
+    writes_before = len(w.square.updates)
+    await p.says("Okay, then move it to Thursday at 4 PM instead.")
+    await p.propose(operation="reschedule", requested_start_iso=local(T3 + (T3 - T2)),
+                    service_description=w.first)
+    await p.says("Yes, go ahead.")
+    await p.tool("confirm_appointment")
+    assert len(w.square.updates) == writes_before
+
+
+async def test_lost_cancel_response_is_never_reported_as_cancelled_or_kept(monkeypatch):
+    w = make_world(monkeypatch)
+    p = await booked_call(w)
+    original = w.square.__call__
+
+    async def request(verb, path, *, json=None):
+        if verb == "POST" and path.endswith("/cancel"):
+            booking = w.square.bookings[path.split("/")[-2]]
+            booking["status"] = "CANCELLED_BY_CUSTOMER"
+            raise asyncio.TimeoutError("response lost")
+        return await original(verb, path, json=json)
+
+    monkeypatch.setattr(w.adapter.delegate, "_request", request)
+    await p.says("Please cancel my appointment.")
+    out = await p.tool("cancel_appointment")
+    assert out["status"] == "error"
+    assert p.session.entities["booking_reconciliation_required"]["operation"] == "cancel"
+    heard = await p.says("Never mind, keep it.")
+    said = " ".join(p.heard[-2:] + heard)
+    assert "stays exactly as it is" not in said and "has been cancelled" not in said
+
+
+async def test_square_read_timeout_on_a_write_is_an_unknown_outcome(monkeypatch):
+    from app.services.booking_adapters.providers.square import SquareAdapter
+
+    adapter = SquareAdapter.__new__(SquareAdapter)
+    adapter.config = {"access_token": "t", "location_id": "loc"}
+    adapter.spa_name = "Test"
+    monkeypatch.setattr(adapter, "_validate_config", lambda: None)
+    monkeypatch.setattr(SquareAdapter, "base_url", "https://example.invalid", raising=False)
+    monkeypatch.setattr(adapter, "_headers", lambda: {})
+
+    class Client:
+        def __init__(self, error):
+            self.error = error
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return False
+
+        async def request(self, *_a, **_k):
+            raise self.error
+
+    for error, code, retryable in [
+        (httpx.ReadTimeout("read timed out"), "BOOKING_OUTCOME_UNKNOWN", False),
+        (httpx.ConnectError("refused"), None, True),
+    ]:
+        monkeypatch.setattr(httpx, "AsyncClient", lambda *a, _e=error, **k: Client(_e))
+        with pytest.raises(BookingProviderError) as raised:
+            await adapter._request("PUT", "/v2/bookings/sq_1", json={})
+        assert raised.value.code == code and raised.value.retryable is retryable

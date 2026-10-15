@@ -5992,6 +5992,16 @@ class XAIVoiceSession:
                 + (alternatives + " Which time would you prefer?" if alternatives
                    else "Would you like me to check another day?")
             )
+        marker = self.session.entities.get("booking_reconciliation_required")
+        if (
+            status == BookingOutcome.ERROR.value
+            and isinstance(marker, dict)
+            and marker.get("operation") in {"move", "cancel"}
+        ):
+            # A change to an existing booking may or may not have been applied.
+            # Say so plainly, promise nothing about either time, offer staff.
+            self.session.entities["callback_offer_pending"] = True
+            return booking_guard.uncertain_change_speech(self.session, self._tz)
         if (
             status == BookingOutcome.ERROR.value
             and self.session.entities.get("booking_reconciliation_required")
