@@ -271,8 +271,15 @@ async def update_event(
 
 
 async def delete_event(connection: GoogleCalendarConnection, event_id: str) -> None:
+    """Delete an event from the selected calendar, or raise.
+
+    Never reports success without Google confirming this delete: no selected
+    calendar, or an event that calendar does not hold (404 -- e.g. the tenant
+    switched calendars since it was created), is an error for the caller to
+    surface, not a silent no-op.
+    """
     if not connection.selected_calendar_id:
-        return
+        raise GoogleCalendarError("calendar_not_selected")
     try:
         service = await _service(connection)
         await asyncio.to_thread(
@@ -281,5 +288,6 @@ async def delete_event(connection: GoogleCalendarConnection, event_id: str) -> N
             .execute
         )
     except HttpError as exc:
-        if getattr(exc.resp, "status", None) != 404:
-            raise _api_error(exc) from exc
+        if getattr(exc.resp, "status", None) == 404:
+            raise GoogleCalendarError("event_not_found") from exc
+        raise _api_error(exc) from exc

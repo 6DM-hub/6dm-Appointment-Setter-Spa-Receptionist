@@ -635,3 +635,27 @@ def test_a_backend_authored_read_back_is_not_second_guessed():
     assert _asks_something_else(s, line) is True     # model wording: fail closed
     note_backend_prompt(s, line)
     assert _asks_something_else(s, line) is False    # the backend's own read-back
+
+
+# --- Review fix: a Google delete is never a silent success ------------------
+async def test_google_delete_404_or_no_calendar_is_not_success(monkeypatch):
+    from types import SimpleNamespace as NS
+    from googleapiclient.errors import HttpError
+    from app.services import google_calendar as gc
+
+    class _Req:
+        def execute(self):
+            raise HttpError(NS(status=404, reason="Not Found"), b"{}")
+
+    service = NS(events=lambda: NS(delete=lambda **kw: _Req()))
+
+    async def _svc(connection):
+        return service
+
+    monkeypatch.setattr(gc, "_service", _svc)
+    with pytest.raises(gc.GoogleCalendarError) as err:
+        await gc.delete_event(NS(selected_calendar_id="cal-new"), "evt-in-old-calendar")
+    assert err.value.status == "event_not_found"
+    with pytest.raises(gc.GoogleCalendarError) as err:
+        await gc.delete_event(NS(selected_calendar_id=None), "evt-1")
+    assert err.value.status == "calendar_not_selected"

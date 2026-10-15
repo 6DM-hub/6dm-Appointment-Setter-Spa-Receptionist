@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # Anything else (a generic API/server error) may have been applied: unknown.
 _DEFINITE_GOOGLE_REFUSALS = {
     "authorization_required", "token_expired_or_revoked", "insufficient_permissions",
-    "calendar_not_found", "calendar_not_selected",
+    "calendar_not_found", "calendar_not_selected", "event_not_found",
 }
 
 
