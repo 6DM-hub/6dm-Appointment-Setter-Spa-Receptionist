@@ -1684,6 +1684,14 @@ class XAIVoiceSession:
         slot_time = spoken_slot_time((draft.selected_slot or {}).get("start") or draft.start_iso, self._tz)
         if not slot_time or slot_time.casefold() not in (assistant_text or "").casefold():
             return False
+        from app.services.booking_state import backend_spoke_since_caller
+
+        if not backend_spoke_since_caller(self.session, assistant_text):
+            # Model wording never becomes the booking question: it may carry a
+            # second question in any form. A yes to it is re-asked with the
+            # backend's own read-back (see _confirm_pending_booking_from_caller).
+            truth("MODEL_READ_BACK_NOT_BINDING", call_sid=self.call_id)
+            return False
         remember_offer(self.session, assistant_text)
         if not draft.read_back:
             mark_read_back(self.session, assistant_text)

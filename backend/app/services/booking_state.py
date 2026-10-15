@@ -1613,6 +1613,36 @@ def booking_card_speech(card_status: str | None, card_sms: str | None) -> str:
     return ""
 
 
+def backend_spoke_since_caller(session: Any, text: str | None) -> bool:
+    """``text`` is a line the backend itself spoke since the caller last spoke."""
+    history = list(getattr(session, "history", None) or [])
+    since_caller = max((i + 1 for i, item in enumerate(history) if item.get("role") == "user"), default=0)
+    return bool(text) and any(
+        record["at"] >= since_caller and same_question(text, record["text"])
+        for record in _prompt_records(session.entities.get(BACKEND_PROMPTS))
+    )
+
+
+def canonical_read_back(session: Any, tz: Any) -> str | None:
+    """The backend's own single-question read-back of the current proposal.
+
+    Only a question the backend itself authored can become the booking
+    question a yes answers: model wording may carry a second question in any
+    form ("...or just text you our address?", "let me know if...").
+    """
+    draft = get_draft(session)
+    if not (draft.selected_slot and draft.provider_verified):
+        return None
+    label = spoken_slot_time(draft.selected_slot.get("start"), tz)
+    if not label:
+        return None
+    service = (draft.service_description or "your appointment").strip()
+    if getattr(draft, "operation_mode", None) == "reschedule":
+        return (f"{label} is available for {service}. Nothing has been changed yet. "
+                "Would you like me to move your appointment to that time?")
+    return f"{label} is available for {service}. Nothing is booked yet. Would you like me to book that?"
+
+
 def authoritative_availability_speech(session: Any, tz: Any) -> str | None:
     """Caller-facing sentence for a completed Square check.
 

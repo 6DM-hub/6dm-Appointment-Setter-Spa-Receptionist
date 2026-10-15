@@ -939,10 +939,30 @@ async def voice_respond(
     reply = _authoritative_reply(session, reply)
     reply = _authoritative_availability_reply(session, reply)
     reply = _with_gratuity_reminder(session, reply, result)
+    read_back = (
+        _asks_for_confirmation(reply) and not guard_statement
+        and _reads_back_current_proposal(session, reply, tz)
+    )
+    if read_back:
+        # The caller hears the BACKEND's own single-question read-back, not the
+        # model's wording, which may carry a second question in any form
+        # ("...or just text you our address?"). Only that line can bind a yes.
+        from app.services.booking_state import canonical_read_back, note_backend_prompt
+
+        canonical = canonical_read_back(session, tz)
+        if canonical:
+            additional = booking_guard.additional_marker(session) or {}
+            notice = str(additional.get("notice") or "")
+            # A backend notice already prefixed this turn (an additional
+            # appointment) is the backend's own statement: keep it.
+            reply = f"{notice} {canonical}" if notice and reply.startswith(notice) else canonical
+            note_backend_prompt(session, reply)
+        else:
+            read_back = False
     session.add_turn("assistant", reply)
     # If the agent just recited the details and asked for the go-ahead, the
     # caller's next "yes" is consent to those exact details — and only then.
-    if _asks_for_confirmation(reply) and not guard_statement and _reads_back_current_proposal(session, reply, tz):
+    if read_back:
         # The reply's question is what a later yes answers (bound by position).
         mark_read_back(session, reply)
     await state.save(session)

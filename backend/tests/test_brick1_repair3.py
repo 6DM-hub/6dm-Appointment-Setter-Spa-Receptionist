@@ -667,3 +667,35 @@ async def test_google_delete_404_or_no_calendar_is_not_success(monkeypatch):
     with pytest.raises(gc.GoogleCalendarError) as err:
         await gc.delete_event(NS(selected_calendar_id=None), "evt-1")
     assert err.value.status == "calendar_not_selected"
+
+
+# --- Review fix: only the backend's own read-back can bind a yes -------------
+async def test_legacy_caller_hears_the_backend_read_back_not_the_model_wording(monkeypatch):
+    from tests.test_brick1_booking_change_guard import LegacyCall, _intent, T2 as _T2
+    w = make_world(monkeypatch)
+    c = LegacyCall(w, monkeypatch)
+    heard = await c.says(f"I'd like a {w.first} Thursday at 2 PM, I'm Ada Lovelace.",
+                         intent=_intent("schedule", _T2, w.first),
+                         reply="Thursday at 2 PM is available. Would you like me to book that, "
+                               "or just text you our address?")
+    assert "address" not in heard and heard.endswith("Would you like me to book that?")
+    await c.says("Yes.", reply="Okay.")
+    assert len(w.square.creates) == 1     # consent to exactly what was heard
+
+
+@pytest.mark.parametrize("line", [
+    "Thursday at 2 PM is available. Would you like me to book that, or just text you our address?",
+    "Let me know if you'd like our address. Thursday at 2 PM is open, would you like me to book that?",
+    "Thursday at 2 PM is available. Would you like me to book that?",
+])
+async def test_realtime_model_read_back_never_binds_but_the_re_ask_does(monkeypatch, line):
+    from tests.test_codex_brick1_r2_independent import offered
+    w = make_world(monkeypatch)
+    p = await offered(w, monkeypatch, "realtime")
+    p.session.add_turn("user", "Hmm, let me think.")
+    p.session.add_turn("assistant", line)          # model wording
+    reasked = await p.says("Yes.")
+    assert not w.square.creates and reasked        # re-asked instead
+    p.session.add_turn("assistant", reasked[-1])   # the transcript of what was spoken
+    await p.says("Yes.")                           # answers the backend's own read-back
+    assert len(w.square.creates) == 1
