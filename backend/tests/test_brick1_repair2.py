@@ -498,3 +498,23 @@ async def test_dashboard_cannot_change_another_tenants_appointment(rubyz_db, mon
         await cancel_appointment(row.id, scope=session_for(b, "other").scope, db=db)
     assert raised.value.status_code == 404
     assert len(squares["fake-cleaning-token"].active()) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Verification gap: an offer that went stale before the caller said yes
+# --------------------------------------------------------------------------- #
+async def test_offer_taken_by_someone_else_before_yes_is_never_booked(monkeypatch):
+    w = make_world(monkeypatch)
+    p = await _offered(w)
+    # Both team members are booked at 2 PM by other customers in the meantime.
+    for n, team in enumerate(("TM_ANA", "TM_BEA")):
+        w.square.bookings[f"other_{n}"] = {
+            "id": f"other_{n}", "status": "ACCEPTED", "version": 1, "start_at": Z2,
+            "location_id": "loc_123", "customer_id": f"cust_other_{n}",
+            "appointment_segments": [{"team_member_id": team, "service_variation_id": w.first_var,
+                                      "service_variation_version": 3, "duration_minutes": 60}],
+        }
+    heard = await p.says("Yes, please.")
+    assert not w.square.creates, "a slot that is no longer free must not be booked"
+    assert p.session.booking_status != "booked"
+    assert not any("all set" in line for line in heard), heard
