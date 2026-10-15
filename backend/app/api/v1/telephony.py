@@ -115,6 +115,17 @@ def _asks_for_confirmation(reply: str) -> bool:
     return text.endswith("?") and bool(BOOKING_CONFIRMATION_REQUEST.search(text))
 
 
+def _reads_back_current_proposal(session: CallSession, reply: str, tz) -> bool:
+    """A read-back names what is being booked: "Shall I text you our address?"
+    asks for a go-ahead too, but about something else, and must never arm a
+    booking. The proposal's own time has to be in the reply."""
+    from app.services.booking_state import spoken_slot_time
+
+    draft = get_draft(session)
+    slot_time = spoken_slot_time((draft.selected_slot or {}).get("start") or draft.start_iso, tz)
+    return bool(slot_time and slot_time.casefold() in (reply or "").casefold())
+
+
 def _authoritative_reply(session: CallSession, reply: str) -> str:
     """Prevent model-only booking claims in the Twilio text pipeline."""
     booking_is_persisted = (
@@ -931,8 +942,9 @@ async def voice_respond(
     session.add_turn("assistant", reply)
     # If the agent just recited the details and asked for the go-ahead, the
     # caller's next "yes" is consent to those exact details — and only then.
-    if _asks_for_confirmation(reply) and not guard_statement:
-        mark_read_back(session)
+    if _asks_for_confirmation(reply) and not guard_statement and _reads_back_current_proposal(session, reply, tz):
+        # The reply's question is what a later yes answers (bound by position).
+        mark_read_back(session, reply)
     await state.save(session)
 
     if _is_closing_reply(reply):

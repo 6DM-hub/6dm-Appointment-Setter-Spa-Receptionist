@@ -101,6 +101,8 @@ from app.services.booking_state import (
     recover_caller_name_from_history,
     is_booking_consent,
     refuses_offer,
+    booking_consent_context,
+    note_backend_prompt,
     save_draft,
     start_new_intent,
     supplied_caller_name,
@@ -1672,9 +1674,17 @@ class XAIVoiceSession:
             return False
         if not _CONFIRMATION_QUESTION_RE.search(assistant_text or ""):
             return False
-        remember_offer(self.session)
+        # A read-back names what is being booked. "Would you like me to explain
+        # our policy before you book?" asks something else and must never arm
+        # a booking, so the proposal's own time has to be in the question.
+        from app.services.booking_state import spoken_slot_time
+
+        slot_time = spoken_slot_time((draft.selected_slot or {}).get("start") or draft.start_iso, self._tz)
+        if not slot_time or slot_time.casefold() not in (assistant_text or "").casefold():
+            return False
+        remember_offer(self.session, assistant_text)
         if not draft.read_back:
-            mark_read_back(self.session)
+            mark_read_back(self.session, assistant_text)
             logger.info(
                 "call %s: pending appointment read-back armed for caller confirmation",
                 self.call_id,
@@ -1994,6 +2004,22 @@ class XAIVoiceSession:
                     "call %s: CONFIRMATION_REJECTED reason=modification_present",
                     self.call_id,
                 )
+            elif (
+                is_affirmative(caller_text)
+                and not accepted
+                and draft.provider_verified
+                and draft.selected_slot
+                and not booking_consent_context(self.session)
+            ):
+                # A yes that cannot be tied to the booking question (something
+                # else was asked in between): ask the booking question again,
+                # so the caller's next yes is unambiguous.
+                spoken = authoritative_availability_speech(self.session, self._tz)
+                if spoken:
+                    truth("CONFIRMATION_REASKED", call_sid=self.call_id)
+                    await self._cancel_active_response()
+                    await self._speak_availability(spoken)
+                    return True
             return False
         if caller_name_required_for(draft) and not supplied_caller_name(draft):
             await self._ask_for_caller_name(again=True)
@@ -5921,6 +5947,9 @@ class XAIVoiceSession:
             message = message.replace(CARD_LINK_PERMISSION_QUESTION,
                 "Are you okay with me emailing the secure card link to the address you just confirmed?")
         spoken_message = await self._localized_force_message(message)
+        # CARA's own backend lines are not "another question" a later yes
+        # could be answering instead of the booking question.
+        note_backend_prompt(self.session, spoken_message)
         await self._send(
             {
                 "type": "conversation.item.create",
@@ -6373,7 +6402,7 @@ class XAIVoiceSession:
         if offer_accepted(self.session):
             await self._confirm_pending_booking_from_caller("yes")
             return
-        remember_offer(self.session)
+        remember_offer(self.session, spoken)
         slots = ([draft.selected_slot] if draft.provider_verified and draft.selected_slot
                  else list(draft.alternative_slots or [])[:3])
         self.session.entities["spoken_booking_choices"] = {

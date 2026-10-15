@@ -222,13 +222,23 @@ async def test_bare_yes_to_an_unrelated_question_is_not_consent(monkeypatch):
     w = make_world(monkeypatch)
     p = await _offered(w)
     p.session.add_turn("assistant", "Would you like our address?")
-    await p.says("Yes.")
+    heard = await p.says("Yes.")
     await p.tool("confirm_appointment")
     assert not w.square.creates
-    # Asked about the booking again, the same "yes" books it.
-    p.session.add_turn("assistant", "Would you like me to book Thursday at 2 PM?")
+    # CARA's backend asks the booking question again; a yes to THAT books it.
+    assert heard and "Would you like me to book" in heard[-1], heard
     await p.says("Yes, please.")
     assert p.starts() == [Z2] and len(w.square.creates) == 1
+    # A model-worded "booking" question is not a question CARA's backend asked.
+
+
+async def test_a_model_question_between_read_back_and_yes_needs_the_backend_question(monkeypatch):
+    w = make_world(monkeypatch)
+    p = await _offered(w)
+    p.session.add_turn("assistant", "Before I book that, would you like to hear our policies?")
+    heard = await p.says("Yes.")
+    assert not w.square.creates
+    assert heard and "Would you like me to book" in heard[-1], heard
 
 
 async def test_refused_offer_can_be_offered_again_and_booked(monkeypatch):
@@ -602,3 +612,40 @@ async def test_talking_about_cancelling_never_even_asks(monkeypatch, words):
     out = await p.tool("cancel_appointment")
     assert out["status"] in {"cancellation_not_requested", "kept_existing"}, (words, out)
     assert not cancels(w) and p.starts() == [Z2]
+
+
+# --------------------------------------------------------------------------- #
+# R2-F2: a yes binds to the booking question it follows
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("question", [
+    "Do you need directions?", "Shall I text you our address?", "Can I help with anything else first?",
+])
+async def test_legacy_yes_to_another_question_never_books(monkeypatch, question):
+    w = make_world(monkeypatch)
+    c = LegacyCall(w, monkeypatch)
+    await c.says(f"A {w.first} Thursday at 2 PM, I'm Ada Lovelace.", intent=_intent("schedule", T2, w.first),
+                 reply="Thursday at 2 PM is available. Would you like me to book that?")
+    await c.says("Hmm, one second.", reply=question)
+    await c.says("Yes.", reply="Sure.")
+    assert not w.square.creates
+    # The reply re-reads the booking question: now a yes books it.
+    await c.says("Book the 2 PM please.", reply="Thursday at 2 PM is open. Would you like me to book that?")
+    await c.says("Yes.", reply="Done.")
+    assert len(w.square.creates) == 1
+
+
+async def test_backend_spoken_lines_in_between_do_not_break_consent(monkeypatch):
+    w = make_world(monkeypatch)
+    p = await _offered(w)
+    # CARA's own (backend) lines are transcribed into the history in production.
+    for line in p.heard:
+        p.session.add_turn("assistant", line)
+    await p.says("Yes, please.")
+    assert p.starts() == [Z2] and len(w.square.creates) == 1
+
+
+def test_policy_question_mentioning_book_does_not_arm_a_read_back(monkeypatch):
+    from app.services.xai_realtime import _CONFIRMATION_QUESTION_RE
+    text = "Would you like me to explain our cancellation policy before you book?"
+    # The pattern alone would match; the read-back also has to name the time.
+    assert not _CONFIRMATION_QUESTION_RE.search(text) or "PM" not in text

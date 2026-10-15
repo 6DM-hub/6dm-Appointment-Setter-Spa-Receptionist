@@ -309,9 +309,108 @@ def answering_unrelated_question(session: Any) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# A yes counts only as the answer to the question it follows
+# ---------------------------------------------------------------------------
+# The booking question CARA actually asked for the CURRENT proposal, and where
+# in the conversation it was asked. A caller's yes authorizes that proposal
+# only when it is the very next caller turn after that question and nothing
+# else was asked in between (CARA's own backend-spoken lines excepted).
+OPEN_BOOKING_QUESTION = "open_booking_question"
+BACKEND_PROMPTS = "backend_prompts"   # lines CARA's backend itself spoke (recent)
+
+
+def note_booking_question(session: Any, text: str | None = None) -> None:
+    draft = get_draft(session)
+    if not draft.selected_slot:
+        return
+    session.entities[OPEN_BOOKING_QUESTION] = {
+        "history_len": len(getattr(session, "history", None) or []),
+        "fingerprint": proposal_fingerprint(draft),
+        "text": text,
+    }
+
+
+def note_backend_prompt(session: Any, text: str | None) -> None:
+    if not text:
+        return
+    prompts = list(session.entities.get(BACKEND_PROMPTS) or [])
+    prompts.append(str(text)[:600])
+    session.entities[BACKEND_PROMPTS] = prompts[-12:]
+
+
+def _plain_words(text: str | None) -> str:
+    return " ".join(re.sub(r"[^a-z0-9 ]+", " ", (text or "").casefold()).split())
+
+
+def same_question(said: str | None, asked: str | None) -> bool:
+    """An assistant turn is (the transcript of) a line CARA itself spoke."""
+    a, b = _plain_words(said), _plain_words(asked)
+    return bool(a and b and (a == b or b in a or a in b))
+
+
+def _trailing_non_dialogue(tail: list) -> int:
+    count = 0
+    for item in reversed(tail):
+        if item.get("role") in {"system", "tool"}:
+            count += 1
+            continue
+        break
+    return count
+
+
+def answers_backend_question(
+    session: Any, *, history_len: int, question: str | None, trusted: list | None = None,
+) -> bool | None:
+    """Does the latest caller turn answer the question asked at ``history_len``,
+    with no other question asked since?
+
+    None when no caller turn has happened since (a programmatic check, not a
+    caller answer). Any assistant turn since then that asks something else
+    ("would you like our address?") means the yes may answer that instead.
+    Earlier caller turns in between are fine: one that changed or refused the
+    proposal has already replaced or withdrawn it.
+    """
+    tail = list((getattr(session, "history", None) or [])[int(history_len):])
+    users = [i for i, item in enumerate(tail) if item.get("role") == "user"]
+    if not users:
+        return None
+    if users[-1] != len(tail) - 1 - _trailing_non_dialogue(tail):
+        return False
+    for item in tail[: users[-1]]:
+        if item.get("role") != "assistant":
+            continue
+        said = str(item.get("content") or "")
+        if "?" not in said:
+            continue
+        if question and same_question(said, question):
+            continue
+        if any(same_question(said, prompt) for prompt in (trusted or [])):
+            continue
+        return False
+    return True
+
+
+def booking_consent_context(session: Any) -> bool:
+    """The caller's latest turn may be read as an answer to the booking question."""
+    question = session.entities.get(OPEN_BOOKING_QUESTION)
+    if isinstance(question, dict):
+        if question.get("fingerprint") != proposal_fingerprint(get_draft(session)):
+            return False  # the question was about a different proposal
+        bound = answers_backend_question(
+            session,
+            history_len=int(question.get("history_len", 0)),
+            question=question.get("text"),
+            trusted=list(session.entities.get(BACKEND_PROMPTS) or []),
+        )
+        if bound is not None:
+            return bound
+    return not answering_unrelated_question(session)
+
+
 def is_booking_consent(session: Any, utterance: str | None) -> bool:
     """Plain agreement that answers CARA's question about this booking."""
-    return is_affirmative(utterance) and not answering_unrelated_question(session)
+    return is_affirmative(utterance) and booking_consent_context(session)
 
 
 def refuses_offer(utterance: str | None) -> bool:
@@ -715,8 +814,20 @@ def capture_caller_name_answer(session: Any, utterance: str | None) -> str | Non
     return name
 
 
-def mark_read_back(session: Any) -> BookingDraft:
-    """Record that the agent has just recited the full details to the caller."""
+def mark_read_back(session: Any, question: str | None = None) -> BookingDraft:
+    """Record that the agent has just recited the full details to the caller.
+
+    ``question`` is the line that asked for the go-ahead; a later yes binds to
+    it (see `booking_consent_context`).
+    """
+    open_question = session.entities.get(OPEN_BOOKING_QUESTION)
+    draft_now = get_draft(session)
+    if question is not None or not (
+        isinstance(open_question, dict)
+        and draft_now.selected_slot
+        and open_question.get("fingerprint") == proposal_fingerprint(draft_now)
+    ):
+        note_booking_question(session, question)
     draft = get_draft(session)
     if caller_name_required_for(draft) and not supplied_caller_name(draft):
         truth("CALLER_NAME_REQUIRED")
@@ -1091,7 +1202,7 @@ def record_pure_confirmation(session: Any, utterance: str | None = None) -> bool
     if utterance is not None and not is_affirmative(utterance):
         truth("CONFIRMATION_REJECTED", reason="modification_present", utterance=utterance)
         return False
-    if utterance is not None and answering_unrelated_question(session):
+    if utterance is not None and not booking_consent_context(session):
         truth("CONFIRMATION_REJECTED", reason="answer_to_unrelated_question", utterance=utterance)
         return False
     if caller_name_required_for(draft) and not supplied_caller_name(draft):
@@ -1130,7 +1241,9 @@ def arm_verified_proposal(session: Any) -> BookingDraft:
     Used by tests and by the voice path after an explicit pure "yes".
     """
     mark_read_back(session)
-    record_pure_confirmation(session, "yes, book it")
+    # Explicit authorization by the calling code (tests, or a caller yes that
+    # was already checked): not re-derived from conversation position.
+    record_pure_confirmation(session)
     return get_draft(session)
 
 

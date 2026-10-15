@@ -526,48 +526,12 @@ def _caller_turns(session: Any) -> list[str]:
     ]
 
 
-def _same_question(said: str, asked: str) -> bool:
-    """The assistant turn is the backend's own question (transcript may differ in punctuation)."""
-    a = " ".join(re.sub(r"[^a-z0-9 ]+", " ", (said or "").casefold()).split())
-    b = " ".join(re.sub(r"[^a-z0-9 ]+", " ", (asked or "").casefold()).split())
-    return bool(a and b and (a == b or b in a or a in b))
-
-
 def answers_backend_question(session: Any, *, history_len: int, question: str | None,
-                             trusted: list[str] | None = None) -> bool:
-    """The latest caller turn is the FIRST answer to the question CARA asked
-    at ``history_len``, with no other question asked in between.
+                             trusted: list | None = None) -> bool:
+    """See `booking_state.answers_backend_question`; no caller turn means no."""
+    from app.services.booking_state import answers_backend_question as _answers
 
-    Any assistant turn after that point that asks something else -- "would
-    you like our address?" -- means the caller's yes may answer that instead.
-    """
-    tail = list((getattr(session, "history", None) or [])[int(history_len):])
-    users = [i for i, item in enumerate(tail) if item.get("role") == "user"]
-    if len(users) != 1 or users[0] != len(tail) - 1 - _trailing_non_dialogue(tail):
-        return False
-    for item in tail[: users[0]]:
-        if item.get("role") != "assistant":
-            continue
-        said = str(item.get("content") or "")
-        if "?" not in said:
-            continue
-        if question and _same_question(said, question):
-            continue
-        if any(_same_question(said, prompt) for prompt in (trusted or [])):
-            continue
-        return False
-    return True
-
-
-def _trailing_non_dialogue(tail: list[dict]) -> int:
-    """System notes after the caller's turn do not count as dialogue."""
-    count = 0
-    for item in reversed(tail):
-        if item.get("role") in {"system", "tool"}:
-            count += 1
-            continue
-        break
-    return count
+    return bool(_answers(session, history_len=history_len, question=question, trusted=trusted))
 
 
 def cancellation_question(service: str | None, start_iso: str | None, tz: Any) -> str:

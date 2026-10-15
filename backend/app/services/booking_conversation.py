@@ -2,10 +2,13 @@
 from app.services.booking_state import get_draft, proposal_fingerprint
 
 
-def remember_offer(session):
+def remember_offer(session, question=None):
+    """CARA offered the current proposal; ``question`` is the line it spoke."""
+    from app.services.booking_state import note_booking_question
     draft = get_draft(session)
     if draft.provider_verified and draft.selected_slot:
         session.entities["spoken_booking_offer"] = proposal_fingerprint(draft)
+        note_booking_question(session, question)
 
 
 def accept_offer(session):
