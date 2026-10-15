@@ -331,3 +331,71 @@ async def test_square_read_timeout_on_a_write_is_an_unknown_outcome(monkeypatch)
         with pytest.raises(BookingProviderError) as raised:
             await adapter._request("PUT", "/v2/bookings/sq_1", json={})
         assert raised.value.code == code and raised.value.retryable is retryable
+
+
+# --------------------------------------------------------------------------- #
+# F5 / F6: Square must hold exactly what the caller authorized
+# --------------------------------------------------------------------------- #
+def team_of(world):
+    return [b["appointment_segments"][0]["team_member_id"] for b in world.square.active()]
+
+
+async def test_time_only_move_keeps_and_verifies_the_same_staff(monkeypatch):
+    w = make_world(monkeypatch)
+    p = await booked_call(w)
+    held = team_of(w)
+    await p.says("Can we move it to Thursday at 3 PM instead?")
+    await p.propose(operation="reschedule", requested_start_iso=local(T3), service_description=w.first)
+    await p.says("Yes, go ahead.")
+    assert p.starts() == ["2026-10-22T20:00:00Z"] and team_of(w) == held
+
+
+async def test_staff_change_to_someone_unavailable_is_refused_not_faked(monkeypatch):
+    w = make_world(monkeypatch)
+    w.square.openings = [s for s in w.square.openings if not (s["start"] == T3 and s["team"] == "TM_BEA")]
+    p = await booked_call(w)
+    held = team_of(w)
+    await p.says("Change my appointment to be with Bea on Thursday at 3 PM instead.")
+    out = await p.propose(operation="reschedule", requested_start_iso=local(T3),
+                          service_description=w.first, preferred_staff="Bea")
+    await p.says("Yes, go ahead.")
+    assert w.square.updates == [] and team_of(w) == held and p.starts() == [Z2], out
+
+
+async def test_thin_create_response_is_read_back_before_success(monkeypatch):
+    w = make_world(monkeypatch)
+    p = await _offered(w)
+    original = w.square.__call__
+
+    async def thin(method, path, *, json=None):
+        result = await original(method, path, json=json)
+        if method == "POST" and path == "/v2/bookings":
+            return {"booking": {"id": result["booking"]["id"], "status": "ACCEPTED"}}
+        return result
+
+    monkeypatch.setattr(w.adapter.delegate, "_request", thin)
+    await p.says("Yes, please.")
+    reads = [c for c in w.square.calls if c[0] == "GET" and c[1].startswith("/v2/bookings/")]
+    assert reads, "a thin create response must be verified by reading the booking back"
+    assert p.session.booking_status == "booked" and p.starts() == [Z2]
+
+
+async def test_move_that_lands_with_the_wrong_staff_is_not_reported_as_done(monkeypatch):
+    w = make_world(monkeypatch)
+    p = await booked_call(w)
+    original = w.square.__call__
+
+    async def swap_staff(method, path, *, json=None):
+        result = await original(method, path, json=json)
+        if method == "PUT":
+            booking = w.square.bookings[path.rsplit("/", 1)[-1]]
+            booking["appointment_segments"][0]["team_member_id"] = "TM_SOMEONE_ELSE"
+            return {"booking": copy.deepcopy(booking)}
+        return result
+
+    monkeypatch.setattr(w.adapter.delegate, "_request", swap_staff)
+    await p.says("Can we move it to Thursday at 3 PM instead?")
+    await p.propose(operation="reschedule", requested_start_iso=local(T3), service_description=w.first)
+    heard = await p.says("Yes, go ahead.")
+    assert p.session.entities.get("booking_reconciliation_required")
+    assert not any("all set" in line or "has been moved" in line for line in heard), heard

@@ -90,7 +90,9 @@ class _FakeTransport:
         if path.startswith("/v2/customers/") and method == "PUT":
             return {"customer": {"id": path.rsplit("/", 1)[-1]}}
         if path == "/v2/bookings":
-            return {"booking": self.created_booking}
+            # Like Square, CreateBooking echoes the stored booking: the
+            # requested fields plus the provider's id and status.
+            return {"booking": {**((json or {}).get("booking") or {}), **self.created_booking}}
         raise AssertionError(f"unexpected Square path called: {path}")
 
     def calls_to(self, path: str) -> list[dict]:

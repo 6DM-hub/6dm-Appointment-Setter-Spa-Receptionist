@@ -408,7 +408,8 @@ async def test_create_booking_uses_pinned_service_variation_even_if_recheck_show
         if path == "/v2/customers/search":
             return {"customers": [{"id": "cust_1"}]}
         if path == "/v2/bookings":
-            return {"booking": {"id": "sq_ok", "status": "ACCEPTED"}}
+            # Square echoes the stored booking (requested fields + id/status).
+            return {"booking": {**json["booking"], "id": "sq_ok", "status": "ACCEPTED"}}
         raise AssertionError(path)
 
     monkeypatch.setattr(adapter, "_request", _with_square_location(_request))
@@ -539,7 +540,8 @@ async def test_stage_then_confirm_preserves_the_same_therapist_end_to_end(monkey
         if path == "/v2/customers/search":
             return {"customers": [{"id": "cust_1"}]}
         if path == "/v2/bookings":
-            return {"booking": {"id": "sq_final_booking", "status": "ACCEPTED"}}
+            # Square echoes the stored booking (requested fields + id/status).
+            return {"booking": {**json["booking"], "id": "sq_final_booking", "status": "ACCEPTED"}}
         raise AssertionError(path)
 
     monkeypatch.setattr(adapter.delegate, "_request", _with_square_location(_request))

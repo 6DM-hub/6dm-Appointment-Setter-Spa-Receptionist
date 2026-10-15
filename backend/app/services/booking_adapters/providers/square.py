@@ -2287,6 +2287,16 @@ class SquareAdapter(VerticalProviderAdapter):
             raise BookingProviderError(
                 "Square did not return a booking id"
             )
+        if str(booking.get("status") or "").upper() == "ACCEPTED":
+            if not (
+                booking.get("start_at")
+                and booking.get("appointment_segments")
+                and booking.get("location_id")
+                and booking.get("customer_id")
+            ):
+                # A thin response proves nothing about what Square stored.
+                booking = await self._retrieve_booking(str(booking_id))
+            self._verify_created_booking(booking, payload["booking"])
 
         # Square replays the original CreateBooking response for the same
         # idempotency key, including after that appointment was cancelled.
@@ -2485,8 +2495,20 @@ class SquareAdapter(VerticalProviderAdapter):
         service_change = bool(wanted_variation) and self._segments_differ(
             current_segments, pinned
         )
+        # The caller named a different staff member and the verified slot is
+        # with that person: the change must be written and verified, never
+        # silently dropped by a time-only update that keeps the old assignment.
+        staff_change = bool(
+            wanted_variation
+            and ctx is not None
+            and getattr(ctx, "preferred_staff", None)
+            and pinned.get("team_member_id")
+            and len(current_segments) == 1
+            and str((current_segments[0] or {}).get("team_member_id") or "")
+            != str(pinned.get("team_member_id"))
+        )
 
-        if service_change:
+        if service_change or staff_change:
             if len(current_segments) != 1 or pinned.get("visit_segments"):
                 # A multi-service visit cannot be safely re-shaped segment by
                 # segment from one caller sentence.
@@ -2540,6 +2562,12 @@ class SquareAdapter(VerticalProviderAdapter):
             )
             expected_variations = [wanted_variation]
             expected_team = str(team_member_id)
+            if staff_change:
+                truth(
+                    "RESCHEDULE_STAFF_CHANGE",
+                    provider="square",
+                    external_booking_id=booking_id,
+                )
         else:
             current_start_raw = current.get("start_at")
             if (
@@ -2597,7 +2625,12 @@ class SquareAdapter(VerticalProviderAdapter):
                 str(segment.get("service_variation_id") or "")
                 for segment in current_segments
             ]
-            expected_team = None
+            # A time-only move keeps whoever Square holds; verify it did.
+            expected_team = (
+                str((current_segments[0] or {}).get("team_member_id") or "") or None
+                if len(current_segments) == 1
+                else None
+            )
 
         data = await self._request(
             "PUT",
@@ -2621,9 +2654,7 @@ class SquareAdapter(VerticalProviderAdapter):
                 "booking update"
             )
 
-        if not updated.get("start_at") or (
-            service_change and not updated.get("appointment_segments")
-        ):
+        if not updated.get("start_at") or not updated.get("appointment_segments"):
             # A thin response proves nothing about what Square stored.
             updated = await self._retrieve_booking(booking_id)
 
@@ -2647,6 +2678,57 @@ class SquareAdapter(VerticalProviderAdapter):
             external_id=booking_id,
             service_changed=service_change,
         )
+
+    def _verify_created_booking(self, created: dict[str, Any], requested: dict[str, Any]) -> None:
+        """Raise unless Square stored exactly the booking that was authorized.
+
+        Location, customer, UTC start and every appointment segment (service,
+        team member, and duration when one was requested) must match. A
+        mismatch is an unknown outcome: never reported as the caller's booking.
+        """
+        problems: list[str] = []
+        if str(created.get("location_id") or "") != str(requested.get("location_id") or ""):
+            problems.append("location")
+        if str(created.get("customer_id") or "") != str(requested.get("customer_id") or ""):
+            problems.append("customer")
+        try:
+            same_start = self._parse_square_datetime(
+                str(created.get("start_at") or "")
+            ) == self._parse_square_datetime(str(requested.get("start_at") or ""))
+        except ValueError:
+            same_start = False
+        if not same_start:
+            problems.append("start time")
+        stored = list(created.get("appointment_segments") or [])
+        wanted = list(requested.get("appointment_segments") or [])
+        if len(stored) != len(wanted):
+            problems.append("services")
+        else:
+            for held, asked in zip(stored, wanted):
+                if str(held.get("service_variation_id") or "") != str(asked.get("service_variation_id") or ""):
+                    problems.append("service")
+                if str(held.get("team_member_id") or "") != str(asked.get("team_member_id") or ""):
+                    problems.append("team member")
+                if asked.get("duration_minutes") is not None:
+                    try:
+                        if int(held.get("duration_minutes")) != int(asked["duration_minutes"]):
+                            problems.append("duration")
+                    except (TypeError, ValueError):
+                        problems.append("duration")
+        if problems:
+            problems = list(dict.fromkeys(problems))
+            truth(
+                "BOOKING_CREATE_UNVERIFIED",
+                provider="square",
+                external_booking_id=created.get("id"),
+                mismatched=",".join(problems),
+            )
+            raise BookingProviderError(
+                "Square stored a booking that differs from the one requested ("
+                + ", ".join(problems) + "); it needs staff verification",
+                code="BOOKING_OUTCOME_UNKNOWN",
+                retryable=False,
+            )
 
     @staticmethod
     def _segments_differ(
