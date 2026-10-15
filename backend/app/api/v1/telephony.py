@@ -55,6 +55,7 @@ from app.services.appointment_booking_service import (
     confirm_booking,
     stage_booking,
 )
+from app.services import booking_change_guard as booking_guard
 from app.services.booking_state import (
     contains_unauthorized_availability_claim,
     get_draft,
@@ -63,6 +64,7 @@ from app.services.booking_state import (
     mark_read_back,
     mentions_scheduling,
     record_pure_confirmation,
+    start_new_intent,
     utterance_modifies_booking,
 )
 from app.services.business_hours import resolve_timezone
@@ -209,6 +211,58 @@ def _with_gratuity_reminder(session: CallSession, reply: str, result: object | N
             bool(pending.get("fee_included")),
         )
     return reply
+
+
+def _post_booking_gate(session: CallSession, speech: str, intent, tz) -> tuple[str | None, object | None]:
+    """Protect a booking made earlier on this call (legacy text loop).
+
+    The same shared, industry-neutral rules as the realtime path: "keep it"
+    restores the booking and stages nothing; whether a later request changes
+    the booking or adds another is decided from the caller's words, and an
+    unclear request is asked about first. Returns (fixed reply or None, the
+    intent to stage or None).
+    """
+    if not booking_guard.booking_on_record(session) or not booking_guard.caller_spoke_since_booking(session):
+        return None, intent
+    turn = booking_guard.current_turn(session)
+    if booking_guard.keep_request(session, speech, tz) and (
+        booking_guard.something_pending(session)
+        or booking_guard.after_completed_booking(session, turn)
+    ):
+        return booking_guard.keep_existing_booking(
+            session, tz, turn=turn, call_sid=session.call_sid
+        ), None
+    if (
+        intent is None
+        or intent.intent not in {"schedule", "reschedule"}
+        or not booking_guard.after_completed_booking(session, turn)
+    ):
+        return None, intent
+    args = {
+        "requested_start_iso": getattr(intent, "requested_start_iso", None),
+        "service_description": getattr(intent, "service_description", None),
+        "guest_name": getattr(intent, "guest_name", None),
+        "preferred_staff": getattr(intent, "preferred_staff", None),
+        "earliest": getattr(intent, "earliest", None),
+    }
+    decision = booking_guard.decide(
+        session, speech, model_operation=intent.intent, appointment_id=None,
+        args={k: v for k, v in args.items() if v}, turn=turn, tz=tz, call_sid=session.call_sid,
+    )
+    if decision == "keep":
+        return booking_guard.keep_existing_booking(
+            session, tz, turn=turn, call_sid=session.call_sid
+        ), None
+    if decision in {"ask", "wait"}:
+        return booking_guard.change_question(session, tz), None
+    if decision == "unchanged":
+        return None, None
+    if decision == "additional":
+        start_new_intent(session)
+        booking_guard.mark_additional_booking(session, tz)
+        session.booking_status = "collecting_details"
+        return None, intent.model_copy(update={"intent": "schedule"})
+    return None, intent.model_copy(update={"intent": "reschedule"})
 
 
 def _authoritative_availability_reply(session: CallSession, reply: str) -> str:
@@ -720,7 +774,14 @@ async def voice_respond(
     session.entities["retry_count"] = 0
     turn_started_at = time.perf_counter()
     session.add_turn("user", SpeechResult)
+    if booking_guard.USER_TURN_COUNT in session.entities:
+        # A call that started on the realtime path keeps one turn count.
+        session.entities[booking_guard.USER_TURN_COUNT] = int(
+            session.entities[booking_guard.USER_TURN_COUNT]
+        ) + 1
     _note_gratuity_discussion(session, SpeechResult)
+    tz = resolve_timezone(session.timezone)
+    turn = booking_guard.current_turn(session)
 
     # Structured extraction + booking BEFORE the agent replies.
     #
@@ -750,29 +811,46 @@ async def voice_respond(
         await persist_caller_identity(db, session, intent.caller_name, intent.caller_email)
 
     result = None
-    if intent and intent.intent == "cancel" and intent.confidence >= INTENT_CONFIDENCE_THRESHOLD:
-        result = await cancel_booking(db, session, intent)
-    elif (
+    actionable = bool(
         intent
         and intent.confidence >= INTENT_CONFIDENCE_THRESHOLD
         and intent.intent in ACTIONABLE_INTENTS
-    ):
+    )
+    # A booking made earlier on this call is protected before anything is
+    # staged or confirmed: "keep it" keeps it, unclear requests are asked.
+    guard_reply, guarded_intent = _post_booking_gate(
+        session, SpeechResult, intent if actionable else None, tz
+    )
+    # The change/add/keep question and "it stays as it is" are statements:
+    # they never count as reading a proposal back for a later "yes".
+    guard_statement = guard_reply is not None
+    if intent and intent.intent == "cancel" and intent.confidence >= INTENT_CONFIDENCE_THRESHOLD:
+        if guard_reply is None:
+            result = await cancel_booking(db, session, intent)
+    elif guarded_intent is not None and guard_reply is None:
         # Staging only. The caller naming a date is a request, not consent —
         # booking it here is what produced a row for every date they floated.
-        result = await stage_booking(db, session, intent)
+        result = await stage_booking(db, session, guarded_intent)
 
     # Commit only on an explicit "yes" to details the agent has already read
     # back. Detected from the caller's own words rather than left to the model,
     # so no prompt wording can talk the system into writing early.
     draft = get_draft(session)
     if (
-        caller_affirmed
+        guard_reply is None
+        and caller_affirmed
         and not utterance_modifies_booking(SpeechResult)
         and draft.is_complete
         and draft.read_back
         and record_pure_confirmation(session, SpeechResult)
     ):
-        result = await confirm_booking(db, session)
+        # An additional appointment is only booked after the caller heard
+        # that it IS additional and answered on a later turn.
+        gate = booking_guard.additional_confirm_gate(session, turn)
+        if gate is None:
+            result = await confirm_booking(db, session)
+        elif gate[0] == "speak":
+            guard_reply = gate[1]
 
     if result is not None:
         apply_booking_result(session, result)
@@ -782,7 +860,19 @@ async def voice_respond(
         if result.appointment:
             session.entities["active_appointment_id"] = str(result.appointment.id)
 
-    reply = await grok_service.generate_voice_response(session)
+    if guard_reply is not None:
+        reply = guard_reply
+    else:
+        reply = await grok_service.generate_voice_response(session)
+        additional = booking_guard.additional_marker(session)
+        if (
+            additional is not None
+            and not additional.get("notice_spoken")
+            and result is not None
+            and result.outcome in {BookingOutcome.DRAFT, BookingOutcome.CONFLICT}
+        ):
+            reply = f"{additional['notice']} {reply}"
+            booking_guard.note_additional_notice_spoken(session, turn)
     total_ms = (time.perf_counter() - turn_started_at) * 1000
     logger.info(
         "TURN LATENCY call=%s LLM COMPLETE: %.0f ms TTS FIRST AUDIO: %.0f ms "
@@ -798,7 +888,7 @@ async def voice_respond(
     session.add_turn("assistant", reply)
     # If the agent just recited the details and asked for the go-ahead, the
     # caller's next "yes" is consent to those exact details — and only then.
-    if _asks_for_confirmation(reply):
+    if _asks_for_confirmation(reply) and not guard_statement:
         mark_read_back(session)
     await state.save(session)
 

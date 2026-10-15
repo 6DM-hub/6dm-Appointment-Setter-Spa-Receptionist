@@ -761,7 +761,7 @@ BOOKING_CHANGE_IN_PROGRESS = "booking_change_in_progress"
 
 _ADDITIONAL_REQUEST_RE = re.compile(
     r"\b(?:another|second|additional|one more|also|as well|in addition|separate|"
-    r"extra|new one|both|add(?:ing)?\s+(?:a|an|another|one)|book\s+(?:a|an|another)|"
+    r"extra|a new one|both|add(?:ing)?\s+(?:a|an|another|one)|book\s+(?:a|an|another)|"
     r"for my (?:wife|husband|partner|friend|mom|mum|mother|dad|father|daughter|son|"
     r"sister|brother|boyfriend|girlfriend|colleague)|for (?:him|her|them))\b",
     re.IGNORECASE,
@@ -783,19 +783,24 @@ _MAYBE_MODIFY_RE = re.compile(
 # Answers to the "change it, add another, or keep it as is?" question.
 # "Keep" is NOT a request for anything new: it preserves the booking as it is.
 _ANSWER_KEEP_RE = re.compile(
-    r"\b(?:keep|never ?mind|nevermind|leave (?:it|that|everything)|forget (?:it|that|about it)|"
+    r"\b(?:keep(?:ing)?\s+(?:it|that|this|everything|what i (?:have|had|booked)|my (?:\w+\s+)?(?:appointment|booking|time|slot|reservation|visit|original)|"
+    r"the (?:original|same|appointment|booking|time|slot|reservation|visit|first|one i (?:have|had|booked))|"
+    r"(?:it|that|this) (?:as|the way|like)\b)(?!\s+in\s+mind)(?!\s+posted)|"
+    r"(?:just|please|no,?|ok(?:ay)?,?|i'?ll|i will|i'?d (?:rather|like to)|let'?s|we'?ll)\s+keep(?:\s+it)?\s*[.!]?$|^\s*keep\s*[.!]?$|"
+    r"never ?mind|nevermind|leave (?:it|that|everything)|forget (?:it|that|about it)|"
+    r"d[eé]jalo (?:as[ií]|como est[aá])|no (?:lo )?cambies|olv[ií]dalo|"
     r"as (?:it|that) is|the way (?:it|that) is|as is|stays? the same|the same as before|"
     r"no changes?|don'?t change|do not change|don'?t bother|the original)\b",
     re.IGNORECASE,
 )
 _ANSWER_ADDITIONAL_RE = re.compile(
     r"\b(?:add|adding|another|separate|both|additional|second|also|extra|"
-    r"new (?:one|appointment|booking)|book (?:a|an|another) (?:new|second|separate|additional|extra)?)\b",
+    r"a new one|new (?:appointment|booking)|book (?:a|an|another) (?:new|second|separate|additional|extra)?)\b",
     re.IGNORECASE,
 )
 _ANSWER_MODIFY_RE = re.compile(
     r"\b(?:change|update|modify|replace|move|reschedule|switch|instead|"
-    r"first one|the first|that one)\b",
+    r"first one|the first)\b",
     re.IGNORECASE,
 )
 _NEGATED_CHANGE_RE = re.compile(

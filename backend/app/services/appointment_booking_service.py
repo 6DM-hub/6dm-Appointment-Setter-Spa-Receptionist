@@ -57,6 +57,7 @@ from app.services.booking_state import (
     get_draft,
     intent_key,
     invalidate_booking_proposal,
+    kept_booking_speech,
     proposal_fingerprint,
     recover_caller_name_from_history,
     remember_verified_availability,
@@ -1494,6 +1495,36 @@ async def search_day_part(
     )
 
 
+async def _caller_kept_existing_booking(session: CallSession, routing: _Routing) -> BookingResult | None:
+    """Engine-level backstop: "keep it" after a booking stages nothing.
+
+    Whatever voice path or model produced this request, a caller who has
+    just said "keep it" / "never mind" about a booking made on this call gets
+    that booking back exactly as it is and nothing new is staged.
+    """
+    from app.services import booking_change_guard as guard
+
+    if not (guard.booking_on_record(session) and guard.caller_spoke_since_booking(session)):
+        return None
+    try:
+        tz = await _routing_timezone(routing)
+    except BookingProviderError:
+        tz = timezone.utc
+    if not guard.keep_request(session, guard.last_caller_utterance(session), tz):
+        return None
+    turn = guard.current_turn(session)
+    guard.keep_existing_booking(session, tz, turn=turn)
+    service, booked_iso = guard.booked_details(session)
+    return BookingResult(
+        BookingOutcome.MISSING_INFO,
+        message=(
+            "The caller chose to keep their existing appointment exactly as it is. "
+            "Nothing was changed and nothing new was staged or booked. Tell them: "
+            + kept_booking_speech(service, booked_iso, tz)
+        ),
+    )
+
+
 async def stage_booking(
     db: AsyncSession, session: CallSession, intent: AppointmentIntent, *, test_adapter: BookingAdapter | None = None
 ) -> BookingResult:
@@ -1516,6 +1547,9 @@ async def stage_booking(
         else:
             from app.services.campaign_booking import test_routing
             routing = await test_routing(db, session, test_adapter)
+        kept = await _caller_kept_existing_booking(session, routing)
+        if kept is not None:
+            return kept
         if intent.caller_name or intent.caller_email:
             await persist_caller_identity(
                 db, session, intent.caller_name, intent.caller_email
@@ -1837,6 +1871,27 @@ async def _move_existing(
 
 
 async def confirm_booking(
+    db: AsyncSession, session: CallSession, intent: AppointmentIntent | None = None, *, test_adapter: BookingAdapter | None = None
+) -> BookingResult:
+    """Persist the active draft; see `_confirm_booking`.
+
+    A completed booking or reschedule is recorded for the whole call, on every
+    voice path, so the consent that produced it can never be reused and a
+    later change needs fresh, explicit authorization.
+    """
+    result = await _confirm_booking(db, session, intent, test_adapter=test_adapter)
+    if (
+        result.outcome in {BookingOutcome.BOOKED, BookingOutcome.RESCHEDULED}
+        and result.appointment is not None
+        and get_draft(session).is_persisted
+    ):
+        from app.services import booking_change_guard as guard
+
+        guard.record_booking_completed(session, guard.current_turn(session))
+    return result
+
+
+async def _confirm_booking(
     db: AsyncSession, session: CallSession, intent: AppointmentIntent | None = None, *, test_adapter: BookingAdapter | None = None
 ) -> BookingResult:
     """Persist the active draft. The only path that writes an appointment.

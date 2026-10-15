@@ -114,6 +114,7 @@ from app.services.booking_state import (
     kept_booking_speech,
     BookingDraft,
 )
+from app.services import booking_change_guard as booking_guard
 from app.services.business_hours import resolve_timezone
 from app.services.call_state import (
     CALL_PHASE_GREETING_REQUESTED,
@@ -1129,8 +1130,10 @@ class XAIVoiceSession:
         # this survives across `response_id`s for the whole call: a new
         # response must not, by itself, re-grant permission to probe an
         # exact time the caller never actually stated in a NEW turn.
-        self._user_turn_count = 0
-        self._last_probe_turn_count = 0
+        # The caller-turn counter and the completed-booking turn are stored in
+        # the call session (see the properties below), so a media-stream
+        # reconnect continues the same call state instead of restarting at 0.
+        self._last_probe_turn_count = self._user_turn_count
         # Exact timestamps that have already passed temporal grounding for the
         # caller's CURRENT stated time. This lets a provider/tool retry reuse
         # the same caller-approved instant without requiring the caller to say
@@ -1164,7 +1167,6 @@ class XAIVoiceSession:
         self._tool_dispatch_lock = asyncio.Lock()
         self._hold_ack_played_this_turn = False
         self._hold_ack_index = 0
-        self._booking_completed_turn: int | None = None
 
         self._availability_recent: dict[str, tuple[float, str]] = {}
         self._consultation_catalog_cache: tuple[list[dict[str, Any]], list[dict[str, Any]]] | None = None
@@ -1280,6 +1282,28 @@ class XAIVoiceSession:
         looking it up prefixed silently finds nothing — losing the transcript.
         """
         return xai_call_sid(self.call_id)
+
+    # ------------------------------------------------- persisted call counters
+    @property
+    def _user_turn_count(self) -> int:
+        return int(self.session.entities.get(booking_guard.USER_TURN_COUNT, 0))
+
+    @_user_turn_count.setter
+    def _user_turn_count(self, value: int) -> None:
+        self.session.entities[booking_guard.USER_TURN_COUNT] = int(value)
+
+    @property
+    def _booking_completed_turn(self) -> int | None:
+        return booking_guard.completed_turn(self.session)
+
+    @_booking_completed_turn.setter
+    def _booking_completed_turn(self, value: int | None) -> None:
+        if value is None:
+            self.session.entities.pop(booking_guard.BOOKING_COMPLETED, None)
+        else:
+            # Snapshots the booked state and retires every consent and offer
+            # that produced it, so no later "yes" can reuse them.
+            booking_guard.record_booking_completed(self.session, int(value))
 
     # ------------------------------------------------------------- transcript
     def _flush_caller_turn(self) -> None:
@@ -1806,6 +1830,8 @@ class XAIVoiceSession:
         confirmed a booking but never called ``confirm_appointment``. Once a real
         read-back has been recorded, the state machine—not the LLM—owns the write.
         """
+        if await self._intercept_keep_existing_booking(caller_text):
+            return True
         if await self._handle_confirmation_text_answer(caller_text):
             return True
 
@@ -2017,6 +2043,24 @@ class XAIVoiceSession:
             return True
         if CARD_ON_FILE_POLICY in message:
             await self._explain_card_policy()
+            return True
+        if status == "additional_notice_required" and payload.get("notice"):
+            await self._send_force_message(str(payload["notice"]))
+            return True
+        if status in {"awaiting_confirmation", "kept_existing", "awaiting_enhancement_response"}:
+            # Nothing failed: the caller still has to answer a question.
+            marker = booking_guard.additional_marker(self.session)
+            if status == "awaiting_confirmation" and marker:
+                await self._send_force_message(
+                    f"{marker['notice']} Would you like me to book it?"
+                )
+            return True
+        if status == "missing_info" and "Nothing new was booked" in message:
+            await self._send_force_message(
+                "You already have that exact appointment booked from this call, so "
+                "nothing new was booked. Is this one for someone else, or did you "
+                "mean the appointment you already have?"
+            )
             return True
         logger.error(
             "call %s: backend confirm did not produce an authoritative booking status=%s output=%s",
@@ -2663,190 +2707,97 @@ class XAIVoiceSession:
             )
             args.pop("preferred_staff", None)
 
-    def _after_completed_booking(self, draft: Any) -> bool:
-        """A booking succeeded earlier in this call and this is a later turn."""
-        return bool(
-            draft.is_persisted
-            and self._booking_completed_turn is not None
-            and self._user_turn_count > self._booking_completed_turn
-        )
-
-    def _booked_details(self, current: Any) -> tuple[str | None, str | None]:
-        """(service, start ISO) of what this call actually booked, not the draft.
-
-        The draft may already hold a proposed, unconfirmed change; questions
-        and repeat checks must describe the booking the calendar holds.
-        """
-        identity = (
-            self.session.entities.get(BOOKED_SERVICE_IDENTITIES) or {}
-        ).get(str(current.appointment_id)) or {}
-        service = identity.get("title") or current.service_description
-        booked_iso = identity.get("start") or self.session.confirmed_datetime
-        return service, booked_iso
-
-    def _change_in_progress(self, current: Any) -> bool:
-        """The caller chose to change this booking and that change is not done yet."""
-        marker = self.session.entities.get(BOOKING_CHANGE_IN_PROGRESS) or {}
-        return bool(
-            marker
-            and marker.get("appointment_id") == current.appointment_id
-            and int(marker.get("turn", -1)) > int(self._booking_completed_turn or -1)
-        )
-
-    def _proposal_repeats_booking(self, args: dict[str, Any], current: Any) -> bool:
-        """The proposal restates the BOOKED appointment with nothing new."""
-        if self._change_in_progress(current):
-            return False
-        if args.get("guest_name") or args.get("earliest"):
-            return False
-        if args.get("preferred_staff") and args["preferred_staff"] != current.preferred_staff:
-            return False
-        booked_service, booked_iso = self._booked_details(current)
-        requested = args.get("requested_start_iso")
-        if not requested or not booked_iso:
-            return False
-        if self._time_key(requested) != self._time_key(booked_iso):
-            return False
-        service = str(
-            " + ".join(args.get("requested_services") or [])
-            or args.get("service_description") or ""
-        )
-        return not service or _same_service_family(service, booked_service)
-
-    # Session entities for the keep / additional-appointment rules.
-    _BOOKED_DRAFT_SNAPSHOT = "booked_draft_snapshot"
-    _ADDITIONAL_BOOKING = "additional_booking_pending"
-
-    def _remember_booked_draft(self, current: Any) -> None:
-        """Snapshot the draft as booked, before any later change is staged."""
-        snapshot = self.session.entities.get(self._BOOKED_DRAFT_SNAPSHOT) or {}
-        if (
-            snapshot.get("appointment_id") == current.appointment_id
-            and snapshot.get("turn") == self._booking_completed_turn
-        ):
-            return
-        if self._change_in_progress(current):
-            return  # the draft already holds an unconfirmed change
-        self.session.entities[self._BOOKED_DRAFT_SNAPSHOT] = {
-            "appointment_id": current.appointment_id,
-            "turn": self._booking_completed_turn,
-            "draft": current.to_dict(),
-        }
-
-    def _keep_existing_booking(self, current: Any) -> str:
-        """The caller wants the booking left exactly as it is: undo any staged
-        change, open nothing new, and say so."""
-        self.session.entities.pop(BOOKING_CHANGE_CLARIFICATION, None)
-        self.session.entities.pop(BOOKING_CHANGE_IN_PROGRESS, None)
-        self.session.entities.pop(self._ADDITIONAL_BOOKING, None)
-        snapshot = self.session.entities.get(self._BOOKED_DRAFT_SNAPSHOT) or {}
-        service, booked_iso = self._booked_details(current)
-        if snapshot.get("appointment_id") == current.appointment_id and snapshot.get("draft"):
-            save_draft(self.session, BookingDraft.from_dict(snapshot["draft"]))
-        else:
-            # No clean snapshot: make sure no staged change can be confirmed.
-            invalidate_booking_proposal(self.session, "caller_kept_existing_booking")
-        self.session.booking_status = "booked"
-        truth("BOOKING_KEPT_AS_IS", call_sid=self.call_id, appointment_id=current.appointment_id)
-        return kept_booking_speech(service, booked_iso, self._tz)
-
-    def _mark_additional_booking(self, booked: Any) -> None:
-        """The new intent is an ADDITIONAL appointment; remember what stays booked."""
-        service, booked_iso = self._booked_details(booked)
-        self.session.entities[self._ADDITIONAL_BOOKING] = {
-            "booking_id": get_draft(self.session).booking_id,
-            "notice": additional_booking_notice(service, booked_iso, self._tz),
-            "notice_spoken": False,
-        }
+    # The rules for a booking that already exists on this call live in the
+    # shared, industry-neutral `booking_change_guard`, which the legacy text
+    # loop uses too. These wrappers only supply this session's turn and zone.
+    def _after_completed_booking(self, _draft: Any = None) -> bool:
+        return booking_guard.after_completed_booking(self.session, self._user_turn_count)
 
     def _additional_booking_marker(self) -> dict[str, Any] | None:
-        marker = self.session.entities.get(self._ADDITIONAL_BOOKING) or None
-        draft = get_draft(self.session)
-        if not marker or marker.get("booking_id") != draft.booking_id or draft.is_persisted:
-            return None
-        return marker
+        return booking_guard.additional_marker(self.session)
+
+    def _booking_change_question(self, _current: Any = None) -> str:
+        return booking_guard.change_question(self.session, self._tz)
 
     def _post_booking_decision(
         self,
         model_operation: str,
         appointment_id: str | None,
         args: dict[str, Any],
-        current: Any,
+        _current: Any = None,
     ) -> str:
-        """modify | additional | ask | wait | unchanged, after a booking.
-
-        The caller's words decide. The model's `operation` never overrules
-        them; where the two disagree, or the words are unclear, CARA asks.
-        An answer to that question is read as an answer ("keep it", "update
-        it"), and once the caller chose to change the booking, follow-up
-        adjustments are part of that change rather than a new question.
-        """
-        utterance = self._last_user_utterance() or ""
-        pending = self.session.entities.get(BOOKING_CHANGE_CLARIFICATION) or None
-        if pending and int(pending.get("turn", -1)) == self._user_turn_count:
-            return "wait"  # already asked this turn; do not ask twice
-        self._remember_booked_draft(current)
-        if is_keep_request(utterance):
-            # "Keep it", "never mind", "leave it alone": nothing is changed and
-            # nothing new is proposed, whatever the model sent.
-            truth("BOOKING_CHANGE_INTENT", call_sid=self.call_id, decision="keep",
-                  model_operation=model_operation or "none")
-            return "keep"
-        if pending:
-            kind = classify_change_question_answer(utterance)
-            if kind == "ambiguous":
-                kind = classify_post_booking_request(utterance)
-                if kind == "maybe_modify":
-                    kind = "ambiguous"
-        else:
-            kind = classify_post_booking_request(utterance)
-            if kind != "additional" and self._proposal_repeats_booking(args, current):
-                return "unchanged"
-            if self._change_in_progress(current) and kind != "additional":
-                kind = "modify"
-            elif appointment_id and appointment_id in (current.offered_appointment_ids or []):
-                # The caller picked one of the appointments the backend listed.
-                kind = "modify" if kind != "additional" else "ambiguous"
-            elif kind == "maybe_modify":
-                kind = "modify" if model_operation == "reschedule" else "ambiguous"
-            elif kind == "modify" and model_operation == "schedule":
-                kind = "ambiguous"
-            elif kind == "additional" and model_operation == "reschedule":
-                kind = "ambiguous"
-        if kind == "ambiguous":
-            attempts = int((pending or {}).get("attempts", 0)) + 1
-            self.session.entities[BOOKING_CHANGE_CLARIFICATION] = {
-                "turn": self._user_turn_count,
-                "appointment_id": current.appointment_id,
-                "attempts": attempts,
-            }
-            truth(
-                "BOOKING_CHANGE_CLARIFICATION_ASKED",
-                call_sid=self.call_id,
-                model_operation=model_operation or "none",
-                attempt=attempts,
-            )
-            return "ask"
-        self.session.entities.pop(BOOKING_CHANGE_CLARIFICATION, None)
-        if kind == "modify":
-            self.session.entities[BOOKING_CHANGE_IN_PROGRESS] = {
-                "turn": self._user_turn_count,
-                "appointment_id": current.appointment_id,
-            }
-        else:
-            self.session.entities.pop(BOOKING_CHANGE_IN_PROGRESS, None)
-        truth(
-            "BOOKING_CHANGE_INTENT",
+        return booking_guard.decide(
+            self.session,
+            self._last_user_utterance() or "",
+            model_operation=model_operation,
+            appointment_id=appointment_id,
+            args=args,
+            turn=self._user_turn_count,
+            tz=self._tz,
             call_sid=self.call_id,
-            decision=kind,
-            model_operation=model_operation or "none",
         )
-        return kind
 
-    def _booking_change_question(self, current: Any) -> str:
-        service, booked_iso = self._booked_details(current)
-        attempt = int((self.session.entities.get(BOOKING_CHANGE_CLARIFICATION) or {}).get("attempts", 1))
-        return booking_change_question(service, booked_iso, self._tz, attempt=attempt)
+    def _caller_keeps_booking(self) -> bool:
+        """The caller's latest words keep the booking made on this call."""
+        turn = self._user_turn_count
+        if not booking_guard.booking_on_record(self.session):
+            return False
+        if booking_guard.kept_this_turn(self.session, turn):
+            return True
+        if not (
+            booking_guard.something_pending(self.session)
+            or booking_guard.after_completed_booking(self.session, turn)
+        ):
+            return False
+        return booking_guard.keep_request(self.session, self._last_user_utterance() or "", self._tz)
+
+    def _kept_existing_output(self) -> str:
+        """Tool output for "keep it". The kept line is spoken once per turn."""
+        turn = self._user_turn_count
+        already_spoken = booking_guard.kept_this_turn(self.session, turn)
+        if already_spoken:
+            service, booked_iso = booking_guard.booked_details(self.session)
+            spoken = kept_booking_speech(service, booked_iso, self._tz)
+        else:
+            spoken = booking_guard.keep_existing_booking(
+                self.session, self._tz, turn=turn, call_sid=self.call_id
+            )
+        return json.dumps({
+            "status": "kept_existing",
+            "booked": False,
+            "statement": True,
+            "already_spoken": already_spoken,
+            "spoken": spoken,
+            "message": (
+                "The caller chose to keep the existing appointment exactly as it "
+                "is. Nothing was changed, nothing new was proposed or booked."
+                + (" They have already been told; say nothing more about it." if already_spoken else "")
+            ),
+        })
+
+    async def _intercept_keep_existing_booking(self, caller_text: str) -> bool:
+        """"Keep it" / "never mind" while a change or extra booking is pending.
+
+        Handled by the backend before any model turn or auto-confirmation,
+        so the pending change can never be confirmed by a later "yes".
+        """
+        if not booking_guard.booking_on_record(self.session):
+            return False
+        if not booking_guard.something_pending(self.session):
+            return False
+        if not booking_guard.keep_request(self.session, caller_text, self._tz):
+            return False
+        speech = booking_guard.keep_existing_booking(
+            self.session, self._tz, turn=self._user_turn_count, call_sid=self.call_id
+        )
+        self._cancel_confirmation_wait()
+        await self._cancel_active_response()
+        self._response_needed_after_tool = False
+        self._restricted_response_needed_after_tool = False
+        self._pending_forced_tool_message = None
+        await self._send_force_message(speech)
+        await self._persist_session()
+        return True
 
     async def _run_propose_appointment(self, raw_arguments: str) -> str:
         """Stage a new booking or move an explicitly selected existing one."""
@@ -2870,6 +2821,10 @@ class XAIVoiceSession:
             )
 
         current_before_proposal = get_draft(self.session)
+        if self._caller_keeps_booking():
+            output = self._kept_existing_output()
+            await self._persist_session()
+            return output
         if self._after_completed_booking(current_before_proposal):
             # A booking already succeeded on this call. Whether this request
             # CHANGES it or ADDS another appointment is decided from the
@@ -2889,17 +2844,9 @@ class XAIVoiceSession:
                     ),
                 })
             if decision == "keep":
-                spoken = self._keep_existing_booking(current_before_proposal)
+                output = self._kept_existing_output()
                 await self._persist_session()
-                return json.dumps({
-                    "status": "kept_existing",
-                    "booked": False,
-                    "spoken": spoken,
-                    "message": (
-                        "The caller chose to keep the existing appointment exactly as it "
-                        "is. Nothing was changed, nothing new was proposed or booked."
-                    ),
-                })
+                return output
             if decision == "wait":
                 return json.dumps({
                     "status": "awaiting_clarification",
@@ -2916,6 +2863,7 @@ class XAIVoiceSession:
                 return json.dumps({
                     "status": "needs_clarification",
                     "booked": False,
+                    "statement": True,
                     "spoken": self._booking_change_question(current_before_proposal),
                     "message": (
                         "Nothing was changed. Wait for the caller to say whether to "
@@ -2929,9 +2877,8 @@ class XAIVoiceSession:
         ):
             # The caller explicitly asked for an ADDITIONAL appointment. Open a
             # separate intent so the first booking is never adopted and moved.
-            booked_before = current_before_proposal
             start_new_intent(self.session)
-            self._mark_additional_booking(booked_before)
+            booking_guard.mark_additional_booking(self.session, self._tz)
             self._grounded_exact_times.clear()
             self.session.booking_status = "collecting_details"
             self._awaiting_wrap_up = False
@@ -3084,12 +3031,11 @@ class XAIVoiceSession:
         additional = self._additional_booking_marker()
         if spoken and additional:
             # The caller must hear that this is a SECOND appointment before any
-            # confirmation question about it.
+            # confirmation question about it, including when the requested time
+            # was taken and alternatives are offered instead.
             spoken = f"{additional['notice']} {spoken}"
-            if result.outcome is BookingOutcome.DRAFT:
-                additional["notice_spoken"] = True
-                additional["notice_turn"] = self._user_turn_count
-                await self._persist_session()
+            booking_guard.note_additional_notice_spoken(self.session, self._user_turn_count)
+            await self._persist_session()
         message = result.message
         if spoken:
             message = (
@@ -3110,33 +3056,39 @@ class XAIVoiceSession:
         if enhancement_pending(self.session):
             return json.dumps({"status": "awaiting_enhancement_response", "booked": False})
         """Commit the pending request. Idempotent; the only tool that writes."""
-        additional = self._additional_booking_marker()
-        if additional is not None:
-            # An additional appointment is confirmed only after the caller has
-            # heard that it IS additional, and answered on a later turn.
-            if not additional.get("notice_spoken"):
-                additional["notice_spoken"] = True
-                additional["notice_turn"] = self._user_turn_count
-                await self._persist_session()
+        if booking_guard.kept_this_turn(self.session, self._user_turn_count):
+            return json.dumps({
+                "status": "kept_existing",
+                "booked": False,
+                "message": (
+                    "The caller just chose to keep their existing appointment as it is. "
+                    "There is nothing to confirm. Do not book or change anything."
+                ),
+            })
+        # An additional appointment is confirmed only after the caller has
+        # heard that it IS additional, and answered on a later turn.
+        gate = booking_guard.additional_confirm_gate(self.session, self._user_turn_count)
+        if gate is not None:
+            await self._persist_session()
+            if gate[0] == "speak":
                 truth("ADDITIONAL_BOOKING_NOTICE", call_sid=self.call_id, via="confirm")
                 return json.dumps({
                     "status": "additional_notice_required",
                     "booked": False,
-                    "notice": f"{additional['notice']} Would you like me to book it?",
+                    "notice": gate[1],
                     "message": (
                         "Not booked. The caller is being told this is an additional "
                         "appointment. Wait for their answer before confirming."
                     ),
                 })
-            if self._user_turn_count <= int(additional.get("notice_turn") or -1):
-                return json.dumps({
-                    "status": "awaiting_confirmation",
-                    "booked": False,
-                    "message": (
-                        "Not booked. The caller was just told this is an additional "
-                        "appointment. Wait for their answer before confirming."
-                    ),
-                })
+            return json.dumps({
+                "status": "awaiting_confirmation",
+                "booked": False,
+                "message": (
+                    "Not booked. The caller was just told this is an additional "
+                    "appointment. Wait for their answer before confirming."
+                ),
+            })
         draft = get_draft(self.session)
         last = self._last_user_utterance() or ""
         already_booked = draft.is_persisted and self.session.booking_status in {
@@ -3176,7 +3128,14 @@ class XAIVoiceSession:
                         f"and do not paraphrase it: {line}"
                     ),
                 })
-            if utterance_modifies_booking(last):
+            # Picking one of the exact provider-offered times ("5 PM works") is
+            # bound and authorized by the backend for THIS revision; it is the
+            # caller's consent, not a further change.
+            already_authorized = (
+                draft.confirmation_authorized
+                and self.session.entities.get("caller_confirmed_revision") == draft.draft_revision
+            )
+            if utterance_modifies_booking(last) and not already_authorized:
                 return json.dumps({
                     "status": "rejected",
                     "booked": False,
@@ -3186,10 +3145,6 @@ class XAIVoiceSession:
                         "read the new details back, and wait for a new confirmation."
                     ),
                 })
-            already_authorized = (
-                draft.confirmation_authorized
-                and self.session.entities.get("caller_confirmed_revision") == draft.draft_revision
-            )
             if not already_authorized and not record_pure_confirmation(self.session, last):
                 return json.dumps({
                     "status": "rejected",
@@ -3430,21 +3385,18 @@ class XAIVoiceSession:
     async def _run_start_new_appointment(self, _raw_arguments: str = "") -> str:
         """Open a second, explicitly requested booking intent."""
         current = get_draft(self.session)
+        if self._caller_keeps_booking():
+            output = self._kept_existing_output()
+            await self._persist_session()
+            return output
         if self._after_completed_booking(current):
             # Starting a second appointment is the model's claim that the
             # caller asked for one. The caller's words must agree.
             decision = self._post_booking_decision("schedule", None, {}, current)
             if decision == "keep":
-                speech = self._keep_existing_booking(current)
+                output = self._kept_existing_output()
                 await self._persist_session()
-                return json.dumps({
-                    "status": "kept_existing",
-                    "booked": False,
-                    "message": (
-                        "Nothing was started, changed or booked. The caller is keeping "
-                        "their existing appointment. Tell them exactly: " + speech
-                    ),
-                })
+                return output
             if decision == "modify":
                 return json.dumps({
                     "status": "modify_existing",
@@ -3460,15 +3412,18 @@ class XAIVoiceSession:
                 return json.dumps({
                     "status": "needs_clarification",
                     "booked": False,
+                    "statement": True,
+                    "spoken": self._booking_change_question(current) if decision == "ask" else None,
                     "message": (
-                        "Nothing was started. Ask the caller exactly this and wait for "
-                        "the answer: " + self._booking_change_question(current)
+                        "Nothing was started or changed. The caller is being asked whether "
+                        "to change the existing appointment, add another, or keep it as "
+                        "is. Wait for the answer."
                     ),
                 })
-        booked_before = current if self._after_completed_booking(current) else None
+        booked_before = self._after_completed_booking(current)
         start_new_intent(self.session)
-        if booked_before is not None:
-            self._mark_additional_booking(booked_before)
+        if booked_before:
+            booking_guard.mark_additional_booking(self.session, self._tz)
         self._grounded_exact_times.clear()
         self._clear_caller_requested_date()
         self.session.entities.pop("caller_grounded_service_durations", None)
@@ -6639,6 +6594,18 @@ class XAIVoiceSession:
             )
             return
 
+        if name in {
+            CHECK_AVAILABILITY_TOOL["name"],
+            PROPOSE_APPOINTMENT_TOOL["name"],
+            NEW_APPOINTMENT_TOOL["name"],
+        } and self._caller_keeps_booking():
+            # The caller is keeping the booking made on this call: nothing is
+            # looked up, proposed or opened, whatever the model asked for.
+            async with self._tool_dispatch_lock:
+                output = self._kept_existing_output()
+            await self._deliver_statement(call_ref, output, self._tool_statement(PROPOSE_APPOINTMENT_TOOL["name"], output) or "")
+            return
+
         if name == PROPOSE_APPOINTMENT_TOOL["name"]:
             try:
                 proposal = json.loads(raw_args or "{}")
@@ -6972,6 +6939,11 @@ class XAIVoiceSession:
         else:
             output = await self._invoke_tool_with_hold(name, handler, raw_args)
 
+        statement = self._tool_statement(name, output)
+        if statement is not None:
+            await self._deliver_statement(call_ref, output, statement)
+            return
+
         if name == CHECK_AVAILABILITY_TOOL["name"] or (
             name == PROPOSE_APPOINTMENT_TOOL["name"]
             and '"spoken":' in output
@@ -7037,6 +7009,37 @@ class XAIVoiceSession:
         # but only after the response that requested the tool has closed.
         await self._send_function_output(call_ref, output)
 
+    def _tool_statement(self, name: str, output: str) -> str | None:
+        """A backend line to say verbatim ("" = already said), or None.
+
+        Statements (the change/add/keep question, "your booking stays as it
+        is") are not availability offers: they must never arm an offer, be
+        treated as consent, or trigger an automatic confirmation.
+        """
+        if name not in {PROPOSE_APPOINTMENT_TOOL["name"], NEW_APPOINTMENT_TOOL["name"]}:
+            return None
+        try:
+            payload = json.loads(output)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict) or not payload.get("statement"):
+            return None
+        if payload.get("already_spoken"):
+            return ""
+        return str(payload.get("spoken") or "")
+
+    async def _deliver_statement(self, call_ref: str | None, output: str, line: str) -> None:
+        await self._send_function_output(call_ref, output, nudge=False)
+        self._response_needed_after_tool = False
+        self._restricted_response_needed_after_tool = False
+        self._pending_forced_tool_message = None
+        await self._persist_session()
+        if not line:
+            return
+        if self._active_response_id is not None:
+            await self._cancel_active_response()
+        await self._send_force_message(line)
+
     # ------------------------------------------------------------ event loop
     async def _dispatch(self, event: dict[str, Any]) -> None:
         etype = event.get("type", "")
@@ -7081,6 +7084,8 @@ class XAIVoiceSession:
                         source="caller_transcript",
                     )
             self._flush_caller_turn()
+            if caller_text and await self._intercept_keep_existing_booking(caller_text):
+                return
             if caller_text and capture_caller_name_answer(self.session, caller_text):
                 self._caller_name_question_sent = False
                 draft = get_draft(self.session)
