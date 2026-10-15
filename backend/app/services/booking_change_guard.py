@@ -495,3 +495,38 @@ def refused_cancellation_speech(session: Any, tz: Any) -> str:
         "No problem, I haven't cancelled anything. Your appointment stays as it is. "
         "Is there anything else I can help you with?"
     )
+
+
+# --------------------------------------------------------------------------- #
+# A refused offer is gone
+# --------------------------------------------------------------------------- #
+def offer_is_live(session: Any) -> bool:
+    """Something was offered or read back and is still waiting for an answer."""
+    draft = get_draft(session)
+    if draft.is_persisted and getattr(session, "booking_status", None) in {"booked", "rescheduled"}:
+        return False
+    return bool(
+        session.entities.get("spoken_booking_offer")
+        or session.entities.get("accepted_booking_offer")
+        or session.entities.get("spoken_booking_choices")
+        or draft.read_back
+    )
+
+
+def retire_refused_offer(session: Any, tz: Any, *, turn: int, call_sid: str | None = None) -> bool:
+    """The caller said no to what was offered: withdraw it and every consent.
+
+    A later "yes" (to an address question, say) can then never book it. For a
+    change to an existing booking, the booking is restored exactly as it is.
+    Returns True when something was withdrawn.
+    """
+    if not offer_is_live(session):
+        return False
+    if booking_on_record(session) and something_pending(session):
+        keep_existing_booking(session, tz, turn=turn, call_sid=call_sid)
+    else:
+        invalidate_booking_proposal(session, "caller_refused_offer")
+    for key in _STALE_OFFER_KEYS:
+        session.entities.pop(key, None)
+    truth("BOOKING_OFFER_REFUSED", call_sid=call_sid)
+    return True

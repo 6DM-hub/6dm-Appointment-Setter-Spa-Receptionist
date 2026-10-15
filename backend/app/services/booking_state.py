@@ -253,12 +253,77 @@ def is_affirmative(utterance: str | None) -> bool:
         return False
     if text in _AFFIRMATIVE:
         return True
-    words = text.split()
-    if len(words) <= 8:
-        for phrase in _ENGLISH_AFFIRMATIVE:
-            if text.startswith(phrase + " ") or text == phrase:
-                return True
+    # "Yes" followed by anything other than courtesy or consent wording is not
+    # agreement to the booking: "yes, where are you located?", "yes, I can
+    # hear you" and "yes, Deep Cleaning" all say something else. Only the
+    # words that cannot change or redirect the decision may follow.
+    for phrase in sorted(_ENGLISH_AFFIRMATIVE, key=len, reverse=True):
+        if text.startswith(phrase + " "):
+            leftover = text[len(phrase):].split()
+            return bool(leftover) and len(leftover) <= 8 and all(
+                word in _CONSENT_FOLLOW_UP for word in leftover
+            )
     return False
+
+
+# Words that may follow "yes" without changing what the caller agreed to.
+_CONSENT_FOLLOW_UP = _CONFIRMATION_FILLER | {
+    "so", "much", "lovely", "wonderful", "awesome", "cool", "dear", "sir",
+    "maam", "ma'am", "please", "thankyou", "very", "is", "would", "be",
+    "sounds", "great", "good", "perfect", "ok", "okay", "yes",
+}
+
+# A question CARA asks about the booking itself. A plain "yes" answers the
+# booking only when CARA's last question was one of these.
+_BOOKING_QUESTION_RE = re.compile(
+    r"\b(?:book|booking|reserve|confirm|schedule|move|reschedul\w*|appointment|"
+    r"go ahead|lock (?:it|that) in|work(?:s)? for you|sound(?:s)? good|"
+    r"shall i|should i|want me to|like me to|that time|this time|"
+    r"is that (?:right|correct))\b",
+    re.IGNORECASE,
+)
+_REFUSAL_START_RE = re.compile(r"^(?:no|nope|nah|not|don'?t|do not|never)\b")
+
+
+def answering_unrelated_question(session: Any) -> bool:
+    """CARA's most recent question before this caller turn was not about the booking.
+
+    "Would you like our address?" -> "Yes." is an answer to the address
+    question, never consent to an earlier booking offer.
+    """
+    history = list(getattr(session, "history", None) or [])
+    seen_caller = False
+    for turn in reversed(history):
+        role = turn.get("role")
+        if role == "user":
+            if seen_caller:
+                return False
+            seen_caller = True
+            continue
+        if role == "assistant" and seen_caller:
+            text = str(turn.get("content") or "").strip()
+            if not text.endswith("?"):
+                return False
+            return not _BOOKING_QUESTION_RE.search(text)
+    return False
+
+
+def is_booking_consent(session: Any, utterance: str | None) -> bool:
+    """Plain agreement that answers CARA's question about this booking."""
+    return is_affirmative(utterance) and not answering_unrelated_question(session)
+
+
+def refuses_offer(utterance: str | None) -> bool:
+    """The caller turns down what was just offered ("no", "no, don't book that")."""
+    text = _normalize(utterance or "")
+    if not text:
+        return False
+    if text in _NEGATIVE:
+        return True
+    if not _REFUSAL_START_RE.match(text):
+        return False
+    # "No, Tuesday instead" is a change, handled as a new request.
+    return not _BOOKING_FIELD_MODIFICATION.search(text)
 
 
 def is_negative(utterance: str | None) -> bool:
@@ -1024,6 +1089,9 @@ def record_pure_confirmation(session: Any, utterance: str | None = None) -> bool
     draft = get_draft(session)
     if utterance is not None and not is_affirmative(utterance):
         truth("CONFIRMATION_REJECTED", reason="modification_present", utterance=utterance)
+        return False
+    if utterance is not None and answering_unrelated_question(session):
+        truth("CONFIRMATION_REJECTED", reason="answer_to_unrelated_question", utterance=utterance)
         return False
     if caller_name_required_for(draft) and not supplied_caller_name(draft):
         truth("CALLER_NAME_REQUIRED")

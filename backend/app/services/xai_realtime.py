@@ -99,6 +99,8 @@ from app.services.booking_state import (
     proposal_fingerprint,
     record_pure_confirmation,
     recover_caller_name_from_history,
+    is_booking_consent,
+    refuses_offer,
     save_draft,
     start_new_intent,
     supplied_caller_name,
@@ -1962,7 +1964,7 @@ class XAIVoiceSession:
                             await self._send_force_message(suggestion)
                             return True
                         accept_offer(self.session)
-            elif is_affirmative(caller_text):
+            elif is_booking_consent(self.session, caller_text):
                 accept_offer(self.session)
         accepted = offer_accepted(self.session)
         if (
@@ -1972,7 +1974,17 @@ class XAIVoiceSession:
         ):
             await self._send_force_message(CARD_ON_FILE_HESITANT)
             return True
-        if not selected_now and (utterance_modifies_booking(caller_text) or not is_affirmative(caller_text)):
+        if not selected_now and refuses_offer(caller_text):
+            # "No" / "no, don't book that": the offer and every consent for it
+            # are withdrawn, so no later yes can book it.
+            booking_guard.retire_refused_offer(
+                self.session, self._tz, turn=self._user_turn_count, call_sid=self.call_id
+            )
+            return False
+        if not selected_now and (
+            utterance_modifies_booking(caller_text)
+            or not is_booking_consent(self.session, caller_text)
+        ):
             if accepted and utterance_modifies_booking(caller_text):
                 from app.services.booking_state import consume_confirmation_authorization
                 self.session.entities.pop("accepted_booking_offer", None)

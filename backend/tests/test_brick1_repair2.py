@@ -142,3 +142,91 @@ async def test_cancel_authorization_does_not_carry_into_a_new_call(monkeypatch):
     monkeypatch.setattr(engine, "_find_upcoming_appointments", upcoming)
     await c.says("Yes.", intent=_intent("cancel", T2, w.first))
     assert not cancels(w) and c.starts() == [Z2]
+
+
+# --------------------------------------------------------------------------- #
+# F2 / F3 / F7: consent must answer the booking question, and only that
+# --------------------------------------------------------------------------- #
+async def _offered(world):
+    p = Phone(world)
+    await p.says(f"A {world.first} Thursday at 2 PM. My name is Ada Lovelace.")
+    out = await p.propose(operation="schedule", requested_start_iso=local(T2),
+                          service_description=world.first, caller_name="Ada Lovelace")
+    assert out["status"] == "draft", out
+    return p
+
+
+@pytest.mark.parametrize("consent", [
+    "Yes.", "Yes please.", "Yes, please book it.", "Yeah, that works for me, thanks.",
+    "Yes, that sounds great, thank you so much.", "Okay, go ahead.",
+])
+async def test_real_consent_still_books(monkeypatch, consent):
+    w = make_world(monkeypatch)
+    p = await _offered(w)
+    await p.says(consent)
+    assert p.starts() == [Z2] and len(w.square.creates) == 1, (consent, p.heard)
+
+
+@pytest.mark.parametrize("utterance", [
+    "Yes, what's the cancellation policy?", "Yes, is there parking?", "Yes, hold on a second.",
+    "Yeah, I'm driving right now.", "Sure, what do I need to bring?",
+])
+async def test_yes_followed_by_something_else_is_not_consent(monkeypatch, utterance):
+    w = make_world(monkeypatch)
+    p = await _offered(w)
+    await p.says(utterance)
+    await p.tool("confirm_appointment")
+    assert not w.square.creates, (utterance, p.heard)
+
+
+async def test_bare_yes_to_an_unrelated_question_is_not_consent(monkeypatch):
+    w = make_world(monkeypatch)
+    p = await _offered(w)
+    p.session.add_turn("assistant", "Would you like our address?")
+    await p.says("Yes.")
+    await p.tool("confirm_appointment")
+    assert not w.square.creates
+    # Asked about the booking again, the same "yes" books it.
+    p.session.add_turn("assistant", "Would you like me to book Thursday at 2 PM?")
+    await p.says("Yes, please.")
+    assert p.starts() == [Z2] and len(w.square.creates) == 1
+
+
+async def test_refused_offer_can_be_offered_again_and_booked(monkeypatch):
+    w = make_world(monkeypatch)
+    p = await _offered(w)
+    await p.says("No, don't book that.")
+    await p.says("Yes.")
+    await p.tool("confirm_appointment")
+    assert not w.square.creates
+    # The caller changes their mind: a fresh offer is checked, read back and confirmed.
+    await p.says(f"Actually, could I get the {w.first} Thursday at 2 PM after all?")
+    out = await p.propose(operation="schedule", requested_start_iso=local(T2),
+                          service_description=w.first, caller_name="Ada Lovelace")
+    assert out["status"] == "draft" and out["spoken"], out
+    await p.says("Yes, please.")
+    assert p.starts() == [Z2] and len(w.square.creates) == 1
+
+
+async def test_legacy_refused_offer_then_yes_to_another_question_books_nothing(monkeypatch):
+    w = make_world(monkeypatch)
+    c = LegacyCall(w, monkeypatch)
+    await c.says(f"A {w.first} Thursday at 2 PM, I'm Ada Lovelace.",
+                 intent=_intent("schedule", T2, w.first),
+                 reply="Thursday at 2 PM is available. Would you like me to book that?")
+    await c.says("No, don't book that.", reply="Okay. Would you like our address?")
+    await c.says("Yes.", reply="We're at 1 Main Street.")
+    assert not w.square.creates
+
+
+@pytest.mark.parametrize("business", ["spa", "hvac", "dental"])
+async def test_service_correction_books_the_corrected_service_after_fresh_consent(monkeypatch, business):
+    w = make_world(monkeypatch, business)
+    p = await _offered(w)
+    await p.says(f"Yes, {w.second}.")
+    assert not w.square.creates
+    out = await p.propose(operation="schedule", requested_start_iso=local(T2),
+                          service_description=w.second, caller_name="Ada Lovelace")
+    assert out["status"] == "draft", out
+    await p.says("Yes, please.")
+    assert p.variations() == [w.second_var] and len(w.square.creates) == 1

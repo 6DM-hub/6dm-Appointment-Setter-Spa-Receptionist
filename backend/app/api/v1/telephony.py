@@ -65,6 +65,7 @@ from app.services.booking_state import (
     mark_read_back,
     mentions_scheduling,
     record_pure_confirmation,
+    refuses_offer,
     start_new_intent,
     utterance_modifies_booking,
 )
@@ -836,6 +837,11 @@ async def voice_respond(
         # Staging only. The caller naming a date is a request, not consent —
         # booking it here is what produced a row for every date they floated.
         result = await stage_booking(db, session, guarded_intent)
+
+    # "No" / "no, don't book that" withdraws what was offered and every consent
+    # for it, so no later yes (to another question) can book it.
+    if guard_reply is None and refuses_offer(SpeechResult):
+        booking_guard.retire_refused_offer(session, tz, turn=turn, call_sid=CallSid)
 
     # Commit only on an explicit "yes" to details the agent has already read
     # back. Detected from the caller's own words rather than left to the model,

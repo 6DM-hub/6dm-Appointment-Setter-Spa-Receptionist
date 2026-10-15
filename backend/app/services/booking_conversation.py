@@ -31,4 +31,6 @@ def authorize_accepted_offer(session):
     if not offer_accepted(session):
         return False
     mark_read_back(session)
-    return record_pure_confirmation(session, "yes")
+    # Consent was given when the offer was accepted (accept_offer); this
+    # only promotes it once identity is complete.
+    return record_pure_confirmation(session)
