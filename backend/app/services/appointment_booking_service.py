@@ -35,6 +35,7 @@ from app.core.tenancy import TenantScope, scope_columns, scope_filter
 from app.models import Appointment, AppointmentStatus, CallLog, Contact, SpaAccount
 from app.services.booking_escalations import unresolved_booking as _unresolved_booking
 from app.services.booking_escalations import (
+    ChangeInFlight as _ChangeInFlight,
     close_change_fence as _close_change_fence,
     mark_change_unknown as _mark_change_unknown,
     open_change_fence as _open_change_fence,
@@ -1801,6 +1802,10 @@ _FENCE_UNAVAILABLE = (
     "I cannot safely change this appointment right now, so nothing was changed. "
     "Apologize and offer to have a staff member call the caller back."
 )
+_CHANGE_IN_FLIGHT = (
+    "An earlier change to this appointment needs staff verification before another "
+    "change. May a staff member call you to help?"
+)
 
 
 def _fence_of(pending: dict | None):
@@ -1813,31 +1818,36 @@ def _fence_of(pending: dict | None):
 async def _begin_provider_change(
     db: AsyncSession, session: CallSession, operation: str, existing: Appointment, *,
     to_start: datetime | None = None, service: str | None = None,
-) -> bool:
+) -> str | None:
     """Record a change before it is sent: in the call session AND durably.
 
     The durable (write-ahead) record is committed on its own connection, so
     it survives a rollback, a lost response or a worker that dies mid-write,
-    without committing or unlocking this request's transaction. If it cannot
-    be written, nothing is sent (False).
+    without committing or unlocking this request's transaction. Returns None
+    when the change may be sent, otherwise what to tell the caller; nothing
+    is sent then.
     """
     _note_pending_mutation(session, operation, existing, to_start=to_start, service=service)
     if not existing.external_booking_id:
-        return True   # CARA-only appointment: no external write to fence
+        return None   # CARA-only appointment: no external write to fence
     pending = session.entities[PENDING_PROVIDER_MUTATION]
     try:
         fence_id = await asyncio.wait_for(
             _open_change_fence(db, _tenant_uuid(session), session.call_sid, pending),
             timeout=FENCE_TIMEOUT_SECONDS,
         )
+    except _ChangeInFlight:
+        truth("CHANGE_BLOCKED_IN_FLIGHT", call_sid=session.call_sid, operation=operation)
+        session.entities.pop(PENDING_PROVIDER_MUTATION, None)
+        return _CHANGE_IN_FLIGHT
     except Exception:
         logger.exception("Could not record a change before sending it: call_sid=%s", session.call_sid)
         truth("CHANGE_FENCE_NOT_RECORDED", call_sid=session.call_sid, operation=operation)
         session.entities.pop(PENDING_PROVIDER_MUTATION, None)
-        return False
+        return _FENCE_UNAVAILABLE
     if fence_id:
         pending["fence_id"] = str(fence_id)
-    return True
+    return None
 
 
 async def _settle_provider_change(db: AsyncSession, session: CallSession, *, in_transaction: bool) -> None:
@@ -1980,10 +1990,11 @@ async def _move_existing(
             routing.adapter, session, _draft_intent(draft), start, end,
             selected_slot=draft.selected_slot,
         )
-    if not await _begin_provider_change(
+    refused = await _begin_provider_change(
         db, session, "move", existing, to_start=start, service=draft.service_description,
-    ):
-        return BookingResult(BookingOutcome.ERROR, message=_FENCE_UNAVAILABLE)
+    )
+    if refused:
+        return BookingResult(BookingOutcome.ERROR, message=refused)
     if mode == "provider" and (service_change or provider_compares):
         move_call = routing.adapter.move_booking(external_booking_of(existing), start, end, ctx=ctx)
     else:
@@ -2707,6 +2718,12 @@ async def apply_staff_change(
         fence_id = await asyncio.wait_for(
             _open_change_fence(db, scope.tenant_id, "staff", record), timeout=FENCE_TIMEOUT_SECONDS,
         )
+    except _ChangeInFlight as exc:
+        raise StaffChangeRefused(
+            409,
+            "Another change to this appointment is in progress or has an unknown outcome. "
+            "Check it in the calendar and resolve the staff alert before changing it again.",
+        ) from exc
     except Exception as exc:
         logger.exception("Could not record a dashboard change before sending it: %s", appointment.id)
         truth("CHANGE_FENCE_NOT_RECORDED", appointment_id=str(appointment.id), operation=operation)
@@ -2959,8 +2976,9 @@ async def cancel_booking(
         session.entities.pop(guard.PENDING_CANCELLATION, None)
         await _lock_call(db, session.call_sid)
         await _lock_slot(db, routing.scope, existing.start_time, existing.end_time)
-        if not await _begin_provider_change(db, session, "cancel", existing):
-            return BookingResult(BookingOutcome.ERROR, message=_FENCE_UNAVAILABLE)
+        refused = await _begin_provider_change(db, session, "cancel", existing)
+        if refused:
+            return BookingResult(BookingOutcome.ERROR, message=refused)
         try:
             if existing.external_booking_id:
                 await _calendar_call(

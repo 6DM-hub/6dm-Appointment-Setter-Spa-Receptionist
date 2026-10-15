@@ -3,7 +3,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 from fastapi import HTTPException
@@ -271,12 +271,31 @@ async def _own_transaction(db):
         yield fence_db
 
 
+class ChangeInFlight(Exception):
+    """Another change of this appointment is in flight or unresolved."""
+
+
 async def open_change_fence(db, tenant_id, call_reference, details):
-    """Durably record a provider change before it is sent; returns its id."""
+    """Durably record a provider change before it is sent; returns its id.
+
+    Exclusive per appointment: while one change is in flight or unresolved,
+    opening another raises ChangeInFlight, so two requests (two calls, two
+    dashboard users, a call and the dashboard) can never both send a change
+    of the same appointment.
+    """
     if not tenant_id or not details.get("appointment_id"):
         return None
-    reference = f"change:{details['appointment_id']}:{uuid.uuid4().hex[:12]}:{call_reference}"[:128]
+    appointment_id = str(details["appointment_id"])
+    reference = f"change:{appointment_id}:{uuid.uuid4().hex[:12]}:{call_reference}"[:128]
     async with _own_transaction(db) as fence_db:
+        if fence_db.bind is not None and fence_db.bind.dialect.name == "postgresql":
+            # Serialize the check-then-insert for this one appointment.
+            await fence_db.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                {"key": f"change-fence:{tenant_id}:{appointment_id}"},
+            )
+        if await unresolved_change_for(fence_db, tenant_id, appointment_id) is not None:
+            raise ChangeInFlight(appointment_id)
         row = BookingEscalation(
             tenant_id=tenant_id, call_reference=reference, status="pending", priority="urgent",
             category=UNRESOLVED_CHANGE,

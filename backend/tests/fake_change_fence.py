@@ -12,7 +12,11 @@ import uuid
 
 
 def install(monkeypatch, svc, unresolved: list) -> None:
+    from app.services.booking_escalations import ChangeInFlight
+
     async def _open(_db, tenant_id, call_reference, details):
+        if any(str(row.get("appointment_id")) == str(details.get("appointment_id")) for row in unresolved):
+            raise ChangeInFlight(details.get("appointment_id"))   # exclusive, as the real fence
         fence_id = uuid.uuid4()
         unresolved.append({"fence_id": str(fence_id), "tenant_id": tenant_id,
                            "call_reference": call_reference, "stage": "in_flight", **details})

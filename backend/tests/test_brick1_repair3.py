@@ -282,3 +282,16 @@ async def test_interrupted_fence_is_promoted_to_a_staff_alert(rubyz_db):
     assert await promote_stale_change_fences(db, older_than=timedelta(0))  # now stale
     [row] = await _escalations(db)
     assert row.details["stage"] == "interrupted" and row.delivery_status == "pending"
+
+
+async def test_fence_is_exclusive_per_appointment(rubyz_db):
+    from app.services.booking_escalations import (
+        ChangeInFlight, close_change_fence, open_change_fence,
+    )
+    db, spa = rubyz_db
+    first = await open_change_fence(db, spa.id, "call-1", {"appointment_id": "a-1"})
+    with pytest.raises(ChangeInFlight):
+        await open_change_fence(db, spa.id, "call-2", {"appointment_id": "a-1"})
+    assert await open_change_fence(db, spa.id, "call-3", {"appointment_id": "a-2"})  # other appointment
+    await close_change_fence(db, first, own_transaction=True)
+    assert await open_change_fence(db, spa.id, "call-2", {"appointment_id": "a-1"})
