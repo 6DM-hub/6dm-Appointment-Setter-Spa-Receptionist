@@ -28,8 +28,7 @@ TASK = """# Task for {agent}: {finding}
 
 Repository access is through `repo.bundle` (no network needed):
 
-    git clone repo.bundle cara && cd cara && git checkout -b {agent}/{slug}-attempt <base>
-    (base = {head})
+    git clone -b {branch} repo.bundle cara && cd cara && git checkout -b {agent}/{slug}-attempt {head}
 
 Read `AGENTS.md` in the repository root first; its rules are binding.
 {handoff_line}
@@ -78,7 +77,7 @@ def main() -> int:
                                "--out", str(stage / "handoff")])
         handoff_line = "Then read `handoff/HANDOFF.md`: the finding, every earlier attempt and its evidence.\n"
     slug = (a.finding or "brick1").lower()
-    (stage / "TASK.md").write_text(TASK.format(agent=a.agent, finding=a.finding or "Brick 1",
+    (stage / "TASK.md").write_text(TASK.format(agent=a.agent, finding=a.finding or "Brick 1", branch=a.branch,
                                                slug=slug, head=head, handoff_line=handoff_line))
     out = Path(a.out).resolve()
     archive = shutil.make_archive(str(out.with_suffix("")), "zip", stage.parent, "pack")
