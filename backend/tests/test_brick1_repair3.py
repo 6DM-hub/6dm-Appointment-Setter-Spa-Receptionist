@@ -39,7 +39,7 @@ def test_any_untrusted_assistant_statement_unbinds():
 def test_backend_spoken_line_in_between_keeps_binding():
     note = "One moment while I check that."
     s = _session(("assistant", Q), ("assistant", note), ("user", "Yes."))
-    assert answers_backend_question(s, history_len=0, question=Q, trusted=[note]) is True
+    assert answers_backend_question(s, history_len=0, question=Q, trusted=[{"text": note, "at": 1}]) is True
 
 
 def test_unbound_fallback_treats_unpunctuated_question_as_a_question():
@@ -420,19 +420,19 @@ async def test_promotion_never_overwrites_an_unknown_outcome(rubyz_db):
 def test_a_backend_statement_between_question_and_yes_keeps_the_binding():
     hold = "One moment, I'm still checking that."
     s = _session(("assistant", Q), ("assistant", hold), ("user", "Yes."))
-    assert answers_backend_question(s, history_len=0, question=Q, trusted=[hold]) is True
+    assert answers_backend_question(s, history_len=0, question=Q, trusted=[{"text": hold, "at": 1}]) is True
 
 
 def test_a_backend_question_unbinds_a_cancellation_yes_but_not_a_booking_follow_up():
     other = "Would you like me to text you our address"
     s = _session(("assistant", Q), ("assistant", other), ("user", "Yes."))
-    assert answers_backend_question(s, history_len=0, question=Q, trusted=[other],
+    assert answers_backend_question(s, history_len=0, question=Q, trusted=[{"text": other, "at": 1}],
                                     trust_backend_questions=False) is False
     # Booking: the backend's own consent follow-ups ("Would you like me to go
     # ahead?", a translated read-back) are questions and must keep binding.
     follow_up = "Would you like me to go ahead?"
     s = _session(("assistant", Q), ("assistant", follow_up), ("user", "Yes."))
-    assert answers_backend_question(s, history_len=0, question=Q, trusted=[follow_up]) is True
+    assert answers_backend_question(s, history_len=0, question=Q, trusted=[{"text": follow_up, "at": 1}]) is True
 
 
 def test_cancellation_yes_survives_a_backend_hold_line_but_not_a_backend_question():
@@ -443,7 +443,7 @@ def test_cancellation_yes_survives_a_backend_hold_line_but_not_a_backend_questio
         s = _session(("user", "Please cancel my appointment."))
         s.entities[guard.PENDING_CANCELLATION] = {"appointment_id": "a-1", "question": question,
                                                   "history_len": 1, "turn": 1}
-        s.entities["backend_prompts"] = [between]
+        s.entities["backend_prompts"] = [{"text": between, "at": 2}]
         s.history += [{"role": "assistant", "content": question},
                       {"role": "assistant", "content": between},
                       {"role": "user", "content": "Yes."}]
@@ -541,3 +541,4 @@ async def test_owner_scoped_dashboard_change_of_an_external_booking_is_refused(m
 
 async def _async(value):
     return value
+

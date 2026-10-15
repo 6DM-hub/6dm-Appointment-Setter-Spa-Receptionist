@@ -346,11 +346,28 @@ def note_booking_question(session: Any, text: str | None = None) -> None:
 
 
 def note_backend_prompt(session: Any, text: str | None) -> None:
+    """Record ONE occurrence of a line the backend itself is about to speak.
+
+    Each record carries where in the conversation it was spoken. It vouches
+    only for an assistant turn at or after that point, only inside the window
+    of the question being answered, and only once: an old backend line that
+    the model repeats later carries no authority.
+    """
     if not text:
         return
     prompts = list(session.entities.get(BACKEND_PROMPTS) or [])
-    prompts.append(str(text)[:600])
+    prompts.append({"text": str(text)[:600], "at": len(getattr(session, "history", None) or [])})
     session.entities[BACKEND_PROMPTS] = prompts[-12:]
+
+
+def _prompt_records(trusted: list | None) -> list[dict]:
+    records = []
+    for item in trusted or []:
+        if isinstance(item, dict) and item.get("text"):
+            records.append({"text": str(item["text"]), "at": int(item.get("at", -1))})
+        elif isinstance(item, str):
+            records.append({"text": item, "at": -1})   # legacy entry: no occurrence, no trust
+    return records
 
 
 def _plain_words(text: str | None) -> str:
@@ -391,13 +408,16 @@ def answers_backend_question(
     Earlier caller turns in between are fine: one that changed or refused the
     proposal has already replaced or withdrawn it.
     """
-    tail = list((getattr(session, "history", None) or [])[int(history_len):])
+    start = int(history_len)
+    tail = list((getattr(session, "history", None) or [])[start:])
     users = [i for i, item in enumerate(tail) if item.get("role") == "user"]
     if not users:
         return None
     if users[-1] != len(tail) - 1 - _trailing_non_dialogue(tail):
         return False
-    for item in tail[: users[-1]]:
+    records = _prompt_records(trusted)
+    used: set[int] = set()
+    for offset, item in enumerate(tail[: users[-1]]):
         if item.get("role") != "assistant":
             continue
         said = str(item.get("content") or "")
@@ -408,9 +428,14 @@ def answers_backend_question(
         # itself or another line the backend spoke unbinds the yes.
         if question and same_question(said, question):
             continue
-        if (trust_backend_questions or not _is_question_line(said)) and any(
-            same_question(said, p) for p in (trusted or [])
-        ):
+        position = start + offset
+        voucher = next((
+            n for n, record in enumerate(records)
+            if n not in used and start <= record["at"] <= position
+            and same_question(said, record["text"])
+        ), None)
+        if voucher is not None and (trust_backend_questions or not _is_question_line(said)):
+            used.add(voucher)
             # A line the backend itself spoke. For a booking these include its
             # own consent questions (a silence follow-up, a translated read-back,
             # "would you like to continue with the original?"), and any other
