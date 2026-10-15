@@ -345,6 +345,8 @@ def wire(monkeypatch, spa=None, adapter=None):
 
     monkeypatch.setattr(svc, "_record_unresolved_change", _record_unresolved)
     monkeypatch.setattr(svc, "_unresolved_change_for", _unresolved_for)
+    from tests.fake_change_fence import install as _install_fence
+    _install_fence(monkeypatch, svc, unresolved)
     monkeypatch.setattr(svc, "_has_conflict", _conflict)
     return SimpleNamespace(spa=spa, square=square, adapter=adapter, store=store, db=db, contact=contact,
                            unresolved=unresolved)

@@ -172,3 +172,113 @@ async def test_unresolved_change_keeps_identifiers_that_look_like_card_digits(ru
     assert redact_payment_text(appointment_id) != appointment_id
     await record_unresolved_change(db, tenant, "call-x", {"appointment_id": appointment_id})
     assert await unresolved_change_for(db, tenant, appointment_id) is not None
+
+
+# --- R3-F5: write-ahead fence before every external change ------------------
+async def _escalations(db):
+    from app.models.booking_escalation import BookingEscalation
+    from sqlalchemy import select
+    return (await db.execute(select(BookingEscalation))).scalars().all()
+
+
+async def test_fence_is_durable_while_the_provider_write_is_in_flight(rubyz_db, monkeypatch):
+    from app.api.v1.appointments import cancel_appointment
+    db, a, b, squares = await setup_tenants(rubyz_db, monkeypatch)
+    call = session_for(a, "r3-fence-inflight")
+    row = await book(db, a, call)
+    row_id, scope = row.id, call.scope
+    square = squares["fake-cleaning-token"]
+    seen = {}
+
+    async def observe(method, route, *, json=None):
+        if method == "POST" and route.endswith("/cancel"):
+            rows = await _escalations(db)
+            seen["fences"] = [r.details.get("stage") for r in rows
+                              if r.details.get("appointment_id") == str(row_id)]
+        return await square(method, route, json=json)
+
+    squares["fake-cleaning-token"] = observe
+    await cancel_appointment(row_id, scope=scope, db=db)
+    assert seen["fences"] == ["in_flight"]          # recorded BEFORE the write
+    assert not [r for r in await _escalations(db)   # removed once verified
+                if r.details.get("appointment_id") == str(row_id)]
+
+
+async def test_definite_dashboard_refusal_clears_the_fence(rubyz_db, monkeypatch):
+    from app.api.v1.appointments import cancel_appointment
+    db, a, b, squares = await setup_tenants(rubyz_db, monkeypatch)
+    call = session_for(a, "r3-fence-refused")
+    row = await book(db, a, call)
+    row_id, scope = row.id, call.scope
+    square = squares["fake-cleaning-token"]
+
+    async def refuse(method, route, *, json=None):
+        if method == "POST" and route.endswith("/cancel"):
+            raise BookingProviderError("simulated forbidden", code="FORBIDDEN")
+        return await square(method, route, json=json)
+
+    squares["fake-cleaning-token"] = refuse
+    with pytest.raises(HTTPException) as err:
+        await cancel_appointment(row_id, scope=scope, db=db)
+    assert err.value.status_code == 409
+    await db.rollback()
+    assert not [r for r in await _escalations(db) if r.details.get("appointment_id") == str(row_id)]
+
+
+async def test_unknown_outcome_turns_the_fence_into_a_staff_alert(rubyz_db, monkeypatch):
+    from app.api.v1.appointments import cancel_appointment
+    db, a, b, squares = await setup_tenants(rubyz_db, monkeypatch)
+    call = session_for(a, "r3-fence-unknown")
+    row = await book(db, a, call)
+    row_id, scope = row.id, call.scope
+    square = squares["fake-cleaning-token"]
+
+    async def lose(method, route, *, json=None):
+        if method == "POST" and route.endswith("/cancel"):
+            raise BookingProviderError("lost", code="BOOKING_OUTCOME_UNKNOWN")
+        return await square(method, route, json=json)
+
+    squares["fake-cleaning-token"] = lose
+    with pytest.raises(HTTPException):
+        await cancel_appointment(row_id, scope=scope, db=db)
+    await db.rollback()
+    rows = [r for r in await _escalations(db) if r.details.get("appointment_id") == str(row_id)]
+    assert len(rows) == 1                     # one record: the fence, now an alert
+    assert rows[0].details["stage"] == "unknown_outcome"
+    assert rows[0].delivery_status == "pending" and rows[0].status == "pending"
+
+
+async def test_no_fence_no_send(rubyz_db, monkeypatch):
+    from app.api.v1.appointments import cancel_appointment
+    from app.services import appointment_booking_service as booking
+    db, a, b, squares = await setup_tenants(rubyz_db, monkeypatch)
+    call = session_for(a, "r3-no-fence")
+    row = await book(db, a, call)
+    row_id, scope = row.id, call.scope
+    square = squares["fake-cleaning-token"]
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("simulated database outage")
+
+    monkeypatch.setattr(booking, "_open_change_fence", broken)
+    before = _writes(square)
+    with pytest.raises(HTTPException) as err:
+        await cancel_appointment(row_id, scope=scope, db=db)
+    assert err.value.status_code == 503
+    later = session_for(a, "r3-no-fence-voice")
+    later.add_turn("user", "Please cancel my appointment.")
+    await booking.cancel_booking(db, later)
+    later.add_turn("user", "Yes.")
+    result = await booking.cancel_booking(db, later)
+    assert result.outcome == booking.BookingOutcome.ERROR
+    assert _writes(square) == before
+
+
+async def test_interrupted_fence_is_promoted_to_a_staff_alert(rubyz_db):
+    from app.services.booking_escalations import open_change_fence, promote_stale_change_fences
+    db, spa = rubyz_db
+    await open_change_fence(db, spa.id, "call-x", {"appointment_id": "a-1", "operation": "move"})
+    assert not await promote_stale_change_fences(db)                       # still fresh
+    assert await promote_stale_change_fences(db, older_than=timedelta(0))  # now stale
+    [row] = await _escalations(db)
+    assert row.details["stage"] == "interrupted" and row.delivery_status == "pending"

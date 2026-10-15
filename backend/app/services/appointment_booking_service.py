@@ -35,6 +35,9 @@ from app.core.tenancy import TenantScope, scope_columns, scope_filter
 from app.models import Appointment, AppointmentStatus, CallLog, Contact, SpaAccount
 from app.services.booking_escalations import unresolved_booking as _unresolved_booking
 from app.services.booking_escalations import (
+    close_change_fence as _close_change_fence,
+    mark_change_unknown as _mark_change_unknown,
+    open_change_fence as _open_change_fence,
     record_unresolved_change as _record_unresolved_change,
     unresolved_change_for as _unresolved_change_for,
 )
@@ -1029,11 +1032,18 @@ async def _failure(db: AsyncSession, session: CallSession, exc: Exception) -> Bo
         }
         if pending.get("appointment_id"):
             # Durable, per appointment: blocks later calls and the dashboard too.
+            # The write-ahead record already blocks; it now also alerts staff.
             try:
-                await _record_unresolved_change(
-                    db, _tenant_uuid(session), session.call_sid,
-                    {"code": exc.code, "details": str(exc), **pending},
-                )
+                fence = _fence_of(pending)
+                if fence is not None:
+                    marked = await _mark_change_unknown(
+                        db, fence, {"code": exc.code, "details": str(exc), **pending},
+                    )
+                if fence is None or marked is None:
+                    await _record_unresolved_change(
+                        db, _tenant_uuid(session), session.call_sid,
+                        {"code": exc.code, "details": str(exc), **pending},
+                    )
             except Exception:
                 logger.exception("Could not record an unresolved change for call %s", session.call_sid)
                 truth("UNRESOLVED_CHANGE_NOT_RECORDED", call_sid=session.call_sid)
@@ -1784,6 +1794,73 @@ def _note_pending_mutation(
     }
 
 
+# How long CARA waits to durably record a change before sending it. If the
+# record cannot be written, the change is not sent.
+FENCE_TIMEOUT_SECONDS = 5.0
+_FENCE_UNAVAILABLE = (
+    "I cannot safely change this appointment right now, so nothing was changed. "
+    "Apologize and offer to have a staff member call the caller back."
+)
+
+
+def _fence_of(pending: dict | None):
+    try:
+        return uuid.UUID(str(pending["fence_id"])) if pending and pending.get("fence_id") else None
+    except (TypeError, ValueError):
+        return None
+
+
+async def _begin_provider_change(
+    db: AsyncSession, session: CallSession, operation: str, existing: Appointment, *,
+    to_start: datetime | None = None, service: str | None = None,
+) -> bool:
+    """Record a change before it is sent: in the call session AND durably.
+
+    The durable (write-ahead) record is committed on its own connection, so
+    it survives a rollback, a lost response or a worker that dies mid-write,
+    without committing or unlocking this request's transaction. If it cannot
+    be written, nothing is sent (False).
+    """
+    _note_pending_mutation(session, operation, existing, to_start=to_start, service=service)
+    if not existing.external_booking_id:
+        return True   # CARA-only appointment: no external write to fence
+    pending = session.entities[PENDING_PROVIDER_MUTATION]
+    try:
+        fence_id = await asyncio.wait_for(
+            _open_change_fence(db, _tenant_uuid(session), session.call_sid, pending),
+            timeout=FENCE_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        logger.exception("Could not record a change before sending it: call_sid=%s", session.call_sid)
+        truth("CHANGE_FENCE_NOT_RECORDED", call_sid=session.call_sid, operation=operation)
+        session.entities.pop(PENDING_PROVIDER_MUTATION, None)
+        return False
+    if fence_id:
+        pending["fence_id"] = str(fence_id)
+    return True
+
+
+async def _settle_provider_change(db: AsyncSession, session: CallSession, *, in_transaction: bool) -> None:
+    """The provider outcome is VERIFIED (confirmed, or definitely refused).
+
+    ``in_transaction``: remove the durable record inside the caller's
+    transaction, so it commits atomically with the local row update.
+    Otherwise remove it on its own connection. If removal fails, the record
+    stays (the appointment stays blocked and staff are alerted): fail closed.
+    """
+    pending = session.entities.pop(PENDING_PROVIDER_MUTATION, None)
+    fence = _fence_of(pending)
+    if fence is None:
+        return
+    if in_transaction:
+        await _close_change_fence(db, fence)
+        return
+    try:
+        await _close_change_fence(db, fence, own_transaction=True)
+    except Exception:
+        logger.exception("Could not clear a settled change record: call_sid=%s", session.call_sid)
+
+
 async def _observe_after_uncertain_write(session: CallSession, routing: _Routing, existing: Appointment) -> None:
     """Read (never write) what the calendar holds after an unanswered change."""
     pending = session.entities.get(PENDING_PROVIDER_MUTATION)
@@ -1903,18 +1980,21 @@ async def _move_existing(
             routing.adapter, session, _draft_intent(draft), start, end,
             selected_slot=draft.selected_slot,
         )
+    if not await _begin_provider_change(
+        db, session, "move", existing, to_start=start, service=draft.service_description,
+    ):
+        return BookingResult(BookingOutcome.ERROR, message=_FENCE_UNAVAILABLE)
     if mode == "provider" and (service_change or provider_compares):
         move_call = routing.adapter.move_booking(external_booking_of(existing), start, end, ctx=ctx)
     else:
         move_call = routing.adapter.move_booking(external_booking_of(existing), start, end)
-    _note_pending_mutation(session, "move", existing, to_start=start, service=draft.service_description)
     try:
         moved = await _calendar_call("move_booking", session.call_sid, move_call)
     except BookingProviderError as exc:
         if exc.code in UNCERTAIN_OUTCOME_CODES:
             await _observe_after_uncertain_write(session, routing, existing)
             raise
-        session.entities.pop(PENDING_PROVIDER_MUTATION, None)
+        await _settle_provider_change(db, session, in_transaction=False)
         if exc.code == "SERVICE_CHANGE_UNSUPPORTED":
             return _service_change_refused(existing, str(exc))
         if exc.code == "SLOT_UNAVAILABLE":
@@ -1928,7 +2008,7 @@ async def _move_existing(
                 ),
             )
         raise
-    session.entities.pop(PENDING_PROVIDER_MUTATION, None)
+    await _settle_provider_change(db, session, in_transaction=True)
     existing.start_time = start
     existing.end_time = end
     existing.status = AppointmentStatus.SCHEDULED
@@ -2613,6 +2693,27 @@ async def apply_staff_change(
             "current calendar. Change it there.",
         )
     operation = "cancel_booking" if cancel else "move_booking"
+    record = {
+        "source": "dashboard",
+        "operation": "cancel" if cancel else "move",
+        "appointment_id": str(appointment.id),
+        "external_booking_id": appointment.external_booking_id,
+        "from_start": appointment.start_time.isoformat() if appointment.start_time else None,
+        "to_start": start.isoformat() if start else None,
+    }
+    # Write-ahead: durably record the change BEFORE it is sent (see
+    # booking_escalations.open_change_fence). No record, no send.
+    try:
+        fence_id = await asyncio.wait_for(
+            _open_change_fence(db, scope.tenant_id, "staff", record), timeout=FENCE_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        logger.exception("Could not record a dashboard change before sending it: %s", appointment.id)
+        truth("CHANGE_FENCE_NOT_RECORDED", appointment_id=str(appointment.id), operation=operation)
+        raise StaffChangeRefused(
+            503, "This change could not be recorded safely before sending it, so nothing was "
+            "changed. Try again in a moment.",
+        ) from exc
     try:
         if cancel:
             await _calendar_call(
@@ -2642,19 +2743,14 @@ async def apply_staff_change(
             # Durable, per appointment: the calendar may already hold this
             # change, so every later voice or dashboard change of this
             # appointment stays blocked until staff resolve it.
-            record = {
-                "code": exc.code, "details": str(exc), "source": "dashboard",
-                "operation": "cancel" if cancel else "move",
-                "appointment_id": str(appointment.id),
-                "external_booking_id": appointment.external_booking_id,
-                "from_start": appointment.start_time.isoformat() if appointment.start_time else None,
-                "to_start": start.isoformat() if start else None,
-            }
+            record.update(code=exc.code, details=str(exc))
             await _safe_rollback(db)  # (expires ORM rows: use only `record` below)
             try:
-                await _record_unresolved_change(
-                    db, scope.tenant_id, f"staff:{uuid.uuid4().hex[:12]}", record,
-                )
+                marked = await _mark_change_unknown(db, fence_id, record) if fence_id else None
+                if marked is None:
+                    await _record_unresolved_change(
+                        db, scope.tenant_id, f"staff:{uuid.uuid4().hex[:12]}", record,
+                    )
             except Exception:
                 logger.exception("Could not record an unresolved dashboard change for %s",
                                  record["appointment_id"])
@@ -2664,9 +2760,16 @@ async def apply_staff_change(
                 "The calendar did not confirm this change, so its outcome is unknown. "
                 "Check the appointment in the calendar before changing it again.",
             ) from exc
+        try:
+            await _close_change_fence(db, fence_id, own_transaction=True)
+        except Exception:
+            logger.exception("Could not clear a refused dashboard change record: %s", record["appointment_id"])
         raise StaffChangeRefused(
             409, f"The calendar did not accept this change: {exc}"
         ) from exc
+    # Verified: the record is removed in the caller's transaction, which
+    # commits it together with the local row update.
+    await _close_change_fence(db, fence_id)
 
 
 async def cancel_booking(
@@ -2856,7 +2959,8 @@ async def cancel_booking(
         session.entities.pop(guard.PENDING_CANCELLATION, None)
         await _lock_call(db, session.call_sid)
         await _lock_slot(db, routing.scope, existing.start_time, existing.end_time)
-        _note_pending_mutation(session, "cancel", existing)
+        if not await _begin_provider_change(db, session, "cancel", existing):
+            return BookingResult(BookingOutcome.ERROR, message=_FENCE_UNAVAILABLE)
         try:
             if existing.external_booking_id:
                 await _calendar_call(
@@ -2870,9 +2974,9 @@ async def cancel_booking(
             if exc.code in UNCERTAIN_OUTCOME_CODES:
                 await _observe_after_uncertain_write(session, routing, existing)
             else:
-                session.entities.pop(PENDING_PROVIDER_MUTATION, None)
+                await _settle_provider_change(db, session, in_transaction=False)
             raise
-        session.entities.pop(PENDING_PROVIDER_MUTATION, None)
+        await _settle_provider_change(db, session, in_transaction=True)
         existing.status = AppointmentStatus.CANCELLED
         await db.commit()
 

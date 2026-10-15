@@ -1,7 +1,10 @@
 """Persistent staff work queue. No customer notification is implied by an alert."""
-from datetime import datetime, timezone
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 from fastapi import HTTPException
 from app.models.booking_escalation import BookingEscalation
@@ -110,6 +113,7 @@ async def deliver(db, spa, row, sender=None):
 
 async def dispatch_pending(db):
     from app.models import SpaAccount
+    await promote_stale_change_fences(db)
     rows = list((await db.execute(select(BookingEscalation).where(
         BookingEscalation.delivery_status == "pending").order_by(
             BookingEscalation.priority.desc(), BookingEscalation.created_at).limit(20))).scalars())
@@ -234,6 +238,105 @@ async def record_unresolved_change(db, tenant_id, call_reference, details):
     except IntegrityError:
         await db.rollback()
     return row
+
+
+# ---------------------------------------------------------------------------
+# Write-ahead change fence
+# ---------------------------------------------------------------------------
+# Before CARA sends a move or cancellation of an existing appointment to an
+# external calendar, it durably records that the change is IN FLIGHT. The
+# record is an ordinary unresolved-change row, so while it exists every later
+# move or cancellation of that appointment -- any call, any worker, the
+# dashboard -- is blocked. A verified outcome (provider confirmed it, or
+# definitely refused it) removes the record; an unknown outcome turns it into
+# a staff alert; a worker that dies mid-write leaves it in place, and the
+# dispatcher alerts staff once it is stale. Nothing ever clears it silently.
+FENCE_STALE_AFTER = timedelta(minutes=5)
+
+
+def _change_details(details, **extra):
+    row_details = clean({**dict(details), **extra})
+    # Identifiers are not payment text (see record_unresolved_change).
+    for key in ("appointment_id", "external_booking_id"):
+        if details.get(key) is not None:
+            row_details[key] = str(details[key])
+    return row_details
+
+
+@asynccontextmanager
+async def _own_transaction(db):
+    """A session on its OWN connection, so a fence commits without committing
+    (or releasing the locks of) the caller's open transaction."""
+    async with AsyncSession(bind=db.bind, expire_on_commit=False) as fence_db:
+        yield fence_db
+
+
+async def open_change_fence(db, tenant_id, call_reference, details):
+    """Durably record a provider change before it is sent; returns its id."""
+    if not tenant_id or not details.get("appointment_id"):
+        return None
+    reference = f"change:{details['appointment_id']}:{uuid.uuid4().hex[:12]}:{call_reference}"[:128]
+    async with _own_transaction(db) as fence_db:
+        row = BookingEscalation(
+            tenant_id=tenant_id, call_reference=reference, status="pending", priority="urgent",
+            category=UNRESOLVED_CHANGE,
+            details=_change_details(details, stage="in_flight", opened_at=now().isoformat()),
+            delivery={}, history=[], delivery_status="held",
+        )
+        fence_db.add(row)
+        await fence_db.commit()
+        return row.id
+
+
+async def close_change_fence(db, fence_id, *, own_transaction=False):
+    """The provider outcome is verified: the change is no longer in flight.
+
+    In the caller's transaction (``own_transaction=False``) the removal commits
+    atomically with the local row update; otherwise it commits on its own.
+    """
+    if not fence_id:
+        return
+    if not own_transaction:
+        await db.execute(delete(BookingEscalation).where(BookingEscalation.id == fence_id))
+        return
+    async with _own_transaction(db) as fence_db:
+        await fence_db.execute(delete(BookingEscalation).where(BookingEscalation.id == fence_id))
+        await fence_db.commit()
+
+
+async def mark_change_unknown(db, fence_id, details):
+    """The provider outcome is unknown: keep the fence and alert staff."""
+    if not fence_id:
+        return None
+    async with _own_transaction(db) as fence_db:
+        row = await fence_db.get(BookingEscalation, fence_id)
+        if row is None:
+            return None
+        row.details = {**(row.details or {}), **_change_details(details, stage="unknown_outcome")}
+        row.delivery_status = "pending"
+        await fence_db.commit()
+        return row
+
+
+async def promote_stale_change_fences(db, *, older_than=FENCE_STALE_AFTER):
+    """A change still in flight long after it was sent was interrupted: alert staff."""
+    cutoff = now() - older_than
+    rows = list((await db.execute(select(BookingEscalation).where(
+        BookingEscalation.category == UNRESOLVED_CHANGE,
+        BookingEscalation.delivery_status == "held",
+    ))).scalars())
+    changed = False
+    for row in rows:
+        created = row.created_at
+        if created is not None and created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if created is None or created <= cutoff:
+            row.details = {**(row.details or {}), "stage": "interrupted"}
+            row.delivery_status = "pending"
+            changed = True
+    if changed:
+        await db.commit()
+    return changed
 
 
 async def unresolved_change_for(db, tenant_id, appointment_id):
