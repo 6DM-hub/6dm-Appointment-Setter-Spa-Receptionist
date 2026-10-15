@@ -1,0 +1,140 @@
+name: Brick 1 independent verification
+run-name: Brick 1 verification (${{ inputs.target_sha || github.event.pull_request.head.sha || '140d9200788b8dbb84e2d765f670eb54bfef5408' }})
+
+on:
+  push:
+    branches: [codex/brick1-ci-setup]
+  pull_request:
+    branches: [main]
+    paths: ['backend/**', 'ci/brick1/**', '.github/workflows/brick1-independent.yml']
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Exact 40-character commit SHA to verify (must be available in this repository)
+        required: true
+        default: '140d9200788b8dbb84e2d765f670eb54bfef5408'
+      postgres:
+        description: Run disposable PostgreSQL race tests and negative controls
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: brick1-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ci-contracts:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Check proposed CI runner contracts
+        run: |
+          python ci/brick1/test_runner.py -v
+          python -c 'import sys; sys.path.insert(0,"ci/brick1"); import run; run.check_integrity(run.HERE)'
+  verify:
+    # The bootstrap PR adds the referee to main; main cannot supply it yet.
+    # Its push run proves environment setup; its PR job checks the proposed runner.
+    if: github.event_name != 'pull_request' || github.head_ref != 'codex/brick1-ci-setup'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      TARGET_SHA: ${{ inputs.target_sha || github.event.pull_request.head.sha || '140d9200788b8dbb84e2d765f670eb54bfef5408' }}
+      USE_POSTGRES: ${{ github.event_name != 'workflow_dispatch' || inputs.postgres }}
+      TWILIO_ACCOUNT_SID: AC00000000000000000000000000000000
+      TWILIO_AUTH_TOKEN: x
+      TWILIO_PHONE_NUMBER: '+15551234567'
+      TWILIO_VALIDATE_SIGNATURE: 'false'
+    steps:
+      - name: Checkout trusted workflow separately from target
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Create evidence directory
+        run: mkdir -p evidence
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: ci/brick1/requirements.txt
+      - name: Validate CI runner contracts and trusted files
+        run: |
+          python ci/brick1/test_runner.py -v 2>&1 | tee evidence/ci-contracts.log
+          python -c 'import sys; sys.path.insert(0,"ci/brick1"); import run; run.check_integrity(run.HERE)'
+      - name: Fetch exact target if needed (before network isolation)
+        run: |
+          python -c 'import os,sys; sys.path.insert(0,"ci/brick1"); import run; run.validate_commit(os.environ["TARGET_SHA"])'
+          if ! git cat-file -e "$TARGET_SHA^{commit}" 2>/dev/null; then
+            git fetch --no-tags origin "$TARGET_SHA" > evidence/target-fetch.log 2>&1 || true
+          fi
+          # Missing target is classified by the runner, after environment setup.
+      - name: Install verification dependencies
+        run: |
+          python -m pip install -r ci/brick1/requirements.txt 2>&1 | tee evidence/dependency-install.log
+          python -m pip freeze > evidence/runtime-packages.txt
+          python --version > evidence/python-version.txt
+      - name: Provision disposable PostgreSQL with Unix socket only
+        if: env.USE_POSTGRES == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y postgresql-16 > evidence/postgres-install.log 2>&1
+          pg_root=$(mktemp -d /tmp/cara-brick1-pg-XXXXXX)
+          mkdir "$pg_root/socket"
+          /usr/lib/postgresql/16/bin/initdb -D "$pg_root/data" -A trust -U postgres > evidence/postgres-init.log
+          /usr/lib/postgresql/16/bin/pg_ctl -D "$pg_root/data" -l "$pg_root/server.log" -o "-k $pg_root/socket -c listen_addresses=''" -w start
+          /usr/lib/postgresql/16/bin/createdb -h "$pg_root/socket" -U postgres cara_brick1
+          echo "PG_ROOT=$pg_root" >> "$GITHUB_ENV"
+          echo "PG_SOCKET=$pg_root/socket" >> "$GITHUB_ENV"
+      - name: Verify exact commit without IP network access
+        run: |
+          python_bin=$(command -v python)
+          runner_user=$(id -un)
+          pg_args=()
+          if [ -n "${PG_SOCKET:-}" ]; then pg_args=(--pg-socket "$PG_SOCKET"); fi
+          # A separate Linux network namespace has no external interfaces.
+          # PostgreSQL remains reachable only through the disposable Unix socket.
+          sudo unshare --net -- sudo -u "$runner_user" -- env \
+            PATH="$PATH" \
+            GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \
+            TWILIO_ACCOUNT_SID="$TWILIO_ACCOUNT_SID" \
+            TWILIO_AUTH_TOKEN=x TWILIO_PHONE_NUMBER=+15551234567 \
+            TWILIO_VALIDATE_SIGNATURE=false \
+            "$python_bin" "$PWD/ci/brick1/run.py" \
+            --repo "$PWD" --commit "$TARGET_SHA" --out "$PWD/evidence" "${pg_args[@]}"
+      - name: Stop disposable PostgreSQL
+        if: always() && env.PG_ROOT != ''
+        run: |
+          /usr/lib/postgresql/16/bin/pg_ctl -D "$PG_ROOT/data" -m immediate -w stop || true
+          cat "$PG_ROOT/server.log" > evidence/postgres-server.log || true
+      - name: Publish readable status
+        if: always()
+        run: |
+          if [ ! -f evidence/CI-STATUS.md ]; then
+            echo '# Brick 1 CI: BLOCKED' > evidence/CI-STATUS.md
+            echo 'Environment setup did not finish. Inspect job logs. No booking verdict or owner approval.' >> evidence/CI-STATUS.md
+            cat evidence/CI-STATUS.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Save evidence even when verification fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: brick1-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14

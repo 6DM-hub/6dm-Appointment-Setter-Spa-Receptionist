@@ -1,0 +1,21 @@
+{
+  "extra-tests/test_codex_r5_isolation.py": "31e8d3b44fec7aab1daf91d5329af4572f332b45c25e34d2b7ecd8164f049442",
+  "extra-tests/test_codex_r5_provider.py": "297d42f6b2004505a4d650f06f73fce0839dcafa4abdb580dd6d11320b00acea",
+  "extra-tests/test_codex_r5_voice.py": "7d4261ead818a9694d1fb5edf4ddfd6b019c086fbe017c76df33d53f82fe48d7",
+  "requirements.txt": "abb557e0d54aaba262d83416ebef07b779de795fc2bd1c7ccfad84b90b16f990",
+  "trusted/CHATGPT_REVIEW_PROMPT.md": "080ee236d4da1ca77d755845313b630609c4569fbcbdf391310dc4b5fad2c4fe",
+  "trusted/README.md": "b4eb818399411710af542e6a37ade00b0b0d1e897f955ac2f64cf79864f374eb",
+  "trusted/codex_test_manifest.json": "2fe5236bc3fe21edc01b3b1867cba5f1967c8f79d972dd767ffd25c3b9d2a016",
+  "trusted/ledger/findings.json": "826bc1530de1662df9714a59c41463adbc39229acc8335f63e72f79c13f36f8e",
+  "trusted/ledger.py": "7d8bd82b5cb8cfa36a31afe510e4e0353215b0938c82243071947b17a40eeef6",
+  "trusted/make_handoff_pack.py": "1978aa3113be1121291510e754448dd6b3d8d77de6d943f1ca849d7be5a09c55",
+  "trusted/pg_controls/fence_removed_conftest.py": "78d8a993fcaa0e9554a99431196721204d7bf67267389f39976393e75a0d1ba8",
+  "trusted/pg_controls/locks_removed_conftest.py": "a69dff7bc1f0b35119c4a9a89015c9aaa35a0dd6859cc5a8bef90a96db021ba6",
+  "trusted/scenarios/SHA256SUMS": "0cd7ff73d190eccca8f61f70f68b8e44da26a308eb532bdbef1e9028b4369572",
+  "trusted/scenarios/harness.py": "a97ada65a22272487542df523854ab095f3695e816d2d2f172e4bbecfb4df4b8",
+  "trusted/scenarios/test_b1_defects.py": "00b513bcc396c9e99c83f2a1c115f6d7571be021f735053ecb4a7303b8d20589",
+  "trusted/scenarios/test_b1_extra.py": "81d41194e901074d5fe878953ab03161e440c8eea8f9e24bd0f8af043b378427",
+  "trusted/scenarios/test_b1_scenarios.py": "cf20caaf9441a25e26eb0bbf89c30faf51f993b72b8a51760e27221f5fe69b11",
+  "trusted/verification_network_block.py": "e22e8d974474d54739d27739149437d46d2a5faeeeb4dba19a463bcbfe8968cb",
+  "trusted/verify_commit.py": "7f283054caad9badb6f3fcb79919cef3a12ba1a7a2976f351c994dc7fa17cc2c"
+}

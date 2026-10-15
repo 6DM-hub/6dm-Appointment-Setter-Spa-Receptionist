@@ -1,0 +1,8 @@
+{
+    "rules": {
+        "attempts_per_turn": 2,
+        "first_owner": "codex",
+        "approval": "independent verification PASS on the exact commit, then owner approval"
+    },
+    "findings": {}
+}
