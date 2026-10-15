@@ -26,6 +26,11 @@ def test_unpunctuated_unrelated_question_unbinds():
     assert answers_backend_question(s, history_len=0, question=Q) is False
 
 
+def test_trusted_question_plus_another_question_unbinds():
+    s = _session(("assistant", Q + " Would you like our address before deciding?"), ("user", "Yes."))
+    assert answers_backend_question(s, history_len=0, question=Q) is False
+
+
 def test_any_untrusted_assistant_statement_unbinds():
     s = _session(("assistant", Q), ("assistant", "We also have parking out back."), ("user", "Yes."))
     assert answers_backend_question(s, history_len=0, question=Q) is False

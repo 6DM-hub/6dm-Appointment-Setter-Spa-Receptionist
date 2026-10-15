@@ -351,9 +351,14 @@ def _plain_words(text: str | None) -> str:
 
 
 def same_question(said: str | None, asked: str | None) -> bool:
-    """An assistant turn is (the transcript of) a line CARA itself spoke."""
+    """An assistant turn is exactly (the transcript of) a line CARA itself spoke.
+
+    Exact after normalising case and punctuation only. A turn that merely
+    CONTAINS the trusted line ("... book that? Would you like our address
+    before deciding?") is a different turn: its yes is ambiguous.
+    """
     a, b = _plain_words(said), _plain_words(asked)
-    return bool(a and b and (a == b or b in a or a in b))
+    return bool(a and b and a == b)
 
 
 def _trailing_non_dialogue(tail: list) -> int:
