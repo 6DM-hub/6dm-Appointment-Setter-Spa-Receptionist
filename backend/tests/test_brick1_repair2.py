@@ -727,3 +727,34 @@ async def test_legacy_cancel_square_refusal_keeps_the_row_and_says_so(monkeypatc
     said = await c.says("Yes.", intent=None, reply="Your appointment has been cancelled.")
     assert "has been cancelled" not in said.lower() and "still booked" in said
     assert len(w.square.active()) == 1 and w.store.live
+
+
+# --------------------------------------------------------------------------- #
+# R2-F6: a move is verified against everything the caller authorized
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("corruption", ["extra_segment", "staff", "pending_ok"])
+async def test_move_reply_is_checked_segment_by_segment(monkeypatch, corruption):
+    w = make_world(monkeypatch)
+    p = await booked_call(w)
+    original = w.square.__call__
+
+    async def corrupt(method, path, *, json=None):
+        result = await original(method, path, json=json)
+        if method == "PUT":
+            booking = w.square.bookings[path.rsplit("/", 1)[-1]]
+            segment = booking["appointment_segments"][0]
+            if corruption == "extra_segment":
+                booking["appointment_segments"].append(dict(segment))
+            elif corruption == "staff":
+                segment["team_member_id"] = "TM_SOMEONE_ELSE"
+            else:
+                booking["status"] = "PENDING"   # awaiting the business's approval: still active
+            return {"booking": copy.deepcopy(booking)}
+        return result
+
+    monkeypatch.setattr(w.adapter.delegate, "_request", corrupt)
+    await p.says("Move my appointment to Thursday at 3 PM instead.")
+    await p.propose(operation="reschedule", requested_start_iso=local(T3), service_description=w.first)
+    await p.says("Yes, please.")
+    flagged = bool(p.session.entities.get("booking_reconciliation_required"))
+    assert flagged is (corruption != "pending_ok"), (corruption, p.session.booking_status)

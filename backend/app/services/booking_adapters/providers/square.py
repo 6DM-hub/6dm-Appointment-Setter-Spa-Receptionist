@@ -2562,8 +2562,11 @@ class SquareAdapter(VerticalProviderAdapter):
                 wanted_variation,
                 team_member_id,
             )
-            expected_variations = [wanted_variation]
-            expected_team = str(team_member_id)
+            expected_segments = [{
+                "variation": wanted_variation,
+                "team": str(team_member_id),
+                "duration": pinned.get("duration_minutes"),
+            }]
             if staff_change:
                 truth(
                     "RESCHEDULE_STAFF_CHANGE",
@@ -2627,16 +2630,15 @@ class SquareAdapter(VerticalProviderAdapter):
                     new_start,
                 )
             )
-            expected_variations = [
-                str(segment.get("service_variation_id") or "")
+            # A time-only move keeps every segment exactly as Square holds it.
+            expected_segments = [
+                {
+                    "variation": str(segment.get("service_variation_id") or ""),
+                    "team": str(segment.get("team_member_id") or "") or None,
+                    "duration": segment.get("duration_minutes"),
+                }
                 for segment in current_segments
             ]
-            # A time-only move keeps whoever Square holds; verify it did.
-            expected_team = (
-                str((current_segments[0] or {}).get("team_member_id") or "") or None
-                if len(current_segments) == 1
-                else None
-            )
 
         data = await self._request(
             "PUT",
@@ -2668,8 +2670,9 @@ class SquareAdapter(VerticalProviderAdapter):
             updated,
             booking_id=booking_id,
             start_at=str(new_start),
-            variations=expected_variations,
-            team_member_id=expected_team,
+            segments=expected_segments,
+            customer_id=current.get("customer_id"),
+            location_id=current_location or self.location_id,
         )
 
         truth(
@@ -2764,13 +2767,26 @@ class SquareAdapter(VerticalProviderAdapter):
         *,
         booking_id: str,
         start_at: str,
-        variations: list[str],
-        team_member_id: str | None,
+        segments: list[dict[str, Any]],
+        customer_id: str | None,
+        location_id: str | None,
     ) -> None:
-        """Raise unless Square's stored booking is exactly what was requested."""
+        """Raise unless Square's stored booking is exactly what was authorized.
+
+        The expected booking is derived from what Square held before the move
+        plus the authorized change -- never from the reply itself: same id,
+        customer and location, still active, the new start, and every segment
+        (service, team member and duration) in order.
+        """
         problems: list[str] = []
         if str(updated.get("id") or "") != booking_id:
             problems.append("booking id")
+        if customer_id and str(updated.get("customer_id") or "") != str(customer_id):
+            problems.append("customer")
+        if location_id and str(updated.get("location_id") or "") != str(location_id):
+            problems.append("location")
+        if str(updated.get("status") or "").upper() not in {"ACCEPTED", "PENDING"}:
+            problems.append("status")
         raw_start = updated.get("start_at")
         try:
             same_start = bool(raw_start) and (
@@ -2781,14 +2797,22 @@ class SquareAdapter(VerticalProviderAdapter):
             same_start = False
         if not same_start:
             problems.append("start time")
-        segments = list(updated.get("appointment_segments") or [])
-        stored = [str(segment.get("service_variation_id") or "") for segment in segments]
-        if [value for value in variations if value] and stored != variations:
-            problems.append("service")
-        if team_member_id and (
-            not segments or str(segments[0].get("team_member_id") or "") != team_member_id
-        ):
-            problems.append("team member")
+        stored = list(updated.get("appointment_segments") or [])
+        if len(stored) != len(segments):
+            problems.append("services")
+        else:
+            for held, wanted in zip(stored, segments):
+                if wanted.get("variation") and str(held.get("service_variation_id") or "") != wanted["variation"]:
+                    problems.append("service")
+                if wanted.get("team") and str(held.get("team_member_id") or "") != wanted["team"]:
+                    problems.append("team member")
+                if wanted.get("duration") is not None:
+                    try:
+                        if int(held.get("duration_minutes")) != int(wanted["duration"]):
+                            problems.append("duration")
+                    except (TypeError, ValueError):
+                        problems.append("duration")
+        problems = list(dict.fromkeys(problems))
         if problems:
             truth(
                 "RESCHEDULE_UNVERIFIED",
