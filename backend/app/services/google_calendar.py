@@ -2,8 +2,9 @@
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -243,6 +244,70 @@ async def freebusy(
     return bool(response.get("calendars", {}).get(calendar_id, {}).get("busy"))
 
 
+# Google event statuses that mean "this event is on the calendar". Anything
+# else (above all "cancelled") is not a successful move.
+_ACTIVE_EVENT_STATUSES = {"confirmed", "tentative"}
+
+
+def _event_instant(value: Any) -> datetime | None:
+    """The absolute instant of a Google event start/end object, or None.
+
+    Compares instants, never wall-clock text, so a reply that spells the same
+    moment in another UTC offset or time zone still matches. A missing field, an
+    all-day ``date``, or a time that cannot be placed on the timeline returns
+    None: the caller treats that as unverifiable.
+    """
+    if not isinstance(value, dict):
+        return None
+    raw = value.get("dateTime")
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+        if parsed.tzinfo is None:
+            zone_name = value.get("timeZone")
+            if not isinstance(zone_name, str):
+                return None
+            parsed = parsed.replace(tzinfo=ZoneInfo(zone_name))
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, ZoneInfoNotFoundError):
+        return None
+
+
+def _verify_patched_event(result: Any, event_id: str, event_start: dict, event_end: dict) -> None:
+    """Raise unless Google's reply proves the requested move.
+
+    An HTTP success is not proof. The reply must be the event we patched, still
+    active, and now holding exactly the requested start and end instants.
+    Otherwise the calendar may or may not hold the change, so the caller must
+    treat the outcome as unknown (and block retries) rather than as applied.
+    """
+    problems = []
+    if not isinstance(result, dict):
+        problems.append("no event returned")
+    else:
+        if result.get("id") != event_id:
+            problems.append("a different event was returned")
+        if result.get("status") not in _ACTIVE_EVENT_STATUSES:
+            problems.append("the event is not active")
+        for label, returned, requested in (
+            ("start", result.get("start"), event_start),
+            ("end", result.get("end"), event_end),
+        ):
+            instant = _event_instant(returned)
+            if instant is None:
+                problems.append(f"the {label} time is missing or unreadable")
+            elif instant != _event_instant(requested):
+                problems.append(f"the {label} time is not the requested time")
+    if problems:
+        # Log what failed, never the event's contents (customer details).
+        logger.warning("Google Calendar reply did not prove the move of %s: %s", event_id, "; ".join(problems))
+        raise GoogleCalendarError(
+            "unverified_response",
+            "Google Calendar did not confirm the requested change",
+        )
+
+
 async def update_event(
     connection: GoogleCalendarConnection,
     event_id: str,
@@ -256,7 +321,7 @@ async def update_event(
     event_start, event_end = _event_times(start, end, timezone_name)
     try:
         service = await _service(connection)
-        await asyncio.to_thread(
+        result = await asyncio.to_thread(
             service.events()
             .patch(
                 calendarId=connection.selected_calendar_id,
@@ -268,6 +333,8 @@ async def update_event(
         )
     except HttpError as exc:
         raise _api_error(exc) from exc
+    # Success is what Google's reply proves, not the absence of an exception.
+    _verify_patched_event(result, event_id, event_start, event_end)
 
 
 async def delete_event(connection: GoogleCalendarConnection, event_id: str) -> None:

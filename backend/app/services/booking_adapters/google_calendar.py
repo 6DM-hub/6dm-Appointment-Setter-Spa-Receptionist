@@ -28,7 +28,10 @@ _DEFINITE_GOOGLE_REFUSALS = {
 
 def _change_error(exc: GoogleCalendarError, action: str) -> BookingProviderError:
     status = str(getattr(exc, "status", "") or "google_api_error")
-    if status == "google_api_error":
+    # "unverified_response": Google answered, but its reply did not prove the
+    # change (wrong event, cancelled, or not the requested times). The change
+    # may or may not be on the calendar, exactly like an unreadable failure.
+    if status in {"google_api_error", "unverified_response"}:
         return BookingProviderError(
             f"Google Calendar did not confirm the {action}; its outcome is unknown",
             code="BOOKING_OUTCOME_UNKNOWN", retryable=False,
