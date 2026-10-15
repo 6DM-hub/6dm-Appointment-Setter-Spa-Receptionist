@@ -53,6 +53,7 @@ from app.services.appointment_booking_service import (
     _prepare,
     _same_service_family,
     BOOKED_SERVICE_IDENTITIES,
+    CANCELLATION_KEPT_MARKER,
 )
 from app.services.spa_facts import dashboard_facts, lookup_spa_facts
 from app.services.consultation_gate import (
@@ -3333,6 +3334,25 @@ class XAIVoiceSession:
 
         async with AsyncSessionLocal() as db:
             result = await cancel_booking(db, self.session, appointment_id=appointment_id)
+        if CANCELLATION_KEPT_MARKER in (result.message or ""):
+            # The caller is keeping the appointment: nothing was cancelled,
+            # whatever the model asked for, and the caller hears exactly that.
+            await self._persist_session()
+            return json.dumps({
+                "status": "kept_existing",
+                "booked": False,
+                "cancelled": False,
+                "statement": True,
+                "spoken": booking_guard.refused_cancellation_speech(self.session, self._tz),
+                "message": "Nothing was cancelled. The caller is keeping their appointment.",
+            })
+        if result.outcome is BookingOutcome.MISSING_INFO and "has not asked to cancel" in (result.message or ""):
+            return json.dumps({
+                "status": "cancellation_not_requested",
+                "booked": False,
+                "cancelled": False,
+                "message": result.message,
+            })
         apply_booking_result(self.session, result)
         if result.outcome is BookingOutcome.CANCELLED:
             self._availability_recent.clear()
@@ -7016,7 +7036,11 @@ class XAIVoiceSession:
         is") are not availability offers: they must never arm an offer, be
         treated as consent, or trigger an automatic confirmation.
         """
-        if name not in {PROPOSE_APPOINTMENT_TOOL["name"], NEW_APPOINTMENT_TOOL["name"]}:
+        if name not in {
+            PROPOSE_APPOINTMENT_TOOL["name"],
+            NEW_APPOINTMENT_TOOL["name"],
+            CANCEL_APPOINTMENT_TOOL["name"],
+        }:
             return None
         try:
             payload = json.loads(output)

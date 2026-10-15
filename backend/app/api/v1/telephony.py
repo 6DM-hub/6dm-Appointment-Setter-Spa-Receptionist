@@ -49,6 +49,7 @@ from app.models import (
 )
 from app.schemas import OutboundCallRequest, OutboundCallResponse
 from app.services.appointment_booking_service import (
+    CANCELLATION_KEPT_MARKER,
     BookingOutcome,
     apply_booking_result,
     cancel_booking,
@@ -827,6 +828,10 @@ async def voice_respond(
     if intent and intent.intent == "cancel" and intent.confidence >= INTENT_CONFIDENCE_THRESHOLD:
         if guard_reply is None:
             result = await cancel_booking(db, session, intent)
+            if CANCELLATION_KEPT_MARKER in (result.message or ""):
+                # The caller's words keep the appointment; the extraction was wrong.
+                guard_reply = booking_guard.refused_cancellation_speech(session, tz)
+                guard_statement = True
     elif guarded_intent is not None and guard_reply is None:
         # Staging only. The caller naming a date is a request, not consent —
         # booking it here is what produced a row for every date they floated.

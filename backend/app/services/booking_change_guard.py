@@ -413,3 +413,85 @@ def additional_confirm_gate(session: Any, turn: int) -> tuple[str, str | None] |
     if int(turn) <= int(marker.get("notice_turn") if marker.get("notice_turn") is not None else -1):
         return "wait", None
     return None
+
+
+# --------------------------------------------------------------------------- #
+# Cancellation needs the caller's own, current words
+# --------------------------------------------------------------------------- #
+_CANCEL_RE = re.compile(
+    r"\b(?:cancel\w*|call (?:it|that|the appointment|my appointment) off|"
+    r"anular\w*)\b",
+    re.IGNORECASE,
+)
+_NEGATED_CANCEL_RE = re.compile(
+    r"\b(?:don'?t|do not|no need to|not|never|no,? don'?t|without|stop|"
+    r"wouldn'?t|won'?t|no quiero|no)\s+(?:\w+\s+){0,2}(?:cancel\w*|anular\w*)",
+    re.IGNORECASE,
+)
+_CANCEL_LOOKBACK_TURNS = 3
+
+
+def cancel_request(utterance: str | None) -> bool:
+    """The caller asks, in these words, for an appointment to be cancelled."""
+    text = (utterance or "").replace("’", "'")
+    return bool(_CANCEL_RE.search(text)) and not _NEGATED_CANCEL_RE.search(text)
+
+
+def _withdraws_cancellation(utterance: str | None) -> bool:
+    from app.services.booking_state import is_negative
+
+    text = (utterance or "").replace("’", "'")
+    return bool(
+        _NEGATED_CANCEL_RE.search(text)
+        or classify_change_question_answer(text) == "keep"
+        or is_negative(text)
+    )
+
+
+def cancellation_authorization(session: Any) -> str:
+    """allowed | kept | unconfirmed, from the caller's own words.
+
+    * "kept": the caller's latest words keep the appointment ("keep it",
+      "never mind", "don't cancel", "no") -- nothing may be cancelled.
+    * "allowed": the latest caller turn asks to cancel, or is a plain yes that
+      follows the caller's own cancellation request (within a few turns, with
+      no "keep it" in between).
+    * "unconfirmed": anything else. A model's decision to cancel is never
+      enough on its own.
+    A session with no caller speech at all (not a phone conversation) is not
+    gated here.
+    """
+    from app.services.booking_state import is_affirmative
+
+    caller_turns = [
+        str(item.get("content") or "")
+        for item in (getattr(session, "history", None) or [])
+        if item.get("role") == "user"
+    ]
+    if not caller_turns:
+        return "allowed"
+    latest = caller_turns[-1]
+    if _withdraws_cancellation(latest):
+        return "kept"
+    if cancel_request(latest):
+        return "allowed"
+    if is_affirmative(latest):
+        for earlier in reversed(caller_turns[-1 - _CANCEL_LOOKBACK_TURNS:-1]):
+            if _withdraws_cancellation(earlier):
+                return "unconfirmed"
+            if cancel_request(earlier):
+                return "allowed"
+    return "unconfirmed"
+
+
+def refused_cancellation_speech(session: Any, tz: Any) -> str:
+    """What the caller hears when a cancellation they did not ask for is refused."""
+    if booking_on_record(session):
+        service, booked_iso = booked_details(session)
+        return kept_booking_speech(service, booked_iso, tz).replace(
+            "and nothing new was booked", "and nothing was cancelled"
+        )
+    return (
+        "No problem, I haven't cancelled anything. Your appointment stays as it is. "
+        "Is there anything else I can help you with?"
+    )

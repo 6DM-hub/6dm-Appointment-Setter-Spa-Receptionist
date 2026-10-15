@@ -2443,6 +2443,9 @@ async def _confirm_booking(
         return await _failure(db, session, exc)
 
 
+CANCELLATION_KEPT_MARKER = "[CANCELLATION_REFUSED_KEEP]"
+
+
 async def cancel_booking(
     db: AsyncSession,
     session: CallSession,
@@ -2454,7 +2457,38 @@ async def cancel_booking(
     When several appointments exist, no appointment is cancelled until the
     caller selects one of the IDs the backend previously offered.  A model-
     invented UUID is rejected even if it happens to be syntactically valid.
+
+    Nothing is cancelled unless the caller's own current words ask for it:
+    "keep it", "never mind" or "don't cancel" always wins over any model
+    tool call or extraction that decided to cancel, on every voice path, for
+    a booking made on this call or earlier (see `booking_change_guard`).
     """
+    from app.services import booking_change_guard as guard
+
+    authorization = guard.cancellation_authorization(session)
+    if authorization != "allowed":
+        truth("CANCELLATION_REFUSED", call_sid=session.call_sid, reason=authorization)
+        if authorization == "kept":
+            if guard.booking_on_record(session) and guard.something_pending(session):
+                guard.keep_existing_booking(
+                    session, resolve_timezone(session.timezone),
+                    turn=guard.current_turn(session), call_sid=session.call_sid,
+                )
+            return BookingResult(
+                BookingOutcome.MISSING_INFO,
+                message=(
+                    f"{CANCELLATION_KEPT_MARKER} The caller wants to keep their appointment. "
+                    "Nothing was cancelled. Do not cancel it."
+                ),
+            )
+        return BookingResult(
+            BookingOutcome.MISSING_INFO,
+            message=(
+                "Nothing was cancelled: the caller has not asked to cancel in their own "
+                "words. Ask whether they want to cancel the appointment, and only call "
+                "cancel_appointment after they clearly say to cancel it."
+            ),
+        )
     draft = get_draft(session)
     draft.operation_mode = "cancel"
     try:

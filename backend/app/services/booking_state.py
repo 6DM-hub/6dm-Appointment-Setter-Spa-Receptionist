@@ -787,7 +787,8 @@ _ANSWER_KEEP_RE = re.compile(
     r"the (?:original|same|appointment|booking|time|slot|reservation|visit|first|one i (?:have|had|booked))|"
     r"(?:it|that|this) (?:as|the way|like)\b)(?!\s+in\s+mind)(?!\s+posted)|"
     r"(?:just|please|no,?|ok(?:ay)?,?|i'?ll|i will|i'?d (?:rather|like to)|let'?s|we'?ll)\s+keep(?:\s+it)?\s*[.!]?$|^\s*keep\s*[.!]?$|"
-    r"never ?mind|nevermind|leave (?:it|that|everything)|forget (?:it|that|about it)|"
+    r"never ?mind|nevermind|leave (?:it|that|everything|(?:my|the|our) (?:\w+\s+)?(?:appointment|booking|reservation|visit|time|slot)s?(?= alone| as | be\b| how| the way))|"
+    r"forget (?:it|that|about it)|"
     r"d[eé]jalo (?:as[ií]|como est[aá])|no (?:lo )?cambies|olv[ií]dalo|"
     r"as (?:it|that) is|the way (?:it|that) is|as is|stays? the same|the same as before|"
     r"no changes?|don'?t change|do not change|don'?t bother|the original)\b",
