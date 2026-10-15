@@ -1802,6 +1802,10 @@ _FENCE_UNAVAILABLE = (
     "I cannot safely change this appointment right now, so nothing was changed. "
     "Apologize and offer to have a staff member call the caller back."
 )
+_CANNOT_FENCE = (
+    "This appointment is held in an external calendar that I cannot safely change from "
+    "this line, so nothing was changed. Offer to have a staff member make the change."
+)
 _CHANGE_IN_FLIGHT = (
     "An earlier change to this appointment needs staff verification before another "
     "change. May a staff member call you to help?"
@@ -1843,6 +1847,12 @@ async def _begin_provider_change(
     if not existing.external_booking_id:
         return None   # CARA-only appointment: no external write to fence
     pending = session.entities[PENDING_PROVIDER_MUTATION]
+    if _tenant_uuid(session) is None:
+        # No tenant (e.g. the owner-scoped sales workspace): there is nowhere
+        # to keep a durable record, and no record means no send.
+        truth("CHANGE_REFUSED_UNFENCEABLE", call_sid=session.call_sid, operation=operation)
+        session.entities.pop(PENDING_PROVIDER_MUTATION, None)
+        return _CANNOT_FENCE
     planned = uuid.uuid4()
     try:
         fence_id = await asyncio.wait_for(
@@ -2728,6 +2738,12 @@ async def apply_staff_change(
     }
     # Write-ahead: durably record the change BEFORE it is sent (see
     # booking_escalations.open_change_fence). No record, no send.
+    if not scope.tenant_id:
+        raise StaffChangeRefused(
+            409,
+            "This appointment is held in an external calendar that cannot be changed safely "
+            "from this workspace. Change it in the calendar itself.",
+        )
     planned = uuid.uuid4()
     try:
         fence_id = await asyncio.wait_for(

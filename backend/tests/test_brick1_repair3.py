@@ -514,3 +514,30 @@ async def test_google_success_still_changes_the_local_row(rubyz_db, monkeypatch)
     await db.refresh(row)
     assert deleted == ["google-event-1"] and row.status == AppointmentStatus.CANCELLED
     assert not [r for r in await _escalations(db) if r.details.get("appointment_id") == str(row_id)]
+
+
+# --- R4-L1: no tenant, no durable record, no external change ----------------
+async def test_owner_scoped_dashboard_change_of_an_external_booking_is_refused(monkeypatch):
+    import uuid as _uuid
+    from types import SimpleNamespace as NS
+    from app.services import appointment_booking_service as booking
+    sent = []
+
+    class Adapter:
+        provider = "google_calendar"
+
+        async def cancel_booking(self, b):
+            sent.append(b)
+
+    monkeypatch.setattr(booking, "_load_spa", lambda db, scope: _async(NS(name="sales")))
+    monkeypatch.setattr(booking, "get_booking_adapter", lambda **kw: Adapter())
+    appointment = NS(id=_uuid.uuid4(), external_booking_id="evt-1", booking_provider=None,
+                     start_time=None, title="Demo")
+    scope = NS(tenant_id=None, owner_id=_uuid.uuid4())
+    with pytest.raises(booking.StaffChangeRefused) as err:
+        await booking.apply_staff_change(None, scope, appointment, cancel=True)
+    assert err.value.status_code == 409 and sent == []
+
+
+async def _async(value):
+    return value
