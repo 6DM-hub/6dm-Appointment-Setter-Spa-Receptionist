@@ -431,70 +431,202 @@ def additional_confirm_gate(session: Any, turn: int) -> tuple[str, str | None] |
 # --------------------------------------------------------------------------- #
 # Cancellation needs the caller's own, current words
 # --------------------------------------------------------------------------- #
-_CANCEL_RE = re.compile(
-    r"\b(?:cancel\w*|call (?:it|that|the appointment|my appointment) off|"
-    r"anular\w*)\b",
+# A cancellation is a two-step, operation-bound decision:
+#   1. the caller asks to cancel (a plain request, not a question, a maybe or a
+#      prohibition) -> CARA asks ONE dedicated question naming the appointment;
+#   2. the caller's very next turn is a plain yes to THAT question -> cancel.
+# Anything else -- a "keep it", "don't cancel", an unrelated question in
+# between, a yes to something else, a model or extraction that decided on its
+# own -- never cancels. All state is in the session, so it survives reconnects
+# and never carries into another call.
+PENDING_CANCELLATION = "pending_cancellation"   # {"appointment_id", "question", "history_len", "turn"}
+CANCELLATION_QUESTION_MARKER = "[CANCELLATION_CONFIRMATION_REQUIRED]"
+
+# Only the verb itself: "cancellation", "cancelled", "cancelling" describe, they
+# do not ask.
+_CANCEL_VERB_RE = re.compile(
+    r"\b(?:cancel|cancelar|cancela|cancele|anular|anula|anule)\b"
+    r"|\bcall (?:it|that|the appointment|my appointment|the booking|my booking) off\b",
     re.IGNORECASE,
 )
+# Any negation before the verb in the same sentence fails closed:
+# "do not under any circumstances cancel", "no, don't cancel", "not sure if I
+# should cancel".
 _NEGATED_CANCEL_RE = re.compile(
-    r"\b(?:don'?t|do not|no need to|not|never|no,? don'?t|without|stop|"
-    r"wouldn'?t|won'?t|no quiero|no)\s+(?:\w+\s+){0,2}(?:cancel\w*|anular\w*)",
+    r"\b(?:don'?t|do not|doesn'?t|not|never|no|nope|won'?t|wouldn'?t|without|stop|"
+    r"no quiero|no lo|no la)\b[^.!?]*?(?:\bcancel\w*|\banular\w*|\bcall\b[^.!?]*\boff\b)",
+    re.IGNORECASE,
+)
+_QUESTION_START_RE = re.compile(
+    r"^\s*(?:what|what's|whats|how|why|when|where|which|who|is|are|am|do|does|did|"
+    r"would|could|can|will|should|shall|may|might|if|whether|cu[aá]l|c[oó]mo|qu[eé]|"
+    r"puedo|hay)\b",
+    re.IGNORECASE,
+)
+_UNCERTAIN_RE = re.compile(
+    r"\b(?:not sure|unsure|maybe|might|perhaps|thinking (?:about|of)|considering|"
+    r"wonder(?:ing)?|whether|if i|in case|what if|policy|fee|charge|penalt)\w*",
+    re.IGNORECASE,
+)
+# "Can you / could you / would you please cancel ..." asks for the action.
+_POLITE_REQUEST_RE = re.compile(
+    r"^\s*(?:(?:yes|yeah|ok(?:ay)?|hi|hello|so|um|uh)[,.]?\s+)?"
+    r"(?:can|could|would|will)\s+(?:you|i|we)\s+(?:please\s+)?"
+    r"(?:just\s+)?(?:go ahead and\s+)?(?:cancel|call\s+\S+(?:\s+\S+)?\s+off)\b",
     re.IGNORECASE,
 )
 _CANCEL_LOOKBACK_TURNS = 3
 
 
+def _sentences(text: str) -> list[str]:
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+", text or "") if part.strip()]
+
+
 def cancel_request(utterance: str | None) -> bool:
-    """The caller asks, in these words, for an appointment to be cancelled."""
-    text = (utterance or "").replace("’", "'")
-    return bool(_CANCEL_RE.search(text)) and not _NEGATED_CANCEL_RE.search(text)
+    """A plain request, in the caller's own words, to cancel an appointment.
+
+    Fails closed: a question ("what is your cancellation policy?", "would
+    there be a fee if I cancel?"), uncertainty ("I'm not sure whether I should
+    cancel"), or any negation ("do not under any circumstances cancel") is
+    never a request. Only the sentence that holds the verb is judged.
+    """
+    text = (utterance or "").replace("\u2019", "'")
+    if _NEGATED_CANCEL_RE.search(text):
+        return False
+    for sentence in _sentences(text) or [text]:
+        if not _CANCEL_VERB_RE.search(sentence):
+            continue
+        if _UNCERTAIN_RE.search(sentence):
+            return False
+        if _POLITE_REQUEST_RE.match(sentence):
+            return True  # "can you cancel my appointment?" is a request
+        if sentence.endswith("?") or _QUESTION_START_RE.match(sentence):
+            return False
+        return True
+    return False
 
 
 def _withdraws_cancellation(utterance: str | None) -> bool:
     from app.services.booking_state import is_negative
 
-    text = (utterance or "").replace("’", "'")
+    text = (utterance or "").replace("\u2019", "'")
     return bool(
         _NEGATED_CANCEL_RE.search(text)
         or classify_change_question_answer(text) == "keep"
         or is_negative(text)
+        or re.match(r"^\s*(?:no|nope|nah)\b", text, re.IGNORECASE)
     )
 
 
-def cancellation_authorization(session: Any) -> str:
-    """allowed | kept | unconfirmed, from the caller's own words.
-
-    * "kept": the caller's latest words keep the appointment ("keep it",
-      "never mind", "don't cancel", "no") -- nothing may be cancelled.
-    * "allowed": the latest caller turn asks to cancel, or is a plain yes that
-      follows the caller's own cancellation request (within a few turns, with
-      no "keep it" in between).
-    * "unconfirmed": anything else. A model's decision to cancel is never
-      enough on its own.
-    A session with no caller speech at all (not a phone conversation) is not
-    gated here.
-    """
-    from app.services.booking_state import is_affirmative
-
-    caller_turns = [
+def _caller_turns(session: Any) -> list[str]:
+    return [
         str(item.get("content") or "")
         for item in (getattr(session, "history", None) or [])
         if item.get("role") == "user"
     ]
-    if not caller_turns:
-        return "allowed"
-    latest = caller_turns[-1]
+
+
+def _same_question(said: str, asked: str) -> bool:
+    """The assistant turn is the backend's own question (transcript may differ in punctuation)."""
+    a = " ".join(re.sub(r"[^a-z0-9 ]+", " ", (said or "").casefold()).split())
+    b = " ".join(re.sub(r"[^a-z0-9 ]+", " ", (asked or "").casefold()).split())
+    return bool(a and b and (a == b or b in a or a in b))
+
+
+def answers_backend_question(session: Any, *, history_len: int, question: str | None,
+                             trusted: list[str] | None = None) -> bool:
+    """The latest caller turn is the FIRST answer to the question CARA asked
+    at ``history_len``, with no other question asked in between.
+
+    Any assistant turn after that point that asks something else -- "would
+    you like our address?" -- means the caller's yes may answer that instead.
+    """
+    tail = list((getattr(session, "history", None) or [])[int(history_len):])
+    users = [i for i, item in enumerate(tail) if item.get("role") == "user"]
+    if len(users) != 1 or users[0] != len(tail) - 1 - _trailing_non_dialogue(tail):
+        return False
+    for item in tail[: users[0]]:
+        if item.get("role") != "assistant":
+            continue
+        said = str(item.get("content") or "")
+        if "?" not in said:
+            continue
+        if question and _same_question(said, question):
+            continue
+        if any(_same_question(said, prompt) for prompt in (trusted or [])):
+            continue
+        return False
+    return True
+
+
+def _trailing_non_dialogue(tail: list[dict]) -> int:
+    """System notes after the caller's turn do not count as dialogue."""
+    count = 0
+    for item in reversed(tail):
+        if item.get("role") in {"system", "tool"}:
+            count += 1
+            continue
+        break
+    return count
+
+
+def cancellation_question(service: str | None, start_iso: str | None, tz: Any) -> str:
+    from app.services.booking_state import _booked_service, _booked_when
+
+    return (
+        f"Just to confirm, would you like me to cancel your {_booked_service(service)}"
+        f"{_booked_when(start_iso, tz)}?"
+    )
+
+
+def stage_cancellation(session: Any, appointment_id: str, question: str, *, turn: int) -> None:
+    session.entities[PENDING_CANCELLATION] = {
+        "appointment_id": str(appointment_id),
+        "question": question,
+        "history_len": len(getattr(session, "history", None) or []),
+        "turn": int(turn),
+    }
+    truth("CANCELLATION_CONFIRMATION_ASKED", call_sid=getattr(session, "call_sid", None))
+
+
+def cancellation_decision(session: Any) -> str:
+    """kept | confirmed | request | none, from the caller's own words.
+
+    * kept      -- the latest words keep the appointment; nothing is cancelled.
+    * confirmed -- a plain yes that is the very next answer to CARA's own
+                   cancellation question for a specific appointment.
+    * request   -- the caller asked to cancel (now, or in their last few turns
+                   with no "keep" since): CARA must ask its question first.
+    * none      -- anything else. A model's decision alone never cancels, and a
+                   session with no caller words at all fails closed.
+    """
+    from app.services.booking_state import is_affirmative
+
+    turns = _caller_turns(session)
+    if not turns:
+        return "none"
+    latest = turns[-1]
+    pending = session.entities.get(PENDING_CANCELLATION)
     if _withdraws_cancellation(latest):
         return "kept"
+    if (
+        isinstance(pending, dict)
+        and is_affirmative(latest)
+        and answers_backend_question(
+            session, history_len=int(pending.get("history_len", 0)),
+            question=pending.get("question"),
+        )
+    ):
+        return "confirmed"
     if cancel_request(latest):
-        return "allowed"
-    if is_affirmative(latest):
-        for earlier in reversed(caller_turns[-1 - _CANCEL_LOOKBACK_TURNS:-1]):
-            if _withdraws_cancellation(earlier):
-                return "unconfirmed"
-            if cancel_request(earlier):
-                return "allowed"
-    return "unconfirmed"
+        return "request"
+    for earlier in reversed(turns[-1 - _CANCEL_LOOKBACK_TURNS:-1]):
+        if _withdraws_cancellation(earlier):
+            return "none"
+        if cancel_request(earlier):
+            # e.g. the caller is choosing WHICH appointment to cancel.
+            return "request" if not is_affirmative(latest) else "none"
+    return "none"
 
 
 def refused_cancellation_speech(session: Any, tz: Any) -> str:

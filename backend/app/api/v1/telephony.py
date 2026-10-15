@@ -826,14 +826,46 @@ async def voice_respond(
     # The change/add/keep question and "it stays as it is" are statements:
     # they never count as reading a proposal back for a later "yes".
     guard_statement = guard_reply is not None
-    if intent and intent.intent == "cancel" and intent.confidence >= INTENT_CONFIDENCE_THRESHOLD:
-        if guard_reply is None:
+    cancel_handled = False
+    if session.entities.get(booking_guard.PENDING_CANCELLATION):
+        # The caller is answering CARA's own cancellation question. Only a
+        # plain yes to exactly that question cancels, whatever was extracted.
+        decision = booking_guard.cancellation_decision(session)
+        if decision == "confirmed":
             result = await cancel_booking(db, session, intent)
-            if CANCELLATION_KEPT_MARKER in (result.message or ""):
-                # The caller's words keep the appointment; the extraction was wrong.
+            cancel_handled = True
+        else:
+            session.entities.pop(booking_guard.PENDING_CANCELLATION, None)
+            if decision == "kept":
                 guard_reply = booking_guard.refused_cancellation_speech(session, tz)
                 guard_statement = True
-    elif guarded_intent is not None and guard_reply is None:
+                cancel_handled = True
+    if (
+        not cancel_handled
+        and intent and intent.intent == "cancel" and intent.confidence >= INTENT_CONFIDENCE_THRESHOLD
+    ):
+        if guard_reply is None:
+            result = await cancel_booking(db, session, intent)
+            cancel_handled = True
+    if cancel_handled and result is not None:
+        message = result.message or ""
+        if CANCELLATION_KEPT_MARKER in message:
+            # The caller's words keep the appointment; the extraction was wrong.
+            guard_reply = booking_guard.refused_cancellation_speech(session, tz)
+            guard_statement = True
+        elif booking_guard.CANCELLATION_QUESTION_MARKER in message:
+            # Step one: CARA asks its own question, verbatim.
+            guard_reply = message.replace(booking_guard.CANCELLATION_QUESTION_MARKER, "").strip()
+            guard_statement = True
+        elif result.outcome is BookingOutcome.ERROR:
+            guard_reply = (
+                booking_guard.uncertain_change_speech(session, tz)
+                if session.entities.get("booking_reconciliation_required")
+                else "I wasn't able to cancel that appointment, so it is still booked. "
+                "May a team member call you to help with it?"
+            )
+            guard_statement = True
+    elif guarded_intent is not None and guard_reply is None and not cancel_handled:
         # Staging only. The caller naming a date is a request, not consent —
         # booking it here is what produced a row for every date they floated.
         result = await stage_booking(db, session, guarded_intent)

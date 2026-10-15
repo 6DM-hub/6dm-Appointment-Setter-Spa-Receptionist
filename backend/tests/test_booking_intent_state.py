@@ -432,10 +432,22 @@ async def test_date_changed_after_persistence_moves_the_existing_event(world):
 # --------------------------------------------------------------------------- #
 # 10 & 11. Cancelling
 # --------------------------------------------------------------------------- #
+async def _caller_cancels(db, session):
+    """Brick 1: a cancellation is the caller's request, CARA's question naming
+    the appointment, then the caller's plain yes to that question."""
+    session.add_turn("user", "Please cancel my appointment.")
+    asked = await cancel_booking(db, session)
+    if asked.outcome is not BookingOutcome.MISSING_INFO:
+        return asked
+    session.add_turn("user", "Yes.")
+    return await cancel_booking(db, session)
+
+
 async def test_cancelling_before_confirmation_creates_nothing(world):
     db, session = world["db"], world["session"]
 
     await stage_booking(db, session, _wants(SEPT_20))
+    session.add_turn("user", "Please cancel my appointment.")
     result = await cancel_booking(db, session)
 
     assert result.outcome is BookingOutcome.NOT_FOUND
@@ -448,7 +460,7 @@ async def test_cancelling_after_persistence_cancels_the_right_event(world):
     db, session = world["db"], world["session"]
 
     await _confirm(db, session, _wants(SEPT_22))
-    result = await cancel_booking(db, session)
+    result = await _caller_cancels(db, session)
 
     assert result.outcome is BookingOutcome.CANCELLED
     assert world["adapter"].cancelled == ["evt-1"]

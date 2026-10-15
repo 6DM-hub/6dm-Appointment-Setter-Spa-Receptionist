@@ -46,26 +46,57 @@ def cancels(world):
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("request_text", [
     "Please cancel my appointment.", "I need to cancel it.", "Can you call it off?",
+    "Could you please cancel my appointment?",
 ])
-async def test_explicit_cancel_request_still_cancels(monkeypatch, request_text):
+async def test_cancel_request_is_asked_back_then_a_yes_cancels(monkeypatch, request_text):
+    """Owner-approved Brick 1 design: CARA always asks before cancelling."""
     w = make_world(monkeypatch)
     cancellation_transport(monkeypatch, w)
     p = await booked_call(w)
     await p.says(request_text)
     out = await p.tool("cancel_appointment")
-    assert out["status"] == "cancelled", out
+    assert out["status"] == "cancellation_confirmation_required", out
+    assert p.heard[-1].startswith("Just to confirm, would you like me to cancel your")
+    assert "Thursday at 2 PM" in p.heard[-1]
+    assert not cancels(w) and p.starts() == [Z2]
+    heard = await p.says("Yes.")                    # the backend owns the write
     assert len(cancels(w)) == 1 and not w.square.active()
+    assert any("cancelled" in line for line in heard), heard
 
 
-async def test_cancel_request_then_yes_to_confirmation_cancels(monkeypatch):
+async def test_the_model_confirming_on_the_yes_turn_cancels_once(monkeypatch):
     w = make_world(monkeypatch)
     cancellation_transport(monkeypatch, w)
     p = await booked_call(w)
     await p.says("I'd like to cancel my appointment.")
-    p.session.add_turn("assistant", "Just to confirm, cancel your Thursday 2 PM appointment?")
+    await p.tool("cancel_appointment")
+    await p.says("Yes, please.")
+    await p.tool("cancel_appointment")              # a duplicate/late model call
+    assert len(cancels(w)) == 1 and not w.square.active()
+
+
+@pytest.mark.parametrize("answer", [
+    "Yes, where are you located?", "Hmm, what's the fee?", "Yes and also is there parking?",
+])
+async def test_anything_but_a_plain_yes_to_the_cancel_question_cancels_nothing(monkeypatch, answer):
+    w = make_world(monkeypatch)
+    cancellation_transport(monkeypatch, w)
+    p = await booked_call(w)
+    await p.says("Please cancel my appointment.")
+    await p.tool("cancel_appointment")
+    await p.says(answer)
+    assert get_pending(p) is None, "a non-yes answer withdraws the question"
+    out = await p.tool("cancel_appointment")          # the model tries anyway
+    assert out["status"] == "cancellation_confirmation_required", out
+    assert not cancels(w) and p.starts() == [Z2]
+    # Only a plain yes to the question CARA just asked (again) cancels.
     await p.says("Yes.")
-    assert (await p.tool("cancel_appointment"))["status"] == "cancelled"
     assert len(cancels(w)) == 1
+
+
+def get_pending(p):
+    from app.services.booking_change_guard import PENDING_CANCELLATION
+    return p.session.entities.get(PENDING_CANCELLATION)
 
 
 @pytest.mark.parametrize("answer", [
@@ -77,6 +108,8 @@ async def test_withdrawn_cancellation_cancels_nothing_and_says_so(monkeypatch, a
     cancellation_transport(monkeypatch, w)
     p = await booked_call(w)
     await p.says("I want to cancel my appointment.")
+    asked = await p.tool("cancel_appointment")
+    assert asked["status"] == "cancellation_confirmation_required"
     await p.says(answer)
     out = await p.tool("cancel_appointment")
     assert out["status"] == "kept_existing" and out["cancelled"] is False, out
@@ -119,8 +152,12 @@ async def test_legacy_explicit_cancel_still_cancels(monkeypatch):
     w = make_world(monkeypatch)
     cancellation_transport(monkeypatch, w)
     c = await _legacy_booked(w, monkeypatch)
-    await c.says("Please cancel my appointment.", intent=_intent("cancel", T2, w.first),
-                 reply="Your appointment is cancelled. Anything else?")
+    said = await c.says("Please cancel my appointment.", intent=_intent("cancel", T2, w.first),
+                        reply="Your appointment is cancelled. Anything else?")
+    assert said.startswith("Just to confirm, would you like me to cancel your"), said
+    assert not cancels(w)
+    # Whatever the extraction makes of "Yes.", the answer to CARA's question decides.
+    await c.says("Yes.", intent=None, reply="Your appointment is cancelled. Anything else?")
     assert len(cancels(w)) == 1 and not w.square.active()
 
 
@@ -294,9 +331,10 @@ async def test_lost_cancel_response_is_never_reported_as_cancelled_or_kept(monke
 
     monkeypatch.setattr(w.adapter.delegate, "_request", request)
     await p.says("Please cancel my appointment.")
-    out = await p.tool("cancel_appointment")
-    assert out["status"] == "error"
+    await p.tool("cancel_appointment")
+    answer = await p.says("Yes.")
     assert p.session.entities["booking_reconciliation_required"]["operation"] == "cancel"
+    assert not any("has been cancelled" in line for line in answer), answer
     heard = await p.says("Never mind, keep it.")
     said = " ".join(p.heard[-2:] + heard)
     assert "stays exactly as it is" not in said and "has been cancelled" not in said
@@ -520,3 +558,47 @@ async def test_offer_taken_by_someone_else_before_yes_is_never_booked(monkeypatc
     assert not w.square.creates, "a slot that is no longer free must not be booked"
     assert p.session.booking_status != "booked"
     assert not any("all set" in line for line in heard), heard
+
+
+# --------------------------------------------------------------------------- #
+# R2-F1 / R2-F3: the cancel question is bound to its own answer
+# --------------------------------------------------------------------------- #
+from tests.test_brick1_booking_change_guard import reconnect  # noqa: E402
+
+
+async def test_yes_after_another_question_does_not_answer_the_cancel_question(monkeypatch):
+    w = make_world(monkeypatch)
+    cancellation_transport(monkeypatch, w)
+    p = await booked_call(w)
+    await p.says("Please cancel my appointment.")
+    await p.tool("cancel_appointment")
+    p.session.add_turn("assistant", p.heard[-1])                 # CARA's question, as transcribed
+    p.session.add_turn("assistant", "Would you like our address before you go?")
+    await p.says("Yes.")
+    await p.tool("cancel_appointment")
+    assert not cancels(w) and p.starts() == [Z2]
+
+
+async def test_the_cancel_question_survives_a_reconnect(monkeypatch):
+    w = make_world(monkeypatch)
+    cancellation_transport(monkeypatch, w)
+    p = await booked_call(w)
+    await p.says("Please cancel my appointment.")
+    await p.tool("cancel_appointment")
+    q = reconnect(p)
+    await q.says("Yes.")
+    assert len(cancels(w)) == 1 and not w.square.active()
+
+
+@pytest.mark.parametrize("words", [
+    "Can you tell me if I can cancel?", "I might cancel later.", "What happens if I cancel?",
+    "Never cancel my appointment.", "Is there a cancellation fee?",
+])
+async def test_talking_about_cancelling_never_even_asks(monkeypatch, words):
+    w = make_world(monkeypatch)
+    cancellation_transport(monkeypatch, w)
+    p = await booked_call(w)
+    await p.says(words)
+    out = await p.tool("cancel_appointment")
+    assert out["status"] in {"cancellation_not_requested", "kept_existing"}, (words, out)
+    assert not cancels(w) and p.starts() == [Z2]

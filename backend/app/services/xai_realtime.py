@@ -2788,6 +2788,58 @@ class XAIVoiceSession:
             ),
         })
 
+    async def _resolve_pending_cancellation(self, caller_text: str) -> bool:
+        """The caller's answer to CARA's own cancellation question.
+
+        A plain yes that answers exactly that question cancels (the backend
+        owns the write, not the model). Anything else withdraws the question:
+        "no"/"keep it" is told nothing was cancelled; other words are left to
+        the conversation, and a later cancellation needs a fresh request.
+        """
+        pending = self.session.entities.get(booking_guard.PENDING_CANCELLATION)
+        if not isinstance(pending, dict):
+            return False
+        decision = booking_guard.cancellation_decision(self.session)
+        if decision == "confirmed":
+            await self._cancel_active_response()
+            self._response_needed_after_tool = False
+            self._restricted_response_needed_after_tool = False
+            self._pending_forced_tool_message = None
+            output = await self._run_cancel_appointment("{}")
+            forced = self._authoritative_tool_followup(CANCEL_APPOINTMENT_TOOL["name"], output)
+            if forced is None:
+                statement = self._tool_statement(CANCEL_APPOINTMENT_TOOL["name"], output)
+                if statement is None:
+                    try:
+                        payload = json.loads(output)
+                    except (TypeError, json.JSONDecodeError):
+                        payload = {}
+                    forced = (
+                        booking_guard.uncertain_change_speech(self.session, self._tz)
+                        if self.session.entities.get("booking_reconciliation_required")
+                        else "I wasn't able to cancel that appointment, so it is still booked. "
+                        "May a team member call you to help with it?"
+                    )
+                    if payload.get("status") == "cancelled":
+                        forced = None
+                else:
+                    forced = statement or None
+            if forced:
+                await self._send_force_message(forced)
+            await self._persist_session()
+            return True
+        self.session.entities.pop(booking_guard.PENDING_CANCELLATION, None)
+        if decision == "kept":
+            await self._cancel_active_response()
+            self._response_needed_after_tool = False
+            self._restricted_response_needed_after_tool = False
+            await self._send_force_message(
+                booking_guard.refused_cancellation_speech(self.session, self._tz)
+            )
+            await self._persist_session()
+            return True
+        return False
+
     async def _intercept_keep_existing_booking(self, caller_text: str) -> bool:
         """"Keep it" / "never mind" while a change or extra booking is pending.
 
@@ -3357,6 +3409,20 @@ class XAIVoiceSession:
                 "statement": True,
                 "spoken": booking_guard.refused_cancellation_speech(self.session, self._tz),
                 "message": "Nothing was cancelled. The caller is keeping their appointment.",
+            })
+        if booking_guard.CANCELLATION_QUESTION_MARKER in (result.message or ""):
+            # Step one of a cancellation: CARA asks its own question, verbatim.
+            await self._persist_session()
+            return json.dumps({
+                "status": "cancellation_confirmation_required",
+                "booked": False,
+                "cancelled": False,
+                "statement": True,
+                "spoken": result.message.replace(booking_guard.CANCELLATION_QUESTION_MARKER, "").strip(),
+                "message": (
+                    "Nothing was cancelled. The caller is being asked to confirm the "
+                    "cancellation; only their plain yes to that question cancels it."
+                ),
             })
         if result.outcome is BookingOutcome.MISSING_INFO and "has not asked to cancel" in (result.message or ""):
             return json.dumps({
@@ -7130,6 +7196,8 @@ class XAIVoiceSession:
                         source="caller_transcript",
                     )
             self._flush_caller_turn()
+            if caller_text and await self._resolve_pending_cancellation(caller_text):
+                return
             if caller_text and await self._intercept_keep_existing_booking(caller_text):
                 return
             if caller_text and capture_caller_name_answer(self.session, caller_text):

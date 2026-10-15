@@ -2598,17 +2598,22 @@ async def cancel_booking(
     caller selects one of the IDs the backend previously offered.  A model-
     invented UUID is rejected even if it happens to be syntactically valid.
 
-    Nothing is cancelled unless the caller's own current words ask for it:
-    "keep it", "never mind" or "don't cancel" always wins over any model
-    tool call or extraction that decided to cancel, on every voice path, for
-    a booking made on this call or earlier (see `booking_change_guard`).
+    A cancellation is two steps, decided only from the caller's own words
+    (see `booking_change_guard.cancellation_decision`): a plain request makes
+    CARA ask one dedicated question naming the appointment, and only a plain
+    yes that is the very next answer to THAT question cancels it. "Keep it",
+    "don't cancel", questions, uncertainty, an unrelated question in between,
+    or a model/extraction deciding on its own never cancel anything, on any
+    voice path, for a booking made on this call or earlier.
     """
     from app.services import booking_change_guard as guard
 
-    authorization = guard.cancellation_authorization(session)
-    if authorization != "allowed":
-        truth("CANCELLATION_REFUSED", call_sid=session.call_sid, reason=authorization)
-        if authorization == "kept":
+    decision = guard.cancellation_decision(session)
+    pending = session.entities.get(guard.PENDING_CANCELLATION) if decision == "confirmed" else None
+    if decision in {"kept", "none"}:
+        session.entities.pop(guard.PENDING_CANCELLATION, None)
+        truth("CANCELLATION_REFUSED", call_sid=session.call_sid, reason=decision)
+        if decision == "kept":
             if guard.booking_on_record(session) and guard.something_pending(session):
                 guard.keep_existing_booking(
                     session, resolve_timezone(session.timezone),
@@ -2629,6 +2634,11 @@ async def cancel_booking(
                 "cancel_appointment after they clearly say to cancel it."
             ),
         )
+    if pending:
+        # The confirmation answers a question about ONE appointment: that one.
+        if appointment_id and str(appointment_id) != str(pending.get("appointment_id")):
+            decision = "request"
+        appointment_id = str(pending.get("appointment_id"))
     if session.entities.get("booking_reconciliation_required"):
         # An earlier change has an unknown outcome: no further write until
         # staff have reconciled it with the calendar.
@@ -2652,6 +2662,8 @@ async def cancel_booking(
                 allowed_ids.add(draft.appointment_id)
             if session.appointment_id:
                 allowed_ids.add(session.appointment_id)
+            if pending:
+                allowed_ids.add(str(pending.get("appointment_id")))
             if appointment_id not in allowed_ids:
                 save_draft(session, draft)
                 return BookingResult(
@@ -2722,6 +2734,25 @@ async def cancel_booking(
                 message="No upcoming appointment found for this caller to cancel. Let them know politely.",
             )
 
+        if decision != "confirmed" or str(existing.id) != str((pending or {}).get("appointment_id")):
+            # Step one: ask the caller about THIS appointment; nothing is sent.
+            start = existing.start_time
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=timezone.utc)
+            question = guard.cancellation_question(
+                existing.title, start.isoformat(), resolve_timezone(session.timezone)
+            )
+            guard.stage_cancellation(
+                session, str(existing.id), question, turn=guard.current_turn(session)
+            )
+            draft.target_appointment_id = str(existing.id)
+            save_draft(session, draft)
+            return BookingResult(
+                BookingOutcome.MISSING_INFO,
+                message=f"{guard.CANCELLATION_QUESTION_MARKER} {question}",
+            )
+        # Step two: the caller's plain yes answered that exact question.
+        session.entities.pop(guard.PENDING_CANCELLATION, None)
         await _lock_call(db, session.call_sid)
         await _lock_slot(db, routing.scope, existing.start_time, existing.end_time)
         _note_pending_mutation(session, "cancel", existing)

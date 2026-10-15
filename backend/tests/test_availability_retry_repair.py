@@ -287,6 +287,10 @@ async def test_cancel_then_rebook_same_time_is_a_new_idempotent_booking(world):
     db, session = world["db"], world["session"]
     first = await _confirm(db, session, _wants(SEPT_22))
     assert first.outcome == booking.BookingOutcome.BOOKED
+    # Brick 1: the caller asks, CARA asks back, the caller says yes.
+    session.add_turn("user", "Please cancel my appointment.")
+    await booking.cancel_booking(db, session)
+    session.add_turn("user", "Yes.")
     cancelled = await booking.cancel_booking(db, session)
     assert cancelled.outcome == booking.BookingOutcome.CANCELLED
     second = await _confirm(db, session, _wants(SEPT_22))
