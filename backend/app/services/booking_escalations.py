@@ -197,3 +197,46 @@ async def customer_followup(db, tenant_id, request_id, actor_id, consent_note, s
     row.details = {**row.details, "customer_followup": result}
     await db.commit()
     return result
+
+
+UNRESOLVED_CHANGE = "unresolved_change"
+_OPEN_STATUSES = ("pending", "contacted")
+
+
+async def record_unresolved_change(db, tenant_id, call_reference, details):
+    """Durably record a booking change whose provider outcome is unknown.
+
+    Keyed by tenant and appointment, it blocks every later move or
+    cancellation of that appointment -- from any call or the dashboard --
+    until staff resolve it (status no longer pending/contacted).
+    """
+    if not tenant_id or not details.get("appointment_id"):
+        return None
+    reference = f"change:{details['appointment_id']}:{call_reference}"[:128]
+    existing = (await db.execute(select(BookingEscalation).where(
+        BookingEscalation.tenant_id == tenant_id,
+        BookingEscalation.call_reference == reference))).scalar_one_or_none()
+    if existing:
+        return existing
+    row = BookingEscalation(
+        tenant_id=tenant_id, call_reference=reference, status="pending", priority="urgent",
+        category=UNRESOLVED_CHANGE, details=clean(dict(details)), delivery={}, history=[],
+    )
+    db.add(row)
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+    return row
+
+
+async def unresolved_change_for(db, tenant_id, appointment_id):
+    """An unresolved change of this appointment, from any call, if one exists."""
+    if not tenant_id or not appointment_id:
+        return None
+    rows = (await db.execute(select(BookingEscalation).where(
+        BookingEscalation.tenant_id == tenant_id,
+        BookingEscalation.category == UNRESOLVED_CHANGE,
+        BookingEscalation.status.in_(list(_OPEN_STATUSES)),
+    ))).scalars()
+    return next((row for row in rows if str((row.details or {}).get("appointment_id")) == str(appointment_id)), None)

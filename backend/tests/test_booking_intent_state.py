@@ -13,6 +13,7 @@ but still creates two calendar events would fail here.
 """
 import asyncio
 import uuid
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -226,6 +227,17 @@ def world(monkeypatch):
         return _Contact() if getattr(session, "from_number", None) == "+15550000002" else None
 
     monkeypatch.setattr(svc, "_find_contact_by_phone", _contact_for)
+    unresolved = []  # durable unresolved-change records, kept in memory here
+
+    async def _record_unresolved(_db, tenant_id, call_reference, details):
+        unresolved.append(dict(details))
+
+    async def _unresolved_for(_db, tenant_id, appointment_id):
+        return next((SimpleNamespace(details=row) for row in unresolved
+                     if str(row.get("appointment_id")) == str(appointment_id)), None)
+
+    monkeypatch.setattr(svc, "_record_unresolved_change", _record_unresolved)
+    monkeypatch.setattr(svc, "_unresolved_change_for", _unresolved_for)
     monkeypatch.setattr(svc, "_has_conflict", _conflict)
 
     session = CallSession(

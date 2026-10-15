@@ -34,6 +34,10 @@ from sqlalchemy.orm import selectinload
 from app.core.tenancy import TenantScope, scope_columns, scope_filter
 from app.models import Appointment, AppointmentStatus, CallLog, Contact, SpaAccount
 from app.services.booking_escalations import unresolved_booking as _unresolved_booking
+from app.services.booking_escalations import (
+    record_unresolved_change as _record_unresolved_change,
+    unresolved_change_for as _unresolved_change_for,
+)
 from app.models.appointment import CardStatus
 from app.services.booking_adapters import (
     BookingAdapter,
@@ -1023,6 +1027,16 @@ async def _failure(db: AsyncSession, session: CallSession, exc: Exception) -> Bo
         session.entities["booking_reconciliation_required"] = {
             "code": exc.code, "details": str(exc), **pending,
         }
+        if pending.get("appointment_id"):
+            # Durable, per appointment: blocks later calls and the dashboard too.
+            try:
+                await _record_unresolved_change(
+                    db, _tenant_uuid(session), session.call_sid,
+                    {"code": exc.code, "details": str(exc), **pending},
+                )
+            except Exception:
+                logger.exception("Could not record an unresolved change for call %s", session.call_sid)
+                truth("UNRESOLVED_CHANGE_NOT_RECORDED", call_sid=session.call_sid)
         truth("BOOKING_RECONCILIATION_REQUIRED", call_sid=session.call_sid,
               code=exc.code, operation=pending.get("operation"))
         await _notify_provider_error(
@@ -1787,6 +1801,27 @@ async def _observe_after_uncertain_write(session: CallSession, routing: _Routing
         pending["provider_observed"] = observed
 
 
+def _tenant_uuid(session: CallSession):
+    try:
+        return uuid.UUID(str(session.tenant_id)) if session.tenant_id else None
+    except (TypeError, ValueError):
+        return None
+
+
+async def _unresolved_change_blocks(
+    db: AsyncSession, session: CallSession | None, scope: TenantScope, appointment: Appointment,
+) -> dict | None:
+    """An earlier change of this appointment has an unknown outcome."""
+    row = await _unresolved_change_for(db, scope.tenant_id, str(appointment.id))
+    if row is None:
+        return None
+    details = dict(getattr(row, "details", None) or {})
+    if session is not None:
+        session.entities["booking_reconciliation_required"] = details
+    truth("CHANGE_BLOCKED_UNRESOLVED", appointment_id=str(appointment.id))
+    return details
+
+
 async def _move_existing(
     db: AsyncSession,
     session: CallSession,
@@ -1806,6 +1841,11 @@ async def _move_existing(
     calendar is the row itself, and a calendar that cannot change a service in
     place is refused with the original booking left untouched.
     """
+    if await _unresolved_change_blocks(db, session, routing.scope, existing):
+        return BookingResult(
+            BookingOutcome.ERROR,
+            message="An earlier change to this appointment needs staff verification before another change. May a staff member call you to help?",
+        )
     mode = str(getattr(routing.adapter, "service_change_mode", "unsupported") or "unsupported")
     if service_change and mode not in {"provider", "local"}:
         return _service_change_refused(existing, "this calendar cannot change the service of a booking")
@@ -2555,6 +2595,12 @@ async def apply_staff_change(
     """
     if not appointment.external_booking_id:
         return  # exists only in CARA: the caller updates the row, nothing else
+    if await _unresolved_change_blocks(db, None, scope, appointment):
+        raise StaffChangeRefused(
+            409,
+            "An earlier change to this appointment has an unknown outcome. Check it in the "
+            "calendar and resolve the staff alert before changing it again.",
+        )
     spa = await _load_spa(db, scope)
     if spa is None:
         raise StaffChangeRefused(404, "Business not found")
@@ -2763,6 +2809,12 @@ async def cancel_booking(
                 ),
             )
 
+        if await _unresolved_change_blocks(db, session, routing.scope, existing):
+            session.entities.pop(guard.PENDING_CANCELLATION, None)
+            return BookingResult(
+                BookingOutcome.ERROR,
+                message="An earlier change to this appointment needs staff verification before another change. May a staff member call you to help?",
+            )
         if decision != "confirmed" or str(existing.id) != str((pending or {}).get("appointment_id")):
             # Step one: ask the caller about THIS appointment; nothing is sent.
             start = existing.start_time

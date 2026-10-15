@@ -804,3 +804,72 @@ async def test_same_caller_on_a_later_call_can_still_cancel_their_booking(monkey
     assert out["status"] == "cancellation_confirmation_required", out
     await later.says("Yes.")
     assert len(cancels(w)) == 1 and not w.square.active()
+
+
+# --------------------------------------------------------------------------- #
+# R2-F8: an unresolved change blocks every later change, from anywhere
+# --------------------------------------------------------------------------- #
+async def _lost_move_on_sqlite(rubyz_db, monkeypatch):
+    from app.services import appointment_booking_service as booking
+    from app.services.booking_state import arm_verified_proposal
+    from app.services.grok_service import AppointmentIntent
+
+    db, a, _b, squares = await setup_tenants(rubyz_db, monkeypatch)
+    call1 = session_for(a, "lost-move")
+    row = await book(db, a, call1)
+    row_id = row.id
+    square = squares["fake-cleaning-token"]
+    square.open_all(T3)
+
+    async def lose(method, path, *, json=None):
+        result = await square(method, path, json=json)
+        if method == "PUT":
+            raise BookingProviderError("response lost", code="BOOKING_OUTCOME_UNKNOWN", retryable=False)
+        return result
+
+    squares["fake-cleaning-token"] = lose
+    call1.add_turn("user", "Move my appointment to Thursday at 3 PM instead.")
+    await booking.stage_booking(db, call1, AppointmentIntent(
+        intent="reschedule", confidence=1, service_description=a.services[0]["name"],
+        requested_start_iso=local(T3)))
+    arm_verified_proposal(call1)
+    assert (await booking.confirm_booking(db, call1)).outcome is booking.BookingOutcome.ERROR
+    squares["fake-cleaning-token"] = square
+    await db.refresh(a)   # the real rollback expires ORM objects
+    return db, a, square, row_id
+
+
+async def test_unresolved_change_is_durable_and_blocks_the_dashboard(rubyz_db, monkeypatch):
+    from sqlalchemy import select
+    from app.api.v1.appointments import cancel_appointment
+    from app.models.booking_escalation import BookingEscalation
+
+    db, a, square, row_id = await _lost_move_on_sqlite(rubyz_db, monkeypatch)
+    records = list((await db.execute(select(BookingEscalation))).scalars())
+    assert [r.category for r in records] == ["unresolved_change"]
+    assert records[0].details["appointment_id"] == str(row_id) and records[0].status == "pending"
+    writes = len([c for c in square.calls if c[0] == "PUT" or c[1].endswith("/cancel")])
+    with pytest.raises(HTTPException) as raised:
+        await cancel_appointment(row_id, scope=session_for(a, "staff").scope, db=db)
+    assert raised.value.status_code == 409
+    assert len([c for c in square.calls if c[0] == "PUT" or c[1].endswith("/cancel")]) == writes
+    # Once staff have reconciled it, changes are possible again.
+    records[0].status = "resolved"
+    await db.commit()
+    await cancel_appointment(row_id, scope=session_for(a, "staff").scope, db=db)
+    assert not square.active()
+
+
+async def test_unresolved_change_blocks_a_later_voice_call_even_after_its_question(rubyz_db, monkeypatch):
+    from app.services import appointment_booking_service as booking
+
+    db, a, square, row_id = await _lost_move_on_sqlite(rubyz_db, monkeypatch)
+    later = session_for(a, "later-call")
+    later.add_turn("user", "Please cancel my appointment.")
+    first = await booking.cancel_booking(db, later)
+    later.add_turn("user", "Yes.")
+    second = await booking.cancel_booking(db, later)
+    assert first.outcome is booking.BookingOutcome.ERROR, first.message   # blocked before asking
+    assert second.outcome is not booking.BookingOutcome.CANCELLED, second.message
+    assert later.entities.get("booking_reconciliation_required", {}).get("appointment_id") == str(row_id)
+    assert not any(c[1].endswith("/cancel") for c in square.calls)
