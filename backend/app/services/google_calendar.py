@@ -1,5 +1,7 @@
 """Google OAuth and Calendar API operations for one spa connection."""
 import asyncio
+import hashlib
+import re
 import json
 import logging
 from datetime import datetime, timezone
@@ -202,7 +204,13 @@ async def create_event(
     event_start, event_end = _event_times(start, end, timezone_name)
     body = {"summary": title, "description": description, "start": event_start, "end": event_end}
     if event_id:
-        body["id"] = event_id.replace("-", "")
+        legacy_id = event_id.replace("-", "")
+        # Preserve valid historical IDs for retries. Voice intent keys contain
+        # uppercase CallSids and colons, which Google does not accept.
+        body["id"] = (
+            legacy_id if re.fullmatch(r"[a-v0-9]{5,1024}", legacy_id)
+            else hashlib.sha256(event_id.encode("utf-8")).hexdigest()
+        )
     try:
         service = await _service(connection)
         result = await asyncio.to_thread(
