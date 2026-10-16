@@ -90,6 +90,39 @@ async def _durable_contact(db, tenant_id, details) -> Contact | None:
     return contact
 
 
+async def _settle_companion(db, tenant_id, record: BookingEscalation, details: dict, actor_id,
+                            appointment_id: str, event_id: str) -> None:
+    """Settle the per-call booking escalation written for this same attempt.
+
+    Identified by the link stored on the record, or - for a record written
+    before the link existed - by the exact call reference it was recorded
+    under. Never by phone or time: unrelated work items stay untouched. Runs
+    in the caller's transaction, so it commits atomically with the link.
+    """
+    query = select(BookingEscalation).where(
+        BookingEscalation.tenant_id == tenant_id, BookingEscalation.category != PENDING_CREATE)
+    companion_id = _uuid(details.get("companion_escalation_id"))
+    if companion_id is not None:
+        query = query.where(BookingEscalation.id == companion_id)
+    elif details.get("call_sid"):
+        query = query.where(BookingEscalation.call_reference == str(details["call_sid"]))
+    else:
+        return
+    companion = (await db.execute(query.with_for_update())).scalar_one_or_none()
+    if companion is None or companion.status not in _OPEN_STATUSES:
+        return
+    companion.status = "booked"
+    companion.version += 1
+    if companion.delivery_status == "pending":
+        # Not yet sent: do not alert staff about a booking that is now verified.
+        companion.delivery_status = "resolved_before_delivery"
+    companion.details = {**(companion.details or {}), "provider_success_verified": True,
+                         "reconciled_event_id": event_id, "reconciled_appointment_id": appointment_id,
+                         "reconciled_by_pending_create": str(record.id)}
+    _note(companion, actor_id, "reconciled_by_pending_create", pending_create_id=str(record.id),
+          appointment_id=appointment_id, event_id=event_id)
+
+
 def _note(row: BookingEscalation, actor_id, action: str, **extra) -> None:
     row.history = [*(row.history or []), {"at": now().isoformat(), "actor": str(actor_id),
                                           "action": action, **clean(extra)}]
@@ -175,6 +208,7 @@ async def reconcile_pending_create(db, tenant_id, request_id, actor_id) -> dict:
                    "reconciled_appointment_id": str(appointment.id),
                    "provider_success_verified": True}
     _note(row, actor_id, "reconcile_linked", appointment_id=str(appointment.id), event_id=event_id)
+    await _settle_companion(db, tenant_id, row, details, actor_id, str(appointment.id), event_id)
     await db.commit()
     logger.info("Pending Google create %s reconciled to appointment %s", row.id, appointment.id)
     return {"status": "booked", "appointment_id": str(appointment.id), "event_id": event_id}

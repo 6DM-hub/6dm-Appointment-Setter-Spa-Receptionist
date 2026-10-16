@@ -90,3 +90,39 @@ async def test_new_caller_lost_create_reconciles_to_one_valid_contact_and_appoin
     assert appointments[0].external_booking_id in fake.state
     assert len(fake.inserted_ids) == 1                            # no second provider insert
     assert await _count(maker, Contact, Contact.tenant_id == _other.id) == 0   # tenant-scoped
+
+
+# --------------------------------------------------------------------------- #
+# Codex review P2: the companion per-call escalation is settled with the record
+# --------------------------------------------------------------------------- #
+async def test_successful_reconcile_settles_the_companion_escalation(pg, monkeypatch):
+    maker, (spa, _other) = pg
+    _fake, start, pending, rows = await _lost_create(maker, spa, monkeypatch, "CA-companion")
+    companion = [r for r in rows if r.category != esc.PENDING_CREATE]
+    assert len(companion) == 1 and companion[0].call_reference == "CA-companion", rows
+    async with maker() as db:
+        outcome = await reconcile_pending_create(db, spa.id, pending.id, uuid.uuid4())
+    assert outcome["status"] == "booked", outcome
+    async with maker() as db:
+        settled = await db.get(BookingEscalation, companion[0].id)
+        assert settled.status not in ("pending", "contacted"), settled.status
+        assert settled.delivery_status != "pending", settled.delivery_status   # no obsolete alert
+        assert settled.details.get("provider_success_verified") is True
+        assert any(h.get("action") == "reconciled_by_pending_create" for h in settled.history), settled.history
+        assert await esc.unresolved_booking(db, spa.id, PHONE, start) is None    # no stale blocker
+
+
+async def test_reconcile_never_settles_unrelated_work_for_the_same_phone_and_time(pg, monkeypatch):
+    maker, (spa, _other) = pg
+    _fake, start, pending, _rows = await _lost_create(maker, spa, monkeypatch, "CA-related")
+    async with maker() as db:
+        unrelated = await esc.record(db, await db.get(type(spa), spa.id), "CA-unrelated-call",
+                                     {"customer_phone": PHONE, "requested_start": start.isoformat()},
+                                     RuntimeError("an earlier, unrelated failure"))
+        unrelated_id = unrelated.id
+    async with maker() as db:
+        assert (await reconcile_pending_create(db, spa.id, pending.id, uuid.uuid4()))["status"] == "booked"
+    async with maker() as db:
+        untouched = await db.get(BookingEscalation, unrelated_id)
+        assert untouched.status == "pending"
+        assert not any(h.get("action") == "reconciled_by_pending_create" for h in (untouched.history or []))

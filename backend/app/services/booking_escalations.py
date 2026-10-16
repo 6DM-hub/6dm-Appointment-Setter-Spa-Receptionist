@@ -408,7 +408,8 @@ def _create_details(details, **extra):
     row_details = clean({**dict(details), **extra})
     # Identifiers are looked up by value; payment redaction must not alter them.
     for key in ("booking_reference", "event_id", "calendar_id", "contact_id", "source_call_id",
-                "user_id", "requested_start", "requested_end", "customer_phone", "contact_phone"):
+                "user_id", "requested_start", "requested_end", "customer_phone", "contact_phone",
+                "companion_escalation_id", "call_sid"):
         if details.get(key) is not None:
             row_details[key] = str(details[key])
     return row_details

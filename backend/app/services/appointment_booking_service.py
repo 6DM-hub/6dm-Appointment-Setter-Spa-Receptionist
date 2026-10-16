@@ -1849,6 +1849,7 @@ def _google_writer(adapter: Any):
 
 async def _settle_pending_create_after_error(
     db: AsyncSession, record_id, exc: Exception, details: dict, *, escalated: bool,
+    companion_id=None,
 ) -> None:
     """After a failed create: remove the record only when nothing was created.
 
@@ -1873,7 +1874,10 @@ async def _settle_pending_create_after_error(
                 _mark_pending_create_unresolved(
                     db, record_id, {"error_code": getattr(exc, "code", None),
                                     "provider_success_verified": bool(details.get("provider_success_verified")),
-                                    "external_booking_id": details.get("external_booking_id")},
+                                    "external_booking_id": details.get("external_booking_id"),
+                                    # The per-call escalation that alerts staff for this
+                                    # same attempt: reconciliation settles it too.
+                                    "companion_escalation_id": str(companion_id) if companion_id else None},
                     escalated=escalated),
                 timeout=FENCE_TIMEOUT_SECONDS)
     except Exception:
@@ -2804,7 +2808,8 @@ async def _confirm_booking(
                 spa = await db.get(SpaAccount, escalation_spa_id)
                 request = await record(db, spa, session.call_sid, escalation_details, exc)
                 await _settle_pending_create_after_error(
-                    db, pending_create, exc, escalation_details, escalated=True)
+                    db, pending_create, exc, escalation_details, escalated=True,
+                    companion_id=getattr(request, "id", None))
                 pending_create = None
                 session.entities["booking_escalation_id"] = str(request.id)
                 session.entities["booking_reconciliation_required"] = {"request_id": str(request.id)}
