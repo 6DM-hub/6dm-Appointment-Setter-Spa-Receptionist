@@ -2626,6 +2626,13 @@ async def _confirm_booking(
                         "customer_phone": ctx.customer_phone, "customer_name": ctx.customer_name,
                         "services": ctx.service_description, "title": ctx.title,
                         "description": description, "contact_id": contact.id,
+                        # The contact may be new and only flushed: if this
+                        # transaction rolls back, reconciliation rebuilds it
+                        # from these durable, tenant-scoped details.
+                        "contact_phone": getattr(contact, "phone_number", None),
+                        "contact_first_name": getattr(contact, "first_name", None),
+                        "contact_last_name": getattr(contact, "last_name", None),
+                        "contact_email": getattr(contact, "email", None),
                         "source_call_id": appointment.source_call_id,
                         "user_id": getattr(appointment, "user_id", None), "call_sid": session.call_sid,
                     }, record_id=planned), timeout=FENCE_TIMEOUT_SECONDS)

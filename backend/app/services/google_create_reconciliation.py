@@ -22,7 +22,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.models import Appointment, AppointmentStatus
+from app.models import Appointment, AppointmentStatus, Contact
 from app.models.booking_escalation import BookingEscalation
 from app.models.google_calendar_connection import GoogleCalendarConnection
 from app.services import google_calendar as gc
@@ -52,6 +52,44 @@ async def _linked_row(db, tenant_id, reference) -> Appointment | None:
     ))).scalar_one_or_none()
 
 
+async def _durable_contact(db, tenant_id, details) -> Contact | None:
+    """The caller's contact, from durable tenant-scoped data only.
+
+    The recorded contact id is used only if that contact still exists for
+    this tenant: a brand-new contact flushed in a booking transaction that
+    later rolled back is gone. Then the tenant's contact for the recorded
+    phone is reused, or recreated from the recorded identity. The unique
+    (tenant, phone) index makes a concurrent recreation find the first row.
+    """
+    contact_id = _uuid(details.get("contact_id"))
+    if contact_id is not None:
+        found = (await db.execute(select(Contact).where(
+            Contact.id == contact_id, Contact.tenant_id == tenant_id))).scalar_one_or_none()
+        if found is not None:
+            return found
+    phone = details.get("contact_phone") or details.get("customer_phone")
+    if not phone:
+        return None
+
+    async def by_phone():
+        return (await db.execute(select(Contact).where(
+            Contact.tenant_id == tenant_id, Contact.phone_number == phone))).scalar_one_or_none()
+
+    existing = await by_phone()
+    if existing is not None:
+        return existing
+    contact = Contact(tenant_id=tenant_id, phone_number=phone,
+                      first_name=details.get("contact_first_name"),
+                      last_name=details.get("contact_last_name"),
+                      email=details.get("contact_email"))
+    try:
+        async with db.begin_nested():
+            db.add(contact)
+    except IntegrityError:
+        return await by_phone()
+    return contact
+
+
 def _note(row: BookingEscalation, actor_id, action: str, **extra) -> None:
     row.history = [*(row.history or []), {"at": now().isoformat(), "actor": str(actor_id),
                                           "action": action, **clean(extra)}]
@@ -78,11 +116,11 @@ async def reconcile_pending_create(db, tenant_id, request_id, actor_id) -> dict:
 
     reference = details.get("booking_reference")
     start, end = _parse(details.get("requested_start")), _parse(details.get("requested_end"))
-    contact_id = _uuid(details.get("contact_id"))
     connection = (await db.execute(select(GoogleCalendarConnection).where(
         GoogleCalendarConnection.spa_id == tenant_id))).scalar_one_or_none()
     reason = None
-    if not reference or start is None or end is None or contact_id is None:
+    if not reference or start is None or end is None or not (
+            details.get("contact_id") or details.get("contact_phone") or details.get("customer_phone")):
         reason = "the record is missing booking identity"
     elif connection is None or connection.selected_calendar_id != details.get("calendar_id"):
         reason = "the business's Google calendar is no longer the one the booking was sent to"
@@ -100,8 +138,14 @@ async def reconcile_pending_create(db, tenant_id, request_id, actor_id) -> dict:
 
     appointment = await _linked_row(db, tenant_id, reference)
     if appointment is None:
+        contact = await _durable_contact(db, tenant_id, details)
+        if contact is None:
+            _note(row, actor_id, "reconcile_unverified", reason="the caller's identity could not be recovered")
+            row.version += 1
+            await db.commit()
+            return {"status": "unknown", "reason": "the caller's identity could not be recovered"}
         appointment = Appointment(
-            tenant_id=tenant_id, user_id=_uuid(details.get("user_id")), contact_id=contact_id,
+            tenant_id=tenant_id, user_id=_uuid(details.get("user_id")), contact_id=contact.id,
             source_call_id=_uuid(details.get("source_call_id")),
             title=details.get("title") or "Appointment",
             description=details.get("description"),
