@@ -158,7 +158,7 @@ async def get_appointment(
     return appointment
 
 
-@router.patch("/{appointment_id}", response_model=AppointmentRead)
+@router.patch("/{appointment_id}", response_model=AppointmentRead, dependencies=[Depends(get_tenant_manager)])
 async def update_appointment(
     appointment_id: uuid.UUID,
     payload: AppointmentUpdate,
@@ -194,7 +194,7 @@ async def update_appointment(
     return appointment
 
 
-@router.delete("/{appointment_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{appointment_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(get_tenant_manager)])
 async def cancel_appointment(
     appointment_id: uuid.UUID,
     scope: TenantScope = Depends(get_tenant_scope),
