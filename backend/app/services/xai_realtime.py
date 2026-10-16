@@ -6504,12 +6504,14 @@ class XAIVoiceSession:
                 try:
                     return await asyncio.wait_for(handler(raw_args), timeout=20)
                 except asyncio.CancelledError:
-                    if name == PROPOSE_APPOINTMENT_TOOL["name"]:
+                    if (name == PROPOSE_APPOINTMENT_TOOL["name"]
+                            and not booking_guard.is_exact_booked_replay(self.session)):
                         invalidate_booking_proposal(self.session, "proposal_cancelled")
                         self.session.booking_status = "collecting_details"
                     raise
                 except asyncio.TimeoutError:
-                    if name == PROPOSE_APPOINTMENT_TOOL["name"]:
+                    if (name == PROPOSE_APPOINTMENT_TOOL["name"]
+                            and not booking_guard.is_exact_booked_replay(self.session)):
                         invalidate_booking_proposal(self.session, "proposal_timeout")
                         self.session.booking_status = "collecting_details"
                     logger.error("AVAILABILITY_TIMEOUT call=%s tool=%s", self.call_id, name)
@@ -6578,6 +6580,9 @@ class XAIVoiceSession:
             for task in pending:
                 task.cancel()
         await asyncio.gather(*done, *pending, return_exceptions=True)
+        # A change the caller started but never completed must not leave the
+        # finished call recorded as not booked while the booking still exists.
+        booking_guard.settle_abandoned_change(self.session, call_sid=self.call_id)
 
     async def _stop_availability_hold_watchdog(self) -> None:
         task = self._availability_hold_watchdog_task
@@ -7657,9 +7662,7 @@ class XAIVoiceSession:
                 call_log.transcript = transcript or None
                 call_log.ai_analysis = {
                     **(call_log.ai_analysis or {}),
-                    "booking_outcome": self.session.booking_status
-                    if self.session.booking_status != "none"
-                    else "no_booking",
+                    "booking_outcome": booking_guard.reported_booking_outcome(self.session),
                     "linked_appointment_id": self.session.appointment_id,
                     "sensitive_health_request": bool(self.session.entities.get("sensitive_health_request")),
                     "medical_workflow_enabled": False,

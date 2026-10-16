@@ -25,6 +25,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import CallDirection, CallLog, CallStatus
+from app.services.booking_change_guard import reported_booking_outcome
 from app.services.call_state import CallStateStore
 from app.services.caller_identity import persist_caller_identity
 from app.services.grok_service import grok_service, primary_caller_language
@@ -87,9 +88,7 @@ async def finalize_gather_call(
     call_log.transcript = session.transcript_text or None
     call_log.ai_analysis = {
         **(call_log.ai_analysis or {}),
-        "booking_outcome": session.booking_status
-        if session.booking_status != "none"
-        else "no_booking",
+        "booking_outcome": reported_booking_outcome(session),
         "linked_appointment_id": session.appointment_id,
     }
     if session.history:

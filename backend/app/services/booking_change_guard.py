@@ -137,6 +137,85 @@ def is_exact_booked_replay(session: Any) -> bool:
     return all(getattr(current, field) == booked.get(field) for field in fields)
 
 
+def _restore_booked_snapshot(session: Any) -> bool:
+    """Put the session back on the booking the calendar holds, with no pending
+    proposal or consent. Returns False when there is no snapshot to restore.
+    Writes nothing to any calendar."""
+    snapshot = session.entities.get(BOOKED_DRAFT_SNAPSHOT) or {}
+    for key in (BOOKING_CHANGE_CLARIFICATION, BOOKING_CHANGE_IN_PROGRESS, ADDITIONAL_BOOKING):
+        session.entities.pop(key, None)
+    for key in _STALE_OFFER_KEYS:
+        session.entities.pop(key, None)
+    restored_any = False
+    if snapshot.get("draft"):
+        restored = BookingDraft.from_dict(snapshot["draft"])
+        # The restored booking is not awaiting any consent.
+        restored.read_back = False
+        restored.confirmation_authorized = False
+        save_draft(session, restored)
+        session.selected_service = snapshot.get("selected_service") or restored.service_description
+        session.selected_duration = snapshot.get("selected_duration")
+        if restored.appointment_id:
+            session.appointment_id = restored.appointment_id
+            session.external_booking_id = restored.external_booking_id
+        if snapshot.get("confirmed_datetime"):
+            session.confirmed_datetime = snapshot["confirmed_datetime"]
+        if snapshot.get("requested_datetime"):
+            session.requested_datetime = snapshot["requested_datetime"]
+        restored_any = True
+    consume_confirmation_authorization(session)
+    session.booking_status = "booked"
+    return restored_any
+
+
+def _abandoned_change_on_record(session: Any) -> bool:
+    """A booking completed on this call, a later change or addition was
+    started but never completed, and no change has an unknown outcome."""
+    snapshot = session.entities.get(BOOKED_DRAFT_SNAPSHOT) or {}
+    appointment_id = snapshot.get("appointment_id")
+    return bool(
+        booking_on_record(session)
+        and snapshot.get("draft")
+        and appointment_id
+        # Still the call's active booking: a cancellation clears this pointer,
+        # so a cancelled booking is never reported or restored as booked.
+        and str(session.entities.get("active_appointment_id") or "") == str(appointment_id)
+        and session.entities.get("last_booking_outcome") != "cancelled"
+        and getattr(session, "booking_status", None) not in {"booked", "rescheduled"}
+        and not reconciliation_pending(session)
+    )
+
+
+def settle_abandoned_change(session: Any, *, call_sid: str | None = None) -> bool:
+    """Call end: drop a change the caller started but never completed and
+    leave the session on the booking the calendar still holds.
+
+    No permission is re-opened: the restored draft IS the booked one, so an
+    old confirmation can only ever be an exact no-op replay. When a change
+    outcome is unknown nothing is restored or claimed.
+    """
+    if not _abandoned_change_on_record(session):
+        return False
+    _restore_booked_snapshot(session)
+    session.entities["abandoned_change_at_call_end"] = True
+    truth("BOOKING_CHANGE_ABANDONED_AT_CALL_END", call_sid=call_sid,
+          appointment_id=get_draft(session).appointment_id)
+    return True
+
+
+def reported_booking_outcome(session: Any) -> str:
+    """The outcome a finished call is recorded with.
+
+    A booking completed on this call is still reported as booked when a later
+    change was abandoned: nothing changed at the provider. An unknown change
+    outcome keeps its own status.
+    """
+    if _abandoned_change_on_record(session):
+        return "booked"
+    status = getattr(session, "booking_status", None) or "none"
+    return status if status != "none" else "no_booking"
+
+
 def completed_turn(session: Any) -> int | None:
     marker = session.entities.get(BOOKING_COMPLETED) or {}
     turn = marker.get("turn")
@@ -293,30 +372,8 @@ def keep_existing_booking(session: Any, tz: Any, *, turn: int, call_sid: str | N
         truth("BOOKING_KEEP_DURING_RECONCILIATION", call_sid=call_sid)
         return uncertain_change_speech(session, tz)
     service, booked_iso = booked_details(session)
-    snapshot = session.entities.get(BOOKED_DRAFT_SNAPSHOT) or {}
-    for key in (BOOKING_CHANGE_CLARIFICATION, BOOKING_CHANGE_IN_PROGRESS, ADDITIONAL_BOOKING):
-        session.entities.pop(key, None)
-    for key in _STALE_OFFER_KEYS:
-        session.entities.pop(key, None)
-    if snapshot.get("draft"):
-        restored = BookingDraft.from_dict(snapshot["draft"])
-        # The restored booking is not awaiting any consent.
-        restored.read_back = False
-        restored.confirmation_authorized = False
-        save_draft(session, restored)
-        session.selected_service = snapshot.get("selected_service") or restored.service_description
-        session.selected_duration = snapshot.get("selected_duration")
-        if restored.appointment_id:
-            session.appointment_id = restored.appointment_id
-            session.external_booking_id = restored.external_booking_id
-        if snapshot.get("confirmed_datetime"):
-            session.confirmed_datetime = snapshot["confirmed_datetime"]
-        if snapshot.get("requested_datetime"):
-            session.requested_datetime = snapshot["requested_datetime"]
-    else:
+    if not _restore_booked_snapshot(session):
         invalidate_booking_proposal(session, "caller_kept_existing_booking")
-    consume_confirmation_authorization(session)
-    session.booking_status = "booked"
     session.entities[BOOKING_KEPT_TURN] = int(turn)
     truth("BOOKING_KEPT_AS_IS", call_sid=call_sid, appointment_id=get_draft(session).appointment_id)
     return kept_booking_speech(service, booked_iso, tz)
