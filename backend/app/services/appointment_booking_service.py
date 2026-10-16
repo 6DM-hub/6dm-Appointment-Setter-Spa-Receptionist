@@ -35,6 +35,12 @@ from app.core.tenancy import TenantScope, scope_columns, scope_filter
 from app.models import Appointment, AppointmentStatus, CallLog, Contact, SpaAccount
 from app.services.booking_escalations import unresolved_booking as _unresolved_booking
 from app.services.booking_escalations import (
+    CreateInFlight as _CreateInFlight,
+    close_pending_create as _close_pending_create,
+    mark_pending_create_unresolved as _mark_pending_create_unresolved,
+    open_pending_create as _open_pending_create,
+)
+from app.services.booking_escalations import (
     ChangeInFlight as _ChangeInFlight,
     close_change_fence as _close_change_fence,
     mark_change_unknown as _mark_change_unknown,
@@ -1816,6 +1822,64 @@ _CHANGE_IN_FLIGHT = (
 )
 
 
+# Google create refusals that prove nothing was created (adapter codes).
+_DEFINITE_CREATE_REFUSALS = {
+    "GOOGLE_REFUSED", "AUTHORIZATION_REQUIRED", "TOKEN_EXPIRED_OR_REVOKED",
+    "INSUFFICIENT_PERMISSIONS", "CALENDAR_NOT_FOUND", "CALENDAR_NOT_SELECTED",
+}
+_CREATE_IN_FLIGHT = (
+    "An earlier booking attempt for this request still needs staff verification, so "
+    "nothing new was booked. May a staff member contact you to help?"
+)
+_CREATE_UNRECORDABLE = (
+    "I cannot safely book that right now, so nothing was booked. Apologize and offer "
+    "to have a staff member call the caller back."
+)
+
+
+def _google_writer(adapter: Any):
+    """The configured Google Calendar adapter behind ``adapter``, if any."""
+    from app.services.booking_adapters.google_calendar import GoogleCalendarAdapter
+
+    for candidate in (adapter, getattr(adapter, "delegate", None)):
+        if isinstance(candidate, GoogleCalendarAdapter) and candidate.is_configured:
+            return candidate
+    return None
+
+
+async def _settle_pending_create_after_error(
+    db: AsyncSession, record_id, exc: Exception, details: dict, *, escalated: bool,
+) -> None:
+    """After a failed create: remove the record only when nothing was created.
+
+    A definite refusal before any provider success removes it; everything
+    else (unknown outcome, a failure after Google confirmed, an unexpected
+    error) keeps it open for reconciliation. Never raises: if the update
+    fails the record stays held and the dispatcher alerts staff (fail closed).
+    """
+    if record_id is None:
+        return
+    definite = (
+        isinstance(exc, BookingProviderError)
+        and getattr(exc, "code", None) in _DEFINITE_CREATE_REFUSALS
+        and not details.get("provider_success_verified")
+    )
+    try:
+        if definite:
+            await asyncio.wait_for(_close_pending_create(db, record_id, own_transaction=True),
+                                   timeout=FENCE_TIMEOUT_SECONDS)
+        else:
+            await asyncio.wait_for(
+                _mark_pending_create_unresolved(
+                    db, record_id, {"error_code": getattr(exc, "code", None),
+                                    "provider_success_verified": bool(details.get("provider_success_verified")),
+                                    "external_booking_id": details.get("external_booking_id")},
+                    escalated=escalated),
+                timeout=FENCE_TIMEOUT_SECONDS)
+    except Exception:
+        logger.exception("Could not settle pending create record %s", record_id)
+
+
 async def _discard_unsent_fence(db: AsyncSession, fence_id) -> None:
     """Opening the fence failed or timed out, and nothing was sent. Its commit
     may still have landed: remove it, so it does not block the appointment.
@@ -2542,6 +2606,44 @@ async def _confirm_booking(
             "location": getattr(routing.spa, "location", None), "slot": ctx.selected_slot,
             "provider": routing.adapter.provider, "booking_reference": key,
         }
+        google = _google_writer(routing.adapter)
+        if google is not None and routing.scope.tenant_id is not None:
+            # Write-ahead: the attempt is durable BEFORE Google is asked, so a
+            # lost reply or a dead worker can still be reconciled, and a
+            # second attempt of this intent is refused while it is open.
+            from datetime import timezone as _tz
+
+            from app.services.google_calendar import deterministic_event_id
+
+            planned = uuid.uuid4()
+            try:
+                pending_create_id = await asyncio.wait_for(_open_pending_create(
+                    db, routing.scope.tenant_id, key, {
+                        "booking_reference": key, "provider": google.provider,
+                        "calendar_id": google.calendar_id, "event_id": deterministic_event_id(key),
+                        "requested_start": start.astimezone(_tz.utc).isoformat(),
+                        "requested_end": end.astimezone(_tz.utc).isoformat(),
+                        "customer_phone": ctx.customer_phone, "customer_name": ctx.customer_name,
+                        "services": ctx.service_description, "title": ctx.title,
+                        "description": description, "contact_id": contact.id,
+                        "source_call_id": appointment.source_call_id,
+                        "user_id": getattr(appointment, "user_id", None), "call_sid": session.call_sid,
+                    }, record_id=planned), timeout=FENCE_TIMEOUT_SECONDS)
+            except _CreateInFlight:
+                truth("CREATE_BLOCKED_IN_FLIGHT", call_sid=session.call_sid)
+                await _safe_rollback(db)
+                session.booking_status = "follow_up_required"
+                return BookingResult(BookingOutcome.ERROR, message=_CREATE_IN_FLIGHT)
+            except Exception:
+                logger.exception("Could not record a create before sending it: call_sid=%s", session.call_sid)
+                truth("CREATE_NOT_RECORDED", call_sid=session.call_sid)
+                await _safe_rollback(db)
+                try:
+                    await asyncio.wait_for(_close_pending_create(db, planned, own_transaction=True),
+                                           timeout=FENCE_TIMEOUT_SECONDS)
+                except Exception:
+                    logger.exception("Could not discard an unsent create record %s", planned)
+                return BookingResult(BookingOutcome.ERROR, message=_CREATE_UNRECORDABLE)
         try:
             external = await _calendar_call(
                 "create_booking", session.call_sid, routing.adapter.create_booking(ctx)
@@ -2592,6 +2694,9 @@ async def _confirm_booking(
             )
             appointment.card_status = CardStatus.UNKNOWN
         session.entities["card_status"] = appointment.card_status.value
+        # Verified create: the write-ahead record goes in the same transaction
+        # as the local appointment, so exactly one of them survives.
+        await _close_pending_create(db, locals().get("pending_create_id"))
         await db.commit()
         await db.refresh(appointment)
         card_sms = "not_attempted"
@@ -2683,6 +2788,7 @@ async def _confirm_booking(
             ),
         )
     except Exception as exc:
+        pending_create = locals().get("pending_create_id")
         if "escalation_details" in locals() and escalation_spa_id is not None:
             session.entities["booking_reconciliation_required"] = {"status": "staff_review_required"}
             await _safe_rollback(db)
@@ -2690,12 +2796,17 @@ async def _confirm_booking(
                 from app.services.booking_escalations import record
                 spa = await db.get(SpaAccount, escalation_spa_id)
                 request = await record(db, spa, session.call_sid, escalation_details, exc)
+                await _settle_pending_create_after_error(
+                    db, pending_create, exc, escalation_details, escalated=True)
+                pending_create = None
                 session.entities["booking_escalation_id"] = str(request.id)
                 session.entities["booking_reconciliation_required"] = {"request_id": str(request.id)}
                 session.booking_status = "follow_up_required"
                 return BookingResult(BookingOutcome.ERROR, message="I couldn't confirm that appointment. I've saved your request for staff review. May a staff member contact you to help?")
             except Exception:
                 logger.exception("Failed to persist booking escalation for call %s", session.call_sid)
+        await _settle_pending_create_after_error(
+            db, pending_create, exc, locals().get("escalation_details") or {}, escalated=False)
         return await _failure(db, session, exc)
 
 

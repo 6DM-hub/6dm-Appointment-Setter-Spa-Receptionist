@@ -207,13 +207,7 @@ async def create_event(
     body = {"summary": title, "description": description, "start": event_start, "end": event_end}
     expected = None
     if event_id:
-        legacy_id = event_id.replace("-", "")
-        # Preserve valid historical IDs for retries. Voice intent keys contain
-        # uppercase CallSids and colons, which Google does not accept.
-        body["id"] = (
-            legacy_id if re.fullmatch(r"[a-v0-9]{5,1024}", legacy_id)
-            else hashlib.sha256(event_id.encode("utf-8")).hexdigest()
-        )
+        body["id"] = deterministic_event_id(event_id)
         tenant = _connection_tenant(connection)
         if tenant:
             # Who CARA created this event for, signed so a recovery lookup can
@@ -259,6 +253,44 @@ CARA_TAG_VERSION_KEY = "cara_v"
 CARA_TENANT_KEY = "cara_tenant"
 CARA_TAG_KEY = "cara_tag"
 _TAG_DOMAIN = b"cara/google-event-tag/v1"
+
+
+def deterministic_event_id(reference: str) -> str:
+    """The Google event id CARA uses for one booking reference.
+
+    Valid historical ids keep their representation for retries; voice intent
+    keys (uppercase CallSids and colons, which Google rejects) become sha256
+    hex, which is valid base32hex.
+    """
+    legacy_id = reference.replace("-", "")
+    if re.fullmatch(r"[a-v0-9]{5,1024}", legacy_id):
+        return legacy_id
+    return hashlib.sha256(reference.encode("utf-8")).hexdigest()
+
+
+async def verify_created_event(connection: Any, *, reference: str, start: datetime, end: datetime) -> str:
+    """READ-ONLY: prove that the event CARA created for ``reference`` exists.
+
+    Used by explicit reconciliation after a restart. One read of the exact
+    deterministic id, the same proof as create recovery; never an insert.
+    Raises GoogleCalendarError("unverified_response") unless fully proven.
+    """
+    calendar_id = getattr(connection, "selected_calendar_id", None)
+    tenant = _connection_tenant(connection)
+    if not calendar_id or not tenant or not reference:
+        raise GoogleCalendarError("unverified_response", "Not enough identity to verify the event")
+    event_start, event_end = _event_times(start, end, "UTC")
+    body = {"id": deterministic_event_id(reference)}
+    expected = {
+        CARA_TAG_VERSION_KEY: CARA_TAG_VERSION,
+        CARA_TENANT_KEY: tenant,
+        CARA_TAG_KEY: _event_tag(tenant, calendar_id, body["id"], reference, event_start, event_end),
+    }
+    try:
+        service = await _service(connection)
+    except Exception as exc:  # noqa: BLE001 - cannot read: still unknown
+        raise GoogleCalendarError("unverified_response", "Google Calendar could not be read") from exc
+    return await _recover_created_event(service, calendar_id, body, expected, event_start, event_end)
 
 
 def _connection_tenant(connection: Any) -> str | None:

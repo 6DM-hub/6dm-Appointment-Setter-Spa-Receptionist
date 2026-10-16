@@ -119,7 +119,12 @@ class GoogleCalendarAdapter(LocalCalendarAdapter):
                     "Google Calendar did not confirm the new booking; its outcome is unknown",
                     code="BOOKING_OUTCOME_UNKNOWN", retryable=False,
                 ) from exc
-            raise BookingProviderError(str(exc)) from exc
+            status = str(getattr(exc, "status", "") or "")
+            # Nothing was created: a definite refusal, named so the engine can
+            # tell it apart from an unclear outcome.
+            raise BookingProviderError(
+                str(exc), code=status.upper() if status in _DEFINITE_GOOGLE_REFUSALS else "GOOGLE_REFUSED",
+            ) from exc
         return ExternalBooking(provider=self.provider, external_id=event_id)
 
     async def check_availability(self, ctx: BookingContext):

@@ -35,3 +35,30 @@ def install(monkeypatch, svc, unresolved: list) -> None:
     monkeypatch.setattr(svc, "_open_change_fence", _open)
     monkeypatch.setattr(svc, "_close_change_fence", _close)
     monkeypatch.setattr(svc, "_mark_change_unknown", _mark)
+
+    # Write-ahead pending creates (Google): same list, category-tagged.
+    from app.services.booking_escalations import CreateInFlight, PENDING_CREATE
+
+    async def _open_create(_db, tenant_id, intent_key, details, *, record_id=None):
+        if any(row.get("category") == PENDING_CREATE and row.get("booking_reference") == intent_key
+               for row in unresolved):
+            raise CreateInFlight(intent_key)
+        record_id = record_id or uuid.uuid4()
+        unresolved.append({"category": PENDING_CREATE, "record_id": str(record_id), "tenant_id": tenant_id,
+                           "stage": "in_flight", "delivery_status": "held", **details})
+        return record_id
+
+    async def _close_create(_db, record_id, *, own_transaction=False):
+        unresolved[:] = [row for row in unresolved if row.get("record_id") != str(record_id)]
+
+    async def _mark_create(_db, record_id, details, *, escalated):
+        for row in unresolved:
+            if row.get("record_id") == str(record_id):
+                row.update(details, stage="unknown_outcome",
+                           delivery_status="linked_to_escalation" if escalated else "pending")
+                return row
+        return None
+
+    monkeypatch.setattr(svc, "_open_pending_create", _open_create)
+    monkeypatch.setattr(svc, "_close_pending_create", _close_create)
+    monkeypatch.setattr(svc, "_mark_pending_create_unresolved", _mark_create)

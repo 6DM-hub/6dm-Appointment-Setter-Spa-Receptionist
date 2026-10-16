@@ -1,4 +1,5 @@
 """Persistent staff work queue. No customer notification is implied by an alert."""
+import hashlib
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -71,7 +72,7 @@ async def unresolved_booking(db, tenant_id, phone, start):
         BookingEscalation.details["customer_phone"].as_string() == phone,
         BookingEscalation.details["requested_start"].as_string() == start.astimezone(timezone.utc).isoformat(),
     ))).scalars()
-    return next((row for row in rows if row.category in {"temporary", "unknown_outcome"}
+    return next((row for row in rows if row.category in {"temporary", "unknown_outcome", PENDING_CREATE}
                  or row.details.get("provider_success_verified")), None)
 
 
@@ -146,7 +147,7 @@ async def resolve(db, tenant_id, request_id, actor_id, status, expected_version,
         raise HTTPException(409, "Request changed. Refresh before updating.")
     if status not in {"pending", "contacted", "booked", "unable_to_book"}:
         raise HTTPException(422, "Invalid request status")
-    if (row.category == UNRESOLVED_CHANGE and row.delivery_status == "held"
+    if (row.category in (UNRESOLVED_CHANGE, PENDING_CREATE) and row.delivery_status == "held"
             and status not in _OPEN_STATUSES):
         # Still being sent: its outcome is not known yet, so it cannot be
         # resolved (that would unblock the appointment mid-write).
@@ -350,7 +351,7 @@ async def promote_stale_change_fences(db, *, older_than=FENCE_STALE_AFTER):
     rows = list((await db.execute(select(
         BookingEscalation.id, BookingEscalation.created_at, BookingEscalation.details,
     ).where(
-        BookingEscalation.category == UNRESOLVED_CHANGE,
+        BookingEscalation.category.in_([UNRESOLVED_CHANGE, PENDING_CREATE]),
         BookingEscalation.delivery_status == "held",
     ))).all())
     changed = False
@@ -379,3 +380,116 @@ async def unresolved_change_for(db, tenant_id, appointment_id):
         BookingEscalation.status.in_(list(_OPEN_STATUSES)),
     ))).scalars()
     return next((row for row in rows if str((row.details or {}).get("appointment_id")) == str(appointment_id)), None)
+
+
+# ---------------------------------------------------------------------------
+# Write-ahead pending create (Google)
+# ---------------------------------------------------------------------------
+# Before CARA asks Google to create an event it durably records the attempt:
+# who it is for, the exact deterministic event id, the booking reference and
+# the times. A verified create removes the record in the same transaction as
+# the local appointment; a definite refusal removes it; an unclear outcome
+# keeps it (staff are alerted through the booking escalation); a worker that
+# dies mid-write leaves it "held" and the dispatcher alerts staff once stale.
+# While it is open it blocks another attempt for the same caller and time, and
+# explicit reconciliation can link the verified Google event to ONE local row.
+PENDING_CREATE = "pending_create"
+
+
+class CreateInFlight(Exception):
+    """An earlier attempt for this booking intent is in flight or unresolved."""
+
+
+def _create_reference(intent_key):
+    return "create:" + hashlib.sha256(str(intent_key).encode("utf-8")).hexdigest()[:48]
+
+
+def _create_details(details, **extra):
+    row_details = clean({**dict(details), **extra})
+    # Identifiers are looked up by value; payment redaction must not alter them.
+    for key in ("booking_reference", "event_id", "calendar_id", "contact_id", "source_call_id",
+                "user_id", "requested_start", "requested_end", "customer_phone"):
+        if details.get(key) is not None:
+            row_details[key] = str(details[key])
+    return row_details
+
+
+async def pending_create_for(db, tenant_id, intent_key):
+    """The open pending-create record of this booking intent, if any."""
+    if not tenant_id or not intent_key:
+        return None
+    return (await db.execute(select(BookingEscalation).where(
+        BookingEscalation.tenant_id == tenant_id,
+        BookingEscalation.call_reference == _create_reference(intent_key),
+    ))).scalar_one_or_none()
+
+
+async def open_pending_create(db, tenant_id, intent_key, details, *, record_id=None):
+    """Durably record a Google create before it is sent; returns its id.
+
+    One record per (tenant, booking intent): a second attempt while one is in
+    flight or unresolved raises CreateInFlight, so the same booking is never
+    sent twice in parallel or after an unclear outcome.
+    """
+    if not tenant_id or not intent_key:
+        return None
+    reference = _create_reference(intent_key)
+    async with _own_transaction(db) as create_db:
+        if create_db.bind is not None and create_db.bind.dialect.name == "postgresql":
+            await create_db.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                {"key": f"pending-create:{tenant_id}:{reference}"},
+            )
+        if await pending_create_for(create_db, tenant_id, intent_key) is not None:
+            raise CreateInFlight(reference)
+        row = BookingEscalation(
+            id=record_id or uuid.uuid4(),
+            tenant_id=tenant_id, call_reference=reference, status="pending", priority="urgent",
+            category=PENDING_CREATE,
+            details=_create_details(details, stage="in_flight", opened_at=now().isoformat()),
+            delivery={}, history=[], delivery_status="held",
+        )
+        create_db.add(row)
+        try:
+            await create_db.commit()
+        except IntegrityError as exc:
+            await create_db.rollback()
+            raise CreateInFlight(reference) from exc
+        return row.id
+
+
+async def close_pending_create(db, record_id, *, own_transaction=False):
+    """The create is verified, or definitely refused: remove the record.
+
+    In the caller's transaction it is removed atomically with the local
+    appointment insert; otherwise on its own connection.
+    """
+    if not record_id:
+        return
+    statement = delete(BookingEscalation).where(
+        BookingEscalation.id == record_id, BookingEscalation.category == PENDING_CREATE)
+    if not own_transaction:
+        await db.execute(statement)
+        return
+    async with _own_transaction(db) as create_db:
+        await create_db.execute(statement)
+        await create_db.commit()
+
+
+async def mark_pending_create_unresolved(db, record_id, details, *, escalated):
+    """The outcome is unclear: keep the record open for reconciliation.
+
+    ``escalated``: a booking escalation already alerts staff for this call, so
+    this record is linked rather than alerting twice; otherwise it alerts.
+    """
+    if not record_id:
+        return None
+    async with _own_transaction(db) as create_db:
+        row = await create_db.get(BookingEscalation, record_id)
+        if row is None or row.category != PENDING_CREATE:
+            return None
+        row.details = {**(row.details or {}), **_create_details(details, stage="unknown_outcome")}
+        row.delivery_status = "linked_to_escalation" if escalated else "pending"
+        row.status = "pending"
+        await create_db.commit()
+        return row
