@@ -24,7 +24,10 @@ async def test_retry_stability_distinct_keys_and_legacy_uuid_compatibility(monke
     sent = []
     def insert(**kwargs):
         sent.append(kwargs["body"])
-        return SimpleNamespace(execute=lambda: {"id": kwargs["body"]["id"]})
+        body = kwargs["body"]
+        # Google's insert reply is the created event resource.
+        return SimpleNamespace(execute=lambda: {"id": body["id"], "status": "confirmed",
+                                                "start": body["start"], "end": body["end"]})
     async def service(_):
         return SimpleNamespace(events=lambda: SimpleNamespace(insert=insert))
     monkeypatch.setattr(gc, "_service", service)

@@ -1,6 +1,7 @@
 """Google OAuth and Calendar API operations for one spa connection."""
 import asyncio
 import hashlib
+import hmac
 import re
 import json
 import logging
@@ -202,7 +203,9 @@ async def create_event(
     if not connection.selected_calendar_id:
         raise GoogleCalendarError("calendar_not_selected")
     event_start, event_end = _event_times(start, end, timezone_name)
+    calendar_id = connection.selected_calendar_id
     body = {"summary": title, "description": description, "start": event_start, "end": event_end}
+    expected = None
     if event_id:
         legacy_id = event_id.replace("-", "")
         # Preserve valid historical IDs for retries. Voice intent keys contain
@@ -211,16 +214,154 @@ async def create_event(
             legacy_id if re.fullmatch(r"[a-v0-9]{5,1024}", legacy_id)
             else hashlib.sha256(event_id.encode("utf-8")).hexdigest()
         )
+        tenant = _connection_tenant(connection)
+        if tenant:
+            # Who CARA created this event for, signed so a recovery lookup can
+            # tell this booking's event from any other event under the same id.
+            expected = {
+                CARA_TAG_VERSION_KEY: CARA_TAG_VERSION,
+                CARA_TENANT_KEY: tenant,
+                CARA_TAG_KEY: _event_tag(tenant, calendar_id, body["id"], event_id,
+                                         event_start, event_end),
+            }
+            body["extendedProperties"] = {"private": dict(expected)}
+    service = await _service(connection)   # nothing has been sent yet: failures are definite
     try:
-        service = await _service(connection)
         result = await asyncio.to_thread(
             service.events()
-            .insert(calendarId=connection.selected_calendar_id, body=body, sendUpdates="none")
+            .insert(calendarId=calendar_id, body=body, sendUpdates="none")
             .execute
         )
     except HttpError as exc:
-        raise _api_error(exc) from exc
+        code = getattr(exc.resp, "status", None)
+        if not _ambiguous_insert_status(code):
+            raise _api_error(exc) from exc
+        # 408/409/5xx: Google may hold the event (a 409 says only that the id
+        # exists). Look before deciding; never insert again.
+        logger.warning("Google Calendar insert outcome unclear (HTTP %s); verifying by id", code)
+        return await _recover_created_event(service, calendar_id, body, expected, event_start, event_end)
+    except Exception:  # noqa: BLE001 - transport errors/timeouts after sending
+        # The request may have reached Google: the outcome is unknown.
+        logger.warning("Google Calendar insert reply lost; verifying by id", exc_info=True)
+        return await _recover_created_event(service, calendar_id, body, expected, event_start, event_end)
+    if _created_event_problems(result, body, expected, event_start, event_end):
+        # An HTTP success is not proof. A missing or contradictory reply goes
+        # through the same exact-id verification as a lost one.
+        return await _recover_created_event(service, calendar_id, body, expected, event_start, event_end)
     return result["id"]
+
+
+# --------------------------------------------------------------------------- #
+# Create recovery: an ambiguous insert is resolved by one exact-id read
+# --------------------------------------------------------------------------- #
+CARA_TAG_VERSION = "1"
+CARA_TAG_VERSION_KEY = "cara_v"
+CARA_TENANT_KEY = "cara_tenant"
+CARA_TAG_KEY = "cara_tag"
+_TAG_DOMAIN = b"cara/google-event-tag/v1"
+
+
+def _connection_tenant(connection: Any) -> str | None:
+    tenant = getattr(connection, "spa_id", None)
+    return str(tenant) if tenant else None
+
+
+def _tag_key() -> bytes:
+    """Per-purpose key derived from SECRET_KEY (domain separated).
+
+    If SECRET_KEY is rotated, tags written under the old key no longer verify:
+    recovery then reports an unknown outcome for staff, never success.
+    """
+    return hmac.new(settings.SECRET_KEY.encode("utf-8"), _TAG_DOMAIN, hashlib.sha256).digest()
+
+
+def _utc_text(value: dict) -> str:
+    instant = _event_instant(value)
+    if instant is None:
+        raise GoogleCalendarError("unverified_response", "Event time could not be normalized")
+    return instant.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _event_tag(tenant: str, calendar_id: str, event_id: str, reference: str,
+               event_start: dict, event_end: dict) -> str:
+    """HMAC over the canonical identity of the event CARA asked Google to create.
+
+    It authenticates these fields; it does not stop a calendar editor from
+    copying a whole signed event, so the expected identity always comes from
+    CARA's own request, never from the event alone.
+    """
+    canonical = "|".join(
+        ("v" + CARA_TAG_VERSION, tenant, calendar_id, event_id, reference,
+         _utc_text(event_start), _utc_text(event_end))
+    )
+    return hmac.new(_tag_key(), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _ambiguous_insert_status(code: Any) -> bool:
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        return True
+    return code in {408, 409} or code >= 500
+
+
+def _created_event_problems(result: Any, body: dict, expected: dict | None,
+                            event_start: dict, event_end: dict) -> list[str]:
+    """Everything that stops ``result`` proving it is the event we created."""
+    if not isinstance(result, dict):
+        return ["no event returned"]
+    problems = []
+    if not result.get("id"):
+        problems.append("no event id")
+    elif body.get("id") and result.get("id") != body["id"]:
+        problems.append("a different event id")
+    if result.get("status") not in _ACTIVE_EVENT_STATUSES:
+        problems.append("the event is not active")
+    for label, returned, requested in (("start", result.get("start"), event_start),
+                                       ("end", result.get("end"), event_end)):
+        instant = _event_instant(returned)
+        if instant is None:
+            problems.append(f"the {label} time is missing or unreadable")
+        elif instant != _event_instant(requested):
+            problems.append(f"the {label} time differs")
+    if expected is not None:
+        private = ((result.get("extendedProperties") or {}).get("private") or {})
+        if not isinstance(private, dict):
+            private = {}
+        if private.get(CARA_TAG_VERSION_KEY) != expected[CARA_TAG_VERSION_KEY]:
+            problems.append("missing or unknown CARA tag version")
+        if private.get(CARA_TENANT_KEY) != expected[CARA_TENANT_KEY]:
+            problems.append("a different or missing business")
+        tag = private.get(CARA_TAG_KEY)
+        if not isinstance(tag, str) or not hmac.compare_digest(tag, expected[CARA_TAG_KEY]):
+            problems.append("the CARA tag does not verify")
+    return problems
+
+
+async def _recover_created_event(service: Any, calendar_id: str, body: dict, expected: dict | None,
+                                 event_start: dict, event_end: dict) -> str:
+    """One read of the exact expected event id; success only on full proof.
+
+    No list search, no second insert and no new id. Anything short of a full
+    match (missing event, unreadable reply, other times, cancelled, missing or
+    invalid tag, lookup failure) is an unknown outcome for staff to resolve.
+    """
+    event_id = body.get("id")
+    if not event_id or expected is None:
+        raise GoogleCalendarError("unverified_response", "Google Calendar did not confirm the new event")
+    try:
+        found = await asyncio.to_thread(
+            service.events().get(calendarId=calendar_id, eventId=event_id).execute
+        )
+    except Exception:  # noqa: BLE001 - 404, transport, anything: still unknown
+        logger.warning("Google Calendar recovery lookup failed for %s", event_id, exc_info=True)
+        raise GoogleCalendarError("unverified_response", "Google Calendar did not confirm the new event")
+    problems = _created_event_problems(found, body, expected, event_start, event_end)
+    if problems:
+        logger.warning("Google Calendar recovery did not prove event %s: %s", event_id, "; ".join(problems))
+        raise GoogleCalendarError("unverified_response", "Google Calendar did not confirm the new event")
+    logger.info("Google Calendar create recovered by verified lookup: %s", event_id)
+    return found["id"]
 
 
 async def freebusy(

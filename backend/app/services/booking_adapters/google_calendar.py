@@ -113,6 +113,12 @@ class GoogleCalendarAdapter(LocalCalendarAdapter):
             )
         except GoogleCalendarError as exc:
             logger.exception("Google Calendar create failed for %s", self.calendar_id)
+            if getattr(exc, "status", None) == "unverified_response":
+                # The event may exist: durable unknown outcome, never a retry.
+                raise BookingProviderError(
+                    "Google Calendar did not confirm the new booking; its outcome is unknown",
+                    code="BOOKING_OUTCOME_UNKNOWN", retryable=False,
+                ) from exc
             raise BookingProviderError(str(exc)) from exc
         return ExternalBooking(provider=self.provider, external_id=event_id)
 
