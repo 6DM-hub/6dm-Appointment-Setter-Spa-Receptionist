@@ -169,6 +169,9 @@ async def update_appointment(
     await db.refresh(appointment)
     changes = payload.model_dump(exclude_unset=True)
     if (changes.get("status") == AppointmentStatus.CANCELLED
+            and appointment.status in {AppointmentStatus.COMPLETED, AppointmentStatus.NO_SHOW}):
+        raise HTTPException(status.HTTP_409_CONFLICT, "An inactive appointment cannot be cancelled")
+    if (changes.get("status") == AppointmentStatus.CANCELLED
             and appointment.status == AppointmentStatus.CANCELLED):
         # Decided on the row as it is AFTER the lock: a racing or repeated
         # cancel is told someone already cancelled it, and nothing is written.
