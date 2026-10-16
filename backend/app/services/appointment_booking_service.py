@@ -1591,6 +1591,10 @@ async def stage_booking(
     prior_service = prior.service_description
     prior_staff = prior.preferred_staff
     draft = stage(session, intent)
+    if draft.to_dict() != prior.to_dict() and session.booking_status in {"booked", "rescheduled"}:
+        # stage() mutates the draft synchronously. Drop the old completion state
+        # before routing or identity persistence can suspend/cancel this task.
+        session.booking_status = "collecting_details"
     try:
         if test_adapter is None:
             routing = await _prepare(db, session)
@@ -2139,6 +2143,9 @@ async def _confirm_booking(
             BookingOutcome.NOT_FOUND,
             message="No appointment was found to reschedule. Nothing was booked.",
         )
+    from app.services.booking_change_guard import is_exact_booked_replay
+
+    replay_only = is_exact_booked_replay(session)
     block = confirmation_block_reason(session)
     if block:
         truth("CONFIRMATION_REJECTED", reason=block, revision=draft.draft_revision)
@@ -2255,6 +2262,34 @@ async def _confirm_booking(
                     ),
                 )
 
+        # Stored appointment timestamps are UTC. SQLite drops timezone metadata
+        # on reload; compare instants so that an unchanged row remains a no-op.
+        same_window = False
+        if existing is not None:
+            row_start, row_end = existing.start_time, existing.end_time
+            if row_start.tzinfo is None:
+                row_start = row_start.replace(tzinfo=timezone.utc)
+            if row_end.tzinfo is None:
+                row_end = row_end.replace(tzinfo=timezone.utc)
+            same_window = row_start == start and row_end == end
+
+        if replay_only and (
+            existing is None
+            or str(existing.id) != draft.appointment_id
+            or existing.external_booking_id != draft.external_booking_id
+            or not same_window
+            or _requested_service_change(session, draft, existing)
+        ):
+            # The snapshot shortcut permits a no-op, never restoring an old
+            # booking after its persisted row changed or disappeared.
+            invalidate_booking_proposal(session, "booked_record_changed")
+            session.booking_status = "collecting_details"
+            return BookingResult(
+                BookingOutcome.MISSING_INFO,
+                message="The saved appointment no longer matches this confirmation. "
+                        "Check its current details and obtain fresh agreement before changing it.",
+            )
+
         # getattr: rows written before this column existed, and the stub
         # appointments the adapter tests use, may not carry the attribute.
         # A targeted row may belong to another intent; giving it this call's key
@@ -2267,7 +2302,7 @@ async def _confirm_booking(
             draft.external_booking_id = existing.external_booking_id
             save_draft(session, draft)
             service_change = _requested_service_change(session, draft, existing)
-            if existing.start_time == start and existing.end_time == end and not service_change:
+            if same_window and not service_change:
                 # Case (A) from the brief: the "existing" booking is this very
                 # call's own. That is a success to report, not a clash.
                 logger.info(

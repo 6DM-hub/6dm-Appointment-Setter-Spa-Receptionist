@@ -1353,7 +1353,9 @@ def confirmation_block_reason(session: Any) -> str | None:
     """Hard stop before create_booking. None means the write is allowed."""
     draft = get_draft(session)
     status = getattr(session, "booking_status", None)
-    if draft.is_persisted and status in {"booked", "rescheduled"}:
+    from app.services.booking_change_guard import is_exact_booked_replay
+
+    if is_exact_booked_replay(session):
         return None
     if caller_name_required_for(draft) and not supplied_caller_name(draft):
         truth("CALLER_NAME_REQUIRED")

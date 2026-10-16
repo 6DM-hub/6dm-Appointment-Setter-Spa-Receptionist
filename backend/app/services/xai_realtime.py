@@ -3192,9 +3192,7 @@ class XAIVoiceSession:
             })
         draft = get_draft(self.session)
         last = self._last_user_utterance() or ""
-        already_booked = draft.is_persisted and self.session.booking_status in {
-            BookingOutcome.BOOKED.value, BookingOutcome.RESCHEDULED.value, "booked", "rescheduled"
-        }
+        already_booked = booking_guard.is_exact_booked_replay(self.session)
         if not already_booked:
             if getattr(self, "_card_policy_playback_revision", None) is not None:
                 return json.dumps({"status": "rejected", "booked": False,
@@ -6505,7 +6503,15 @@ class XAIVoiceSession:
             if name in {CHECK_AVAILABILITY_TOOL["name"], PROPOSE_APPOINTMENT_TOOL["name"]}:
                 try:
                     return await asyncio.wait_for(handler(raw_args), timeout=20)
+                except asyncio.CancelledError:
+                    if name == PROPOSE_APPOINTMENT_TOOL["name"]:
+                        invalidate_booking_proposal(self.session, "proposal_cancelled")
+                        self.session.booking_status = "collecting_details"
+                    raise
                 except asyncio.TimeoutError:
+                    if name == PROPOSE_APPOINTMENT_TOOL["name"]:
+                        invalidate_booking_proposal(self.session, "proposal_timeout")
+                        self.session.booking_status = "collecting_details"
                     logger.error("AVAILABILITY_TIMEOUT call=%s tool=%s", self.call_id, name)
                     await self._offer_staff_callback()
                     return json.dumps({"status": "lookup_timeout", "available": False, "message": "The availability lookup did not finish. A callback permission question was delivered."})

@@ -109,6 +109,34 @@ def record_booking_completed(session: Any, turn: int) -> None:
         session.entities.pop(key, None)
 
 
+def is_exact_booked_replay(session: Any) -> bool:
+    """An old confirmation authorizes only the unchanged, snapshotted booking.
+
+    Missing snapshots fail closed, including sessions restored from older state.
+    Proposal/consent flags are deliberately not evidence of booking identity.
+    """
+    if getattr(session, "booking_status", None) not in {"booked", "rescheduled"}:
+        return False
+    snapshot = session.entities.get(BOOKED_DRAFT_SNAPSHOT)
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("draft"), dict):
+        return False
+    current = get_draft(session)
+    booked = snapshot["draft"]
+    if (not current.is_persisted or not current.start_iso or not current.service_description
+            or snapshot.get("appointment_id") != current.appointment_id
+            or not booked.get("appointment_id") or booked.get("cancelled")):
+        return False
+    # Include resolved service/staff and provider slot identities, not just the
+    # spoken labels. A change to a pinned segment must also require fresh consent.
+    fields = (
+        "booking_id", "appointment_id", "external_booking_id", "start_iso", "end_iso",
+        "service_description", "preferred_staff", "service_id", "square_variation_id",
+        "square_variation_version", "provider_id", "duration_minutes", "guest_name",
+        "operation_mode", "target_appointment_id", "selected_slot",
+    )
+    return all(getattr(current, field) == booked.get(field) for field in fields)
+
+
 def completed_turn(session: Any) -> int | None:
     marker = session.entities.get(BOOKING_COMPLETED) or {}
     turn = marker.get("turn")
