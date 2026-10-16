@@ -65,6 +65,31 @@ async def create_with_recovery(delegate, payload):
         try:
             return await delegate._request("POST", "/v2/bookings", json=copy.deepcopy(payload))
         except (BookingProviderError, httpx.TransportError, asyncio.TimeoutError) as error:
+            if str(getattr(error, "code", "") or "").upper() == "BOOKING_OUTCOME_UNKNOWN":
+                # _request maps lost booking-write replies to unknown, not
+                # temporary. Square's same-key replay identifies this exact
+                # operation; a coincidentally matching list row does not.
+                if attempt:
+                    raise
+                try:
+                    replay = await delegate._request("POST", "/v2/bookings", json=copy.deepcopy(payload))
+                    booking = replay.get("booking") if isinstance(replay, dict) else None
+                    if not same_booking(booking, payload["booking"]):
+                        raise ValueError("Idempotent replay did not match the booking")
+                    booking_id = booking["id"]
+                    # A replay can contain the original ACCEPTED response even
+                    # after cancellation: verify today's provider record too.
+                    current = await delegate._request("GET", f"/v2/bookings/{booking_id}")
+                    current_booking = current.get("booking") if isinstance(current, dict) else None
+                    if (not same_booking(current_booking, payload["booking"])
+                            or current_booking["id"] != booking_id):
+                        raise ValueError("Current booking did not match the replay")
+                    return {"booking": current_booking}
+                except (BookingProviderError, httpx.TransportError, asyncio.TimeoutError, ValueError, TypeError) as recovery_error:
+                    raise BookingProviderError(
+                        "The booking outcome cannot be verified; staff must check Square before retrying.",
+                        code="BOOKING_OUTCOME_UNKNOWN",
+                    ) from recovery_error
             if classify(error) != "temporary":
                 raise
             try:
