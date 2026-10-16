@@ -31,7 +31,8 @@ def test_appointment_mutation_requires_manager(client, principal, monkeypatch, m
             return row
         if model is SpaAccount:
             return make_spa(id=tenant)
-    db = SimpleNamespace(get=AsyncMock(side_effect=get), commit=AsyncMock(), refresh=AsyncMock())
+    db = SimpleNamespace(get=AsyncMock(side_effect=get), commit=AsyncMock(), refresh=AsyncMock(),
+                         execute=AsyncMock(return_value=SimpleNamespace(scalar_one=lambda: 0)))
     async def dependency():
         yield db
     app.dependency_overrides[get_db] = dependency

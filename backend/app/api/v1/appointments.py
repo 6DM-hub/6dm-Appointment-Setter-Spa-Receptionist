@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from app.services.scheduling_time import utc_instant
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -8,7 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db, get_tenant_scope
 from app.core.tenancy import TenantScope, owns, scope_columns, scope_filter
-from app.models import Appointment, AppointmentStatus, Contact
+from app.models import Appointment, AppointmentStatus, Contact, SpaAccount
+from app.services import appointment_booking_service as booking
 from app.schemas import AppointmentCreate, AppointmentRead, AppointmentUpdate, Page
 from app.services.appointment_booking_service import StaffChangeRefused, apply_staff_change
 
@@ -79,19 +80,11 @@ async def create_appointment(
     if not contact or not owns(scope, contact):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Contact not found")
 
-    overlap = (
-        await db.execute(
-            select(Appointment).where(
-                scope_filter(scope, Appointment),
-                Appointment.status.in_(
-                    [AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED]
-                ),
-                Appointment.start_time < payload.end_time,
-                Appointment.end_time > payload.start_time,
-            )
-        )
-    ).scalar_one_or_none()
-    if overlap:
+    await booking._lock_slot(db, scope, payload.start_time, payload.end_time)
+    spa = await db.get(SpaAccount, scope.tenant_id) if scope.tenant_id else None
+    if await booking._has_conflict(
+        db, scope, payload.start_time, payload.end_time, booking._capacity(spa)
+    ):
         raise HTTPException(status.HTTP_409_CONFLICT, "Time slot conflicts with an existing appointment")
 
     appointment = Appointment(
@@ -168,9 +161,22 @@ async def update_appointment(
     appointment = await db.get(Appointment, appointment_id)
     if not appointment or not owns(scope, appointment):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appointment not found")
+    # Share the voice calendar lock through the local commit. Reload after
+    # waiting so decisions use the current row, not a pre-lock snapshot.
+    await booking._lock_slot(db, scope, appointment.start_time, appointment.end_time)
+    await db.refresh(appointment)
     changes = payload.model_dump(exclude_unset=True)
-    new_start = changes.get("start_time", appointment.start_time)
-    new_end = changes.get("end_time", appointment.end_time)
+    # SQLite returns UTC storage values without tzinfo; API payloads already
+    # require an explicit offset. PostgreSQL rows remain timezone-aware.
+    old_start = appointment.start_time.replace(tzinfo=timezone.utc) if appointment.start_time.tzinfo is None else appointment.start_time
+    old_end = appointment.end_time.replace(tzinfo=timezone.utc) if appointment.end_time.tzinfo is None else appointment.end_time
+    new_start = changes.get("start_time", old_start)
+    new_end = changes.get("end_time", old_end)
+    active = {AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED}
+    if appointment.status not in active and (
+        (new_start, new_end) != (old_start, old_end) or changes.get("status") in active
+    ):
+        raise HTTPException(status.HTTP_409_CONFLICT, "An inactive appointment cannot be moved or reactivated")
     if new_end <= new_start:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "end_time must be after start_time")
     # A booking mirrored in an external calendar changes there first; the
@@ -179,7 +185,13 @@ async def update_appointment(
         changes.get("status") == AppointmentStatus.CANCELLED
         and appointment.status != AppointmentStatus.CANCELLED
     )
-    moving = (new_start, new_end) != (appointment.start_time, appointment.end_time)
+    moving = (new_start, new_end) != (old_start, old_end)
+    if moving and not cancelling:
+        spa = await db.get(SpaAccount, scope.tenant_id) if scope.tenant_id else None
+        if await booking._has_conflict(
+            db, scope, new_start, new_end, booking._capacity(spa), exclude_id=appointment.id
+        ):
+            raise HTTPException(status.HTTP_409_CONFLICT, "Time slot conflicts with an existing appointment")
     if cancelling or moving:
         try:
             await apply_staff_change(
@@ -203,6 +215,10 @@ async def cancel_appointment(
     appointment = await db.get(Appointment, appointment_id)
     if not appointment or not owns(scope, appointment):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appointment not found")
+    await booking._lock_slot(db, scope, appointment.start_time, appointment.end_time)
+    await db.refresh(appointment)
+    if appointment.status not in {AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED, AppointmentStatus.CANCELLED}:
+        raise HTTPException(status.HTTP_409_CONFLICT, "An inactive appointment cannot be cancelled")
     if appointment.status != AppointmentStatus.CANCELLED:
         try:
             await apply_staff_change(db, scope, appointment, cancel=True)
