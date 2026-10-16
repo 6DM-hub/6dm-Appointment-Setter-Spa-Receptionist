@@ -13,6 +13,8 @@ from app.services import appointment_booking_service as booking
 from app.schemas import AppointmentCreate, AppointmentRead, AppointmentUpdate, Page
 from app.services.appointment_booking_service import StaffChangeRefused, apply_staff_change
 
+ALREADY_CANCELLED = "This appointment is already cancelled."
+
 router = APIRouter(prefix="/appointments", tags=["appointments"])
 
 
@@ -166,6 +168,11 @@ async def update_appointment(
     await booking._lock_slot(db, scope, appointment.start_time, appointment.end_time)
     await db.refresh(appointment)
     changes = payload.model_dump(exclude_unset=True)
+    if (changes.get("status") == AppointmentStatus.CANCELLED
+            and appointment.status == AppointmentStatus.CANCELLED):
+        # Decided on the row as it is AFTER the lock: a racing or repeated
+        # cancel is told someone already cancelled it, and nothing is written.
+        raise HTTPException(status.HTTP_409_CONFLICT, ALREADY_CANCELLED)
     # SQLite returns UTC storage values without tzinfo; API payloads already
     # require an explicit offset. PostgreSQL rows remain timezone-aware.
     old_start = appointment.start_time.replace(tzinfo=timezone.utc) if appointment.start_time.tzinfo is None else appointment.start_time
@@ -217,12 +224,13 @@ async def cancel_appointment(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appointment not found")
     await booking._lock_slot(db, scope, appointment.start_time, appointment.end_time)
     await db.refresh(appointment)
-    if appointment.status not in {AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED, AppointmentStatus.CANCELLED}:
+    if appointment.status == AppointmentStatus.CANCELLED:
+        raise HTTPException(status.HTTP_409_CONFLICT, ALREADY_CANCELLED)
+    if appointment.status not in {AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED}:
         raise HTTPException(status.HTTP_409_CONFLICT, "An inactive appointment cannot be cancelled")
-    if appointment.status != AppointmentStatus.CANCELLED:
-        try:
-            await apply_staff_change(db, scope, appointment, cancel=True)
-        except StaffChangeRefused as exc:
-            raise HTTPException(exc.status_code, exc.detail) from exc
+    try:
+        await apply_staff_change(db, scope, appointment, cancel=True)
+    except StaffChangeRefused as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
     appointment.status = AppointmentStatus.CANCELLED
     await db.commit()
