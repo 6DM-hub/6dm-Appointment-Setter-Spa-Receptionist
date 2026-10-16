@@ -516,12 +516,37 @@ def _spa_for_engine_tests():
     )
 
 
+def _fake_pending_creates(monkeypatch):
+    """Model the new durable-create boundary in this database-free unit test."""
+    records = {}
+
+    async def open_record(db, tenant_id, key, details, *, record_id):
+        assert tenant_id and key and details["provider"] == "square"
+        records[record_id] = details
+        return record_id
+
+    async def close_record(db, record_id, **kwargs):
+        if record_id is not None:
+            assert record_id in records
+            records.pop(record_id)
+
+    async def mark_unresolved(db, record_id, details, **kwargs):
+        assert record_id in records
+        records[record_id].update(details)
+
+    monkeypatch.setattr(appointment_booking_service, "_mark_pending_create_unresolved", mark_unresolved)
+    monkeypatch.setattr(appointment_booking_service, "_open_pending_create", open_record)
+    monkeypatch.setattr(appointment_booking_service, "_close_pending_create", close_record)
+    return records
+
+
 @pytest.mark.asyncio
 async def test_stage_then_confirm_preserves_the_same_therapist_end_to_end(monkeypatch):
     """The scenario the fix targets: propose_appointment (stage) finds a
     therapist via a broad ANY search; confirm_appointment (confirm) must book
     that SAME therapist, even though a fresh broad search at confirm time
     would return someone else."""
+    pending_records = _fake_pending_creates(monkeypatch)
     spa = _spa_for_engine_tests()
     adapter = SpaBookingAdapter(spa)
 
@@ -540,6 +565,9 @@ async def test_stage_then_confirm_preserves_the_same_therapist_end_to_end(monkey
         if path == "/v2/customers/search":
             return {"customers": [{"id": "cust_1"}]}
         if path == "/v2/bookings":
+            from app.services.booking_config import decrypt_config
+            assert len(pending_records) == 1
+            assert decrypt_config(next(iter(pending_records.values()))["square_request"]) == json
             # Square echoes the stored booking (requested fields + id/status).
             return {"booking": {**json["booking"], "id": "sq_final_booking", "status": "ACCEPTED"}}
         raise AssertionError(path)
@@ -581,10 +609,13 @@ async def test_stage_then_confirm_preserves_the_same_therapist_end_to_end(monkey
 
     assert confirmed.outcome is BookingOutcome.BOOKED, confirmed.message
     assert confirmed.appointment.external_booking_id == "sq_final_booking"
+    assert pending_records == {}
 
 
 @pytest.mark.asyncio
 async def test_square_booking_rejection_never_produces_a_booked_outcome(monkeypatch):
+    pending_records = _fake_pending_creates(monkeypatch)
+    provider_calls = []
     spa = _spa_for_engine_tests()
     adapter = SpaBookingAdapter(spa)
 
@@ -594,6 +625,7 @@ async def test_square_booking_rejection_never_produces_a_booked_outcome(monkeypa
         if path == "/v2/customers/search":
             return {"customers": [{"id": "cust_1"}]}
         if path == "/v2/bookings":
+            provider_calls.append(json)
             raise BookingProviderError("Square API request failed: DECLINED")
         raise AssertionError(path)
 
@@ -623,6 +655,7 @@ async def test_square_booking_rejection_never_produces_a_booked_outcome(monkeypa
     arm_verified_proposal(session)
     result = await confirm_booking(_FakeDB(), session)
 
+    assert len(provider_calls) == 1
     assert result.outcome is BookingOutcome.ERROR
     assert result.appointment is None
     assert session.appointment_id is None

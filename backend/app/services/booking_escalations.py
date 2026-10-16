@@ -412,6 +412,9 @@ def _create_details(details, **extra):
                 "companion_escalation_id", "call_sid"):
         if details.get(key) is not None:
             row_details[key] = str(details[key])
+    # Authenticated ciphertext must survive redaction/truncation unchanged.
+    if details.get("square_request") is not None:
+        row_details["square_request"] = details["square_request"]
     return row_details
 
 

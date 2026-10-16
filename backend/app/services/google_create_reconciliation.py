@@ -1,7 +1,7 @@
-"""Explicit reconciliation of an unresolved Google create (G2).
+"""Explicit reconciliation of an unresolved provider create.
 
 Staff (a manager) invoke this for one open pending-create record, e.g. after
-a lost reply or a worker restart. It only READS Google: one lookup of the
+a lost reply or a worker restart. Google recovery only READS: one lookup of the
 exact deterministic event id, accepted only on the same full proof as create
 recovery (id, active status, start/end instants, tenant and signed CARA tag).
 
@@ -10,7 +10,11 @@ created under the booking's intent key, whose unique index makes a concurrent
 second reconciliation find the first row instead of inserting another. The
 record is then marked booked in the same transaction. Anything short of proof
 leaves the record open (blocked, staff alerted) and reports "unknown". It
-never creates, moves or deletes anything in Google.
+never creates, moves or deletes anything in Google. Square recovery may POST
+the exact saved request with its original idempotency key, then GET that ID;
+when a verified response's ID was saved, it only GETs. A Square replay is an
+idempotent write, not a read-only operation. Neither path accepts PENDING as
+a confirmed appointment.
 """
 from __future__ import annotations
 
@@ -26,6 +30,7 @@ from app.models import Appointment, AppointmentStatus, Contact
 from app.models.booking_escalation import BookingEscalation
 from app.models.google_calendar_connection import GoogleCalendarConnection
 from app.services import google_calendar as gc
+from app.services.booking_adapters.base import BookingProviderError
 from app.services.booking_escalations import FENCE_STALE_AFTER, PENDING_CREATE, _OPEN_STATUSES, clean, now
 
 logger = logging.getLogger(__name__)
@@ -155,14 +160,19 @@ async def reconcile_pending_create(db, tenant_id, request_id, actor_id) -> dict:
     if not reference or start is None or end is None or not (
             details.get("contact_id") or details.get("contact_phone") or details.get("customer_phone")):
         reason = "the record is missing booking identity"
-    elif connection is None or connection.selected_calendar_id != details.get("calendar_id"):
+    elif details.get("provider") != "square" and (
+            connection is None or connection.selected_calendar_id != details.get("calendar_id")):
         reason = "the business's Google calendar is no longer the one the booking was sent to"
     event_id = None
     if reason is None:
         try:
-            event_id = await gc.verify_created_event(connection, reference=reference, start=start, end=end)
-        except gc.GoogleCalendarError:
-            reason = "Google did not prove the event"
+            if details.get("provider") == "square":
+                from app.services.square_pending_create import verify_pending_square
+                event_id = await verify_pending_square(db, tenant_id, details)
+            else:
+                event_id = await gc.verify_created_event(connection, reference=reference, start=start, end=end)
+        except (gc.GoogleCalendarError, BookingProviderError):
+            reason = "The provider did not prove the booking"
     if event_id is None:
         _note(row, actor_id, "reconcile_unverified", reason=reason)
         row.version += 1
@@ -183,7 +193,8 @@ async def reconcile_pending_create(db, tenant_id, request_id, actor_id) -> dict:
             title=details.get("title") or "Appointment",
             description=details.get("description"),
             start_time=start, end_time=end, status=AppointmentStatus.SCHEDULED,
-            booking_provider="google_calendar", external_booking_id=event_id,
+            booking_provider="square" if details.get("provider") == "square" else "google_calendar",
+            external_booking_id=event_id,
             booking_intent_key=reference,
         )
         db.add(appointment)
@@ -210,5 +221,5 @@ async def reconcile_pending_create(db, tenant_id, request_id, actor_id) -> dict:
     _note(row, actor_id, "reconcile_linked", appointment_id=str(appointment.id), event_id=event_id)
     await _settle_companion(db, tenant_id, row, details, actor_id, str(appointment.id), event_id)
     await db.commit()
-    logger.info("Pending Google create %s reconciled to appointment %s", row.id, appointment.id)
+    logger.info("Pending provider create %s reconciled to appointment %s", row.id, appointment.id)
     return {"status": "booked", "appointment_id": str(appointment.id), "event_id": event_id}

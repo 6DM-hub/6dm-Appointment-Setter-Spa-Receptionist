@@ -115,6 +115,6 @@ async def resolve(request_id: uuid.UUID, body: Resolution, scope=Depends(get_ten
 @router.post("/{request_id}/reconcile", dependencies=[Depends(get_tenant_manager)])
 async def reconcile(request_id: uuid.UUID, scope=Depends(get_tenant_scope),
                     user=Depends(editor), db=Depends(get_db)):
-    """Explicitly re-check an unresolved Google create. Only READS Google."""
+    """Recover an unresolved create: Google GET; Square exact-key replay/GET."""
     from app.services.google_create_reconciliation import reconcile_pending_create
     return await reconcile_pending_create(db, tenant(scope), request_id, user.id)

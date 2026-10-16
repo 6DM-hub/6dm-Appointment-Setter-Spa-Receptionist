@@ -621,6 +621,8 @@ async def test_confirm_booking_end_to_end_via_square_with_local_time_and_no_staf
     """The scenario from the bug report, driven through the real booking
     engine: local Thursday 2pm request, Square resolves + books it, and the
     resulting appointment carries the real Square booking id."""
+    from tests.test_availability_guard_and_slot_pinning import _fake_pending_creates
+    pending_records = _fake_pending_creates(monkeypatch)
     spa = make_spa(
         booking_provider=BookingProvider.SQUARE,
         booking_config={"access_token": "t", "location_id": "loc_123"},
@@ -699,6 +701,7 @@ async def test_confirm_booking_end_to_end_via_square_with_local_time_and_no_staf
     result = await confirm_booking(_FakeDB(), session)
 
     assert result.outcome is BookingOutcome.BOOKED, result.message
+    assert pending_records == {}
     assert result.appointment.external_booking_id == "sq_book_1"
     assert result.appointment.booking_provider == "square"
     create_call = transport.calls_to("/v2/bookings")[0]

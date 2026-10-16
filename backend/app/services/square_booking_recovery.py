@@ -61,6 +61,8 @@ async def create_with_recovery(delegate, payload):
     payload = copy.deepcopy(payload)
     if not payload.get("idempotency_key"):
         raise BookingProviderError("A stable booking key is required.", code="BOOKING_CONFIGURATION")
+    from app.services.square_pending_create import before_create
+    await before_create(delegate, payload)
     for attempt in range(2):
         try:
             return await delegate._request("POST", "/v2/bookings", json=copy.deepcopy(payload))

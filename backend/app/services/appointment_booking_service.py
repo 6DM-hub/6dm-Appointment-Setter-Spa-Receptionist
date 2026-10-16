@@ -2655,10 +2655,39 @@ async def _confirm_booking(
                 except Exception:
                     logger.exception("Could not discard an unsent create record %s", planned)
                 return BookingResult(BookingOutcome.ERROR, message=_CREATE_UNRECORDABLE)
+        pending_create_id = locals().get("pending_create_id")
+
+        async def record_square_request(delegate, payload):
+            nonlocal pending_create_id
+            from app.services.booking_config import encrypt_config
+            if routing.scope.tenant_id is None:
+                raise BookingProviderError("Durable Square create requires tenant scope", code="BOOKING_CONFIGURATION")
+            if pending_create_id is not None:
+                raise BookingProviderError("A create is already pending", code="BOOKING_OUTCOME_UNKNOWN")
+            pending_create_id = uuid.uuid4()
+            await asyncio.wait_for(_open_pending_create(
+                db, routing.scope.tenant_id, key, {
+                    "booking_reference": key, "provider": "square",
+                    "square_request": encrypt_config(payload),
+                    "square_environment": delegate.environment, "square_api_version": delegate.api_version,
+                    "requested_start": start.astimezone(timezone.utc).isoformat(),
+                    "requested_end": end.astimezone(timezone.utc).isoformat(),
+                    "customer_phone": ctx.customer_phone, "customer_name": ctx.customer_name,
+                    "services": ctx.service_description, "title": ctx.title, "description": description,
+                    "contact_id": contact.id, "contact_phone": getattr(contact, "phone_number", None),
+                    "contact_first_name": getattr(contact, "first_name", None),
+                    "contact_last_name": getattr(contact, "last_name", None),
+                    "contact_email": getattr(contact, "email", None),
+                    "source_call_id": appointment.source_call_id,
+                    "user_id": getattr(appointment, "user_id", None), "call_sid": session.call_sid,
+                }, record_id=pending_create_id), timeout=FENCE_TIMEOUT_SECONDS)
+
+        from app.services.square_pending_create import recording_creates
         try:
-            external = await _calendar_call(
-                "create_booking", session.call_sid, routing.adapter.create_booking(ctx)
-            )
+            with recording_creates(record_square_request):
+                external = await _calendar_call(
+                    "create_booking", session.call_sid, routing.adapter.create_booking(ctx)
+                )
         except asyncio.TimeoutError as exc:
             if (ctx.selected_slot or {}).get("visit_segments"):
                 raise BookingProviderError("The complete visit outcome is unknown after a timeout; reconcile with the provider before retrying.", code="BOOKING_OUTCOME_UNKNOWN") from exc

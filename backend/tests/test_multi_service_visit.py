@@ -31,7 +31,7 @@ def visit():
     adapter.spa = spa
     adapter.default_duration_minutes = 60
     adapter.provider = 'square'
-    provider = SimpleNamespace(provider='square', location_id='loc', timezone_name=spa.timezone)
+    provider = SimpleNamespace(provider='square', location_id='loc', timezone_name=spa.timezone, environment='sandbox', api_version='2026-08-19')
     adapter.delegate = provider
     provider._parse_square_datetime = lambda s: datetime.fromisoformat(s.replace('Z', '+00:00'))
     provider._square_datetime = lambda dt: dt.astimezone(timezone.utc).isoformat()
