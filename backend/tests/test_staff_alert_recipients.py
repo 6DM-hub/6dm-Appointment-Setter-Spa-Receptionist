@@ -155,6 +155,9 @@ async def test_saved_callback_texts_the_dashboard_recipient(monkeypatch):
         async def commit(self):
             return None
 
+        async def flush(self):
+            return None
+
     class FakeSessionLocal:
         async def __aenter__(self):
             return FakeDb()
