@@ -3,7 +3,7 @@ import asyncio
 
 from sqlalchemy import select
 
-from app.models import Appointment, AppointmentStatus
+from app.models import Appointment, AppointmentStatus, SpaAccount
 from app.services import appointment_booking_service as booking
 from app.services.booking_state import arm_verified_proposal
 from tests.test_brick1_approval_slot_safety import install_pending_square
@@ -14,7 +14,9 @@ from tests_postgres.test_postgres_booking_races import pg  # noqa: F401
 async def test_two_square_callers_race_for_one_pending_approval_slot(pg, monkeypatch):
     maker, spas = pg
     async with maker() as db:
-        _, spa, _, squares = await setup_tenants((db, spas[0]), monkeypatch)
+        # The fixture tenant is detached; load it here so setup commits its menu.
+        tenant = await db.get(SpaAccount, spas[0].id)
+        _, spa, _, squares = await setup_tenants((db, tenant), monkeypatch)
     square = squares["fake-cleaning-token"]
     install_pending_square(monkeypatch, square)
     callers = [session_for(spa, f"approval-race-{n}", phone=f"+1555000787{n}") for n in (1, 2)]
