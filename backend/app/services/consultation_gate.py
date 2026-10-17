@@ -835,13 +835,15 @@ def _facial_answer_recognized(field: str, utterance: str) -> bool:
     if unsure:
         return False
     normalized = _normalized(text)
-    bare_polar = bool(
-        re.fullmatch(
-            r"(?:yes|yeah|yep|no|nope|none|never|not really|"
-            r"i do|i don't|i do not|i have|i haven't|i have not)",
-            normalized,
-        )
+    # `normalized` has no punctuation: "don't" becomes "don t".
+    polar = (
+        r"(?:yes|yeah|yep|yup|yea|no|nope|nah|none|never|not really|"
+        r"i do|i don t|i do not|i have|i haven t|i have not)"
     )
+    bare_polar = bool(re.fullmatch(polar, normalized))
+    # "Yes, on my forehead" / "No, not really" answer a yes/no question
+    # even though more words follow the yes or no.
+    leading_polar = bool(re.match(polar + r"\b", normalized))
     if field == "main_concern":
         if re.fullmatch(
             r"(?:what|huh|pardon|sorry|okay|ok|yes|yeah|yep|sure)",
@@ -857,11 +859,11 @@ def _facial_answer_recognized(field: str, utterance: str) -> bool:
             _contains_term(text, terms) for terms in _SKIN_FEEL_TERMS.values()
         )
     if field == "active_breakouts":
-        return bare_polar or _reported_status(
+        return leading_polar or _reported_status(
             text, ("acne", "breakout", "breakouts", "pimple", "pimples", "clogged pores")
         ) is not None
     if field == "skin_sensitivity":
-        return bare_polar or _reported_status(
+        return leading_polar or _reported_status(
             text,
             (
                 "sensitive",
