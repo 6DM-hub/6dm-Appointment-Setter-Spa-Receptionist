@@ -2306,7 +2306,7 @@ class SquareAdapter(VerticalProviderAdapter):
             raise BookingProviderError(
                 "Square did not return a booking id"
             )
-        if str(booking.get("status") or "").upper() == "ACCEPTED":
+        if str(booking.get("status") or "").upper() in {"ACCEPTED", "PENDING"}:
             if not (
                 booking.get("start_at")
                 and booking.get("appointment_segments")
@@ -2321,7 +2321,7 @@ class SquareAdapter(VerticalProviderAdapter):
         # idempotency key, including after that appointment was cancelled.
         # An id alone is not an active booking the caller can attend.
         square_status = str(booking.get("status") or "").upper()
-        if square_status != "ACCEPTED":
+        if square_status not in {"ACCEPTED", "PENDING"}:
             truth(
                 "BOOKING_CREATE_REJECTED",
                 provider="square",
@@ -2356,6 +2356,7 @@ class SquareAdapter(VerticalProviderAdapter):
             customer_email=resolved.email if resolved else None,
             customer_phone=resolved.phone if resolved else None,
             customer_resolution=self._customer_resolution,
+            provider_status=square_status,
         )
 
     # ------------------------------------------------------------------
@@ -2607,7 +2608,7 @@ class SquareAdapter(VerticalProviderAdapter):
                     external_booking_id=booking_id,
                     unchanged=True,
                 )
-                return ExternalBooking(provider=self.provider, external_id=booking_id)
+                return ExternalBooking(provider=self.provider, external_id=booking_id, provider_status=current_status)
 
             # Confirm Square says the new slot is valid. A business user moving
             # a booking from the dashboard decides availability themselves,
@@ -2705,6 +2706,7 @@ class SquareAdapter(VerticalProviderAdapter):
             provider=self.provider,
             external_id=booking_id,
             service_changed=service_change,
+            provider_status=str(updated.get("status") or ""),
         )
 
     def _verify_created_booking(self, created: dict[str, Any], requested: dict[str, Any]) -> None:

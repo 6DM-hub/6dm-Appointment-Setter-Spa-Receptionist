@@ -143,7 +143,7 @@ def insight(contact, appointments, now):
         key=lambda a: aware(a.end_time),
     )
     upcoming = [a for a in appointments if a.contact_id == contact.id
-                and a.status in (AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED)
+                and a.status in (AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED, AppointmentStatus.AWAITING_PROVIDER_APPROVAL)
                 and aware(a.end_time) > now]
     # A past scheduled row is not proof of a completed visit.
     counts = Counter((a.title, int((aware(a.end_time) - aware(a.start_time)).total_seconds() / 60))
@@ -440,7 +440,7 @@ async def book_test(db, tenant, actor, delivery_id, start, gateway=None):
         raise HTTPException(403, "Only consenting test customers can book here.")
     upcoming = (await db.execute(select(Appointment.id).where(
         Appointment.tenant_id == tenant, Appointment.contact_id == contact.id,
-        Appointment.status.in_([AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED]),
+        Appointment.status.in_([AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED, AppointmentStatus.AWAITING_PROVIDER_APPROVAL]),
         Appointment.end_time > now_utc()).limit(1))).first()
     if upcoming:
         raise HTTPException(409, "This customer already has an upcoming appointment.")

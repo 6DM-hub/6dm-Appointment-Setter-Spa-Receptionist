@@ -26,7 +26,7 @@ def same_booking(record, expected):
         instant = lambda s: datetime.fromisoformat(s.replace("Z", "+00:00"))
         keys = ("service_variation_id", "team_member_id", "duration_minutes", "service_variation_version")
         actual_segments, expected_segments = record["appointment_segments"], expected["appointment_segments"]
-        return (record.get("id") and record.get("status") == "ACCEPTED"
+        return (record.get("id") and record.get("status") in {"ACCEPTED", "PENDING"}
                 and all(record.get(k) == expected.get(k) for k in ("location_id", "customer_id"))
                 and instant(record["start_at"]) == instant(expected["start_at"])
                 and len(actual_segments) == len(expected_segments)
@@ -47,7 +47,7 @@ async def reconcile(delegate, payload):
         if not isinstance(data, dict) or data.get("errors") or not isinstance(data.get("bookings", []), list):
             raise BookingProviderError("Booking readback failed.", code="BOOKING_OUTCOME_UNKNOWN")
         for row in data.get("bookings", []):
-            if same_booking(row, expected):
+            if row.get("status") == "ACCEPTED" and same_booking(row, expected):
                 matches.append(row)
         if not data.get("cursor"):
             if len(matches) > 1:

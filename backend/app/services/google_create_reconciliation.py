@@ -96,7 +96,7 @@ async def _durable_contact(db, tenant_id, details) -> Contact | None:
 
 
 async def _settle_companion(db, tenant_id, record: BookingEscalation, details: dict, actor_id,
-                            appointment_id: str, event_id: str) -> None:
+                            appointment_id: str, event_id: str, awaiting_approval: bool = False) -> None:
     """Settle the per-call booking escalation written for this same attempt.
 
     Identified by the link stored on the record, or - for a record written
@@ -116,7 +116,7 @@ async def _settle_companion(db, tenant_id, record: BookingEscalation, details: d
     companion = (await db.execute(query.with_for_update())).scalar_one_or_none()
     if companion is None or companion.status not in _OPEN_STATUSES:
         return
-    companion.status = "booked"
+    companion.status = "awaiting_provider_approval" if awaiting_approval else "booked"
     companion.version += 1
     if companion.delivery_status == "pending":
         # Not yet sent: do not alert staff about a booking that is now verified.
@@ -164,11 +164,13 @@ async def reconcile_pending_create(db, tenant_id, request_id, actor_id) -> dict:
             connection is None or connection.selected_calendar_id != details.get("calendar_id")):
         reason = "the business's Google calendar is no longer the one the booking was sent to"
     event_id = None
+    awaiting_approval = False
     if reason is None:
         try:
             if details.get("provider") == "square":
                 from app.services.square_pending_create import verify_pending_square
-                event_id = await verify_pending_square(db, tenant_id, details)
+                event_id, provider_status = await verify_pending_square(db, tenant_id, details)
+                awaiting_approval = provider_status == "PENDING"
             else:
                 event_id = await gc.verify_created_event(connection, reference=reference, start=start, end=end)
         except (gc.GoogleCalendarError, BookingProviderError):
@@ -192,7 +194,7 @@ async def reconcile_pending_create(db, tenant_id, request_id, actor_id) -> dict:
             source_call_id=_uuid(details.get("source_call_id")),
             title=details.get("title") or "Appointment",
             description=details.get("description"),
-            start_time=start, end_time=end, status=AppointmentStatus.SCHEDULED,
+            start_time=start, end_time=end, status=(AppointmentStatus.AWAITING_PROVIDER_APPROVAL if awaiting_approval else AppointmentStatus.SCHEDULED),
             booking_provider="square" if details.get("provider") == "square" else "google_calendar",
             external_booking_id=event_id,
             booking_intent_key=reference,
@@ -213,13 +215,22 @@ async def reconcile_pending_create(db, tenant_id, request_id, actor_id) -> dict:
         row.version += 1
         await db.commit()
         return {"status": "unknown", "reason": "a different local booking already holds this intent"}
-    row.status = "booked"
+    if details.get("provider") == "square":
+        if appointment.status not in {AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED,
+                                      AppointmentStatus.AWAITING_PROVIDER_APPROVAL}:
+            _note(row, actor_id, "reconcile_conflict", existing_appointment_id=str(appointment.id))
+            row.version += 1
+            await db.commit()
+            return {"status": "unknown", "reason": "the linked local appointment is inactive"}
+        appointment.status = (AppointmentStatus.AWAITING_PROVIDER_APPROVAL if awaiting_approval
+                              else AppointmentStatus.SCHEDULED)
+    row.status = "awaiting_provider_approval" if awaiting_approval else "booked"
     row.version += 1
     row.details = {**details, "reconciled_event_id": event_id,
                    "reconciled_appointment_id": str(appointment.id),
                    "provider_success_verified": True}
     _note(row, actor_id, "reconcile_linked", appointment_id=str(appointment.id), event_id=event_id)
-    await _settle_companion(db, tenant_id, row, details, actor_id, str(appointment.id), event_id)
+    await _settle_companion(db, tenant_id, row, details, actor_id, str(appointment.id), event_id, awaiting_approval=awaiting_approval)
     await db.commit()
     logger.info("Pending provider create %s reconciled to appointment %s", row.id, appointment.id)
-    return {"status": "booked", "appointment_id": str(appointment.id), "event_id": event_id}
+    return {"status": "awaiting_provider_approval" if awaiting_approval else "booked", "appointment_id": str(appointment.id), "event_id": event_id}

@@ -288,7 +288,7 @@ async def create_visit(router, ctx):
         failures = []
         if candidate.get("id") != booking_id:
             failures.append("booking_id")
-        if candidate.get("status") != "ACCEPTED":
+        if candidate.get("status") not in {"ACCEPTED", "PENDING"}:
             failures.append("status")
         if candidate.get("location_id") != delegate.location_id:
             failures.append("location_id")
@@ -345,4 +345,5 @@ async def create_visit(router, ctx):
                 "Do not retry; staff must reconcile it in Square.",
                 code="BOOKING_OUTCOME_UNKNOWN",
             )
-    return ExternalBooking(provider="square", external_id=booking_id, external_customer_id=customer_id)
+        record = readback
+    return ExternalBooking(provider="square", external_id=booking_id, external_customer_id=customer_id, provider_status=record.get("status"))

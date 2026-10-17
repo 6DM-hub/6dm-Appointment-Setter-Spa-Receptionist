@@ -15,6 +15,7 @@ class CallVolume(BaseModel):
 class BookingVolume(BaseModel):
     total: int
     scheduled: int
+    awaiting_provider_approval: int = 0
     confirmed: int
     cancelled: int
     completed: int

@@ -173,7 +173,7 @@ async def confirm(db, tenant, actor, delivery_id, fingerprint, confirmation):
         appointment = existing
     else:
         upcoming = (await db.execute(select(Appointment.id).where(Appointment.tenant_id == tenant, Appointment.contact_id == contact.id,
-                            Appointment.status.in_(["scheduled", "confirmed"]), Appointment.end_time > m.now_utc()).limit(1))).first()
+                            Appointment.status.in_(["scheduled", "confirmed", "awaiting_provider_approval"]), Appointment.end_time > m.now_utc()).limit(1))).first()
         if upcoming:
             raise HTTPException(409, "The test customer already has an upcoming appointment.")
         spa = await db.get(SpaAccount, tenant)

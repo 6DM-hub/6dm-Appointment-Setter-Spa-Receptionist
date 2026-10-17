@@ -57,7 +57,7 @@ async def test_selecting_one_opening_keeps_others_and_square_overrides_local_agg
     calendar = _SelectingCalendar(revalidation_available=True)
     _patch_booking(monkeypatch, calendar)
     async def stale_local_conflict(*args, **kwargs):
-        return True
+        return not kwargs.get("pending_only", False)
     monkeypatch.setattr("app.services.appointment_booking_service._has_conflict", stale_local_conflict)
     session = _session()
     intent = AppointmentIntent(confidence=1, intent="schedule", service_description="Swedish massage", requested_start_iso=START.isoformat())

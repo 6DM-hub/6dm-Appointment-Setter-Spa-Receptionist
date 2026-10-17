@@ -50,6 +50,8 @@ BOOKED_DRAFT_SNAPSHOT = "booked_draft_snapshot"    # {"appointment_id", "turn", 
 ADDITIONAL_BOOKING = "additional_booking_pending"  # {"booking_id", "notice", "notice_spoken", "notice_turn"}
 USER_TURN_COUNT = "realtime_user_turn_count"       # persisted caller-turn counter
 BOOKING_KEPT_TURN = "booking_kept_turn"            # caller turn of the last "keep it"
+AWAITING_PROVIDER_APPROVAL = "awaiting_provider_approval"
+_PERSISTED_OUTCOMES = {"booked", "rescheduled", AWAITING_PROVIDER_APPROVAL}
 
 # Consent/offer state that belongs to ONE proposal. Never carried past a
 # completed booking or a "keep it".
@@ -99,6 +101,7 @@ def record_booking_completed(session: Any, turn: int) -> None:
         "draft": draft.to_dict(),
         "selected_service": getattr(session, "selected_service", None),
         "selected_duration": getattr(session, "selected_duration", None),
+        "booking_status": getattr(session, "booking_status", None),
         "confirmed_datetime": getattr(session, "confirmed_datetime", None),
         "requested_datetime": getattr(session, "requested_datetime", None),
     }
@@ -115,7 +118,7 @@ def is_exact_booked_replay(session: Any) -> bool:
     Missing snapshots fail closed, including sessions restored from older state.
     Proposal/consent flags are deliberately not evidence of booking identity.
     """
-    if getattr(session, "booking_status", None) not in {"booked", "rescheduled"}:
+    if getattr(session, "booking_status", None) not in _PERSISTED_OUTCOMES:
         return False
     snapshot = session.entities.get(BOOKED_DRAFT_SNAPSHOT)
     if not isinstance(snapshot, dict) or not isinstance(snapshot.get("draft"), dict):
@@ -164,8 +167,25 @@ def _restore_booked_snapshot(session: Any) -> bool:
             session.requested_datetime = snapshot["requested_datetime"]
         restored_any = True
     consume_confirmation_authorization(session)
-    session.booking_status = "booked"
+    session.booking_status = _snapshot_outcome(session)
     return restored_any
+
+
+def _snapshot_outcome(session: Any) -> str:
+    """Old accepted snapshots retain their existing booked default."""
+    snapshot = session.entities.get(BOOKED_DRAFT_SNAPSHOT) or {}
+    if snapshot.get("booking_status") == AWAITING_PROVIDER_APPROVAL:
+        return AWAITING_PROVIDER_APPROVAL
+    return "booked"
+
+
+def _pending_request_speech(session: Any, tz: Any) -> str:
+    from app.services.booking_state import _booked_service, _booked_when
+
+    service, start = booked_details(session)
+    return (f"Your {_booked_service(service)} request{_booked_when(start, tz)} "
+            "was received and is awaiting staff approval. "
+            "The business will confirm it.")
 
 
 def _abandoned_change_on_record(session: Any) -> bool:
@@ -181,7 +201,7 @@ def _abandoned_change_on_record(session: Any) -> bool:
         # so a cancelled booking is never reported or restored as booked.
         and str(session.entities.get("active_appointment_id") or "") == str(appointment_id)
         and session.entities.get("last_booking_outcome") != "cancelled"
-        and getattr(session, "booking_status", None) not in {"booked", "rescheduled"}
+        and getattr(session, "booking_status", None) not in _PERSISTED_OUTCOMES
         and not reconciliation_pending(session)
     )
 
@@ -211,7 +231,7 @@ def reported_booking_outcome(session: Any) -> str:
     outcome keeps its own status.
     """
     if _abandoned_change_on_record(session):
-        return "booked"
+        return _snapshot_outcome(session)
     status = getattr(session, "booking_status", None) or "none"
     return status if status != "none" else "no_booking"
 
@@ -376,6 +396,8 @@ def keep_existing_booking(session: Any, tz: Any, *, turn: int, call_sid: str | N
         invalidate_booking_proposal(session, "caller_kept_existing_booking")
     session.entities[BOOKING_KEPT_TURN] = int(turn)
     truth("BOOKING_KEPT_AS_IS", call_sid=call_sid, appointment_id=get_draft(session).appointment_id)
+    if _snapshot_outcome(session) == AWAITING_PROVIDER_APPROVAL:
+        return _pending_request_speech(session, tz) + " Nothing was changed."
     return kept_booking_speech(service, booked_iso, tz)
 
 
@@ -487,7 +509,10 @@ def mark_additional_booking(session: Any, tz: Any) -> None:
     service, booked_iso = booked_details(session)
     session.entities[ADDITIONAL_BOOKING] = {
         "booking_id": get_draft(session).booking_id,
-        "notice": additional_booking_notice(service, booked_iso, tz),
+        "notice": ("This would be an additional appointment request. "
+                   + _pending_request_speech(session, tz)
+                   if _snapshot_outcome(session) == AWAITING_PROVIDER_APPROVAL
+                   else additional_booking_notice(service, booked_iso, tz)),
         "notice_spoken": False,
         "notice_turn": None,
     }
@@ -688,6 +713,8 @@ def cancellation_decision(session: Any) -> str:
 def refused_cancellation_speech(session: Any, tz: Any) -> str:
     """What the caller hears when a cancellation they did not ask for is refused."""
     if booking_on_record(session):
+        if _snapshot_outcome(session) == AWAITING_PROVIDER_APPROVAL:
+            return "Nothing was cancelled. " + _pending_request_speech(session, tz)
         service, booked_iso = booked_details(session)
         return kept_booking_speech(service, booked_iso, tz).replace(
             "and nothing new was booked", "and nothing was cancelled"
@@ -704,7 +731,7 @@ def refused_cancellation_speech(session: Any, tz: Any) -> str:
 def offer_is_live(session: Any) -> bool:
     """Something was offered or read back and is still waiting for an answer."""
     draft = get_draft(session)
-    if draft.is_persisted and getattr(session, "booking_status", None) in {"booked", "rescheduled"}:
+    if draft.is_persisted and getattr(session, "booking_status", None) in _PERSISTED_OUTCOMES:
         return False
     return bool(
         session.entities.get("spoken_booking_offer")

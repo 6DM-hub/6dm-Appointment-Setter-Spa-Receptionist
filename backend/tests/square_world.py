@@ -233,7 +233,7 @@ class Store:
 
     @property
     def live(self) -> list[Appointment]:
-        return [r for r in self.rows if r.status in (AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED)]
+        return [r for r in self.rows if r.status in (AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED, AppointmentStatus.AWAITING_PROVIDER_APPROVAL)]
 
 
 class FakeDB:
@@ -306,8 +306,14 @@ def wire(monkeypatch, spa=None, adapter=None):
             return None
         return next((r for r in store.live if str(r.id) == str(appointment_id)), None)
 
-    async def _conflict(_db, _scope, start, end, capacity=1, exclude_id=None, exclude_intent_key=None):
-        return False  # Square is the source of truth for these tests.
+    async def _conflict(_db, _scope, start, end, capacity=1, exclude_id=None, exclude_intent_key=None, pending_only=False):
+        if not pending_only:
+            return False  # Accepted Square bookings use provider availability.
+        return any(r.status == AppointmentStatus.AWAITING_PROVIDER_APPROVAL
+                   and r.start_time < end and r.end_time > start
+                   and (exclude_id is None or r.id != exclude_id)
+                   and (exclude_intent_key is None or r.booking_intent_key != exclude_intent_key)
+                   for r in store.rows)
 
     async def _card_status(**_k):
         from app.models.appointment import CardStatus

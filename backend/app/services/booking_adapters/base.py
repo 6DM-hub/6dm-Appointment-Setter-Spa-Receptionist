@@ -117,6 +117,7 @@ class ExternalBooking:
     # Set by a verified move when the provider now holds a different SERVICE
     # than before (compared against the provider's own stored booking).
     service_changed: bool = False
+    provider_status: str | None = None
 
 
 @dataclass(frozen=True)

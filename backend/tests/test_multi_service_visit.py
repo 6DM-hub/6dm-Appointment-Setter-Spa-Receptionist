@@ -157,7 +157,7 @@ async def test_true_create_response_mismatch_requires_reconciliation_without_can
         booking['transition_time_minutes'] = 15
         segment = booking['appointment_segments'][0]
         if mismatch == 'status':
-            booking['status'] = 'PENDING'
+            booking['status'] = 'DECLINED'
         elif mismatch == 'location':
             booking['location_id'] = 'another-location'
         elif mismatch == 'customer':

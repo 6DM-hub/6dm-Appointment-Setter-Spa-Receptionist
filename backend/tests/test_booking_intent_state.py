@@ -122,7 +122,7 @@ class _Store:
     def live(self) -> list[Appointment]:
         return [
             r for r in self.rows
-            if r.status in (AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED)
+            if r.status in (AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED, AppointmentStatus.AWAITING_PROVIDER_APPROVAL)
         ]
 
 
@@ -204,11 +204,12 @@ def world(monkeypatch):
         return next((r for r in store.live if r.contact_id == cid), None)
 
     async def _conflict(
-        _db, _scope, start, end, capacity=1, exclude_id=None, exclude_intent_key=None
+        _db, _scope, start, end, capacity=1, exclude_id=None, exclude_intent_key=None, pending_only=False
     ):
         overlapping = [
             r for r in store.live
             if r.start_time < end and r.end_time > start
+            and (not pending_only or r.status == AppointmentStatus.AWAITING_PROVIDER_APPROVAL)
             and (exclude_id is None or r.id != exclude_id)
             and (
                 exclude_intent_key is None

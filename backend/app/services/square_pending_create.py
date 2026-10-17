@@ -62,12 +62,12 @@ async def verify_pending_square(db, tenant_id, details):
             replay = await delegate._request("POST", "/v2/bookings", json=copy.deepcopy(payload))
             record = replay.get("booking") if isinstance(replay, dict) else None
             if not same_booking(record, expected):
-                raise ValueError("Saved request replay is not verified ACCEPTED")
+                raise ValueError("Saved request replay is not a verified active request")
             booking_id = record["id"]
         current = await delegate._request("GET", f"/v2/bookings/{booking_id}")
         record = current.get("booking") if isinstance(current, dict) else None
         if not same_booking(record, expected) or record["id"] != booking_id:
             raise ValueError("Current booking differs from the saved request")
-        return booking_id
+        return booking_id, record["status"]
     except Exception as exc:
         raise BookingProviderError("Square recovery remains unverified", code="BOOKING_OUTCOME_UNKNOWN") from exc

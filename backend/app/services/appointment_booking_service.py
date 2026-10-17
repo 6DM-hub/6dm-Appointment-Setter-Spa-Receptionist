@@ -111,6 +111,7 @@ _REASON_OUTSIDE_HOURS = "outside_business_hours"
 
 
 class BookingOutcome(str, Enum):
+    AWAITING_PROVIDER_APPROVAL = "awaiting_provider_approval"
     BOOKED = "booked"
     RESCHEDULED = "rescheduled"
     CANCELLED = "cancelled"
@@ -148,7 +149,7 @@ def apply_booking_result(session: CallSession, result: BookingResult) -> None:
     mere presence of that row as "active" resurrects a cancelled booking in
     session state.
     """
-    active_outcomes = {BookingOutcome.BOOKED, BookingOutcome.RESCHEDULED}
+    active_outcomes = {BookingOutcome.BOOKED, BookingOutcome.RESCHEDULED, BookingOutcome.AWAITING_PROVIDER_APPROVAL}
     if result.outcome in active_outcomes and result.appointment is None:
         session.booking_status = "failed"
     elif result.outcome is BookingOutcome.DRAFT:
@@ -160,7 +161,7 @@ def apply_booking_result(session: CallSession, result: BookingResult) -> None:
 
     if result.outcome in active_outcomes and result.appointment is not None:
         session.appointment_id = str(result.appointment.id)
-        session.confirmed_datetime = result.appointment.start_time.isoformat()
+        session.confirmed_datetime = (None if result.outcome is BookingOutcome.AWAITING_PROVIDER_APPROVAL else result.appointment.start_time.isoformat())
         session.external_booking_id = result.appointment.external_booking_id
         session.entities["active_appointment_id"] = session.appointment_id
     elif result.outcome is BookingOutcome.CANCELLED:
@@ -343,6 +344,7 @@ async def _has_conflict(
     capacity: int = 1,
     exclude_id: uuid.UUID | None = None,
     exclude_intent_key: str | None = None,
+    pending_only: bool = False,
 ) -> bool:
     """Whether the slot is full *for someone else*.
 
@@ -357,10 +359,12 @@ async def _has_conflict(
     """
     query = select(func.count()).select_from(Appointment).where(
         scope_filter(scope, Appointment),
-        Appointment.status.in_([AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED]),
+        Appointment.status.in_([AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED, AppointmentStatus.AWAITING_PROVIDER_APPROVAL]),
         Appointment.start_time < end,
         Appointment.end_time > start,
     )
+    if pending_only:
+        query = query.where(Appointment.status == AppointmentStatus.AWAITING_PROVIDER_APPROVAL)
     if exclude_id:
         query = query.where(Appointment.id != exclude_id)
     if exclude_intent_key:
@@ -368,6 +372,15 @@ async def _has_conflict(
             (Appointment.booking_intent_key.is_(None))
             | (Appointment.booking_intent_key != exclude_intent_key)
         )
+    # Pending requests may not block Square availability yet. Without a
+    # structured local staff identity, conservatively hold the overlapping
+    # business slot rather than let a capacity count admit a duplicate.
+    if not pending_only and capacity > 1:
+        held = (await db.execute(query.where(
+            Appointment.status == AppointmentStatus.AWAITING_PROVIDER_APPROVAL
+        ))).scalar_one()
+        if held:
+            return True
     overlapping = (await db.execute(query)).scalar_one()
     return overlapping >= max(capacity, 1)
 
@@ -389,7 +402,7 @@ async def _load_by_intent_key(
                 scope_filter(scope, Appointment),
                 Appointment.booking_intent_key == key,
                 Appointment.status.in_(
-                    [AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED]
+                    [AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED, AppointmentStatus.AWAITING_PROVIDER_APPROVAL]
                 ),
             )
         )
@@ -586,7 +599,7 @@ async def _find_upcoming_appointment(
             .where(
                 scope_filter(scope, Appointment),
                 Appointment.contact_id == contact_id,
-                Appointment.status.in_([AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED]),
+                Appointment.status.in_([AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED, AppointmentStatus.AWAITING_PROVIDER_APPROVAL]),
                 Appointment.start_time >= now,
             )
             .order_by(Appointment.start_time.asc())
@@ -610,7 +623,7 @@ async def _find_upcoming_appointments(
             .where(
                 scope_filter(scope, Appointment),
                 Appointment.contact_id == contact_id,
-                Appointment.status.in_([AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED]),
+                Appointment.status.in_([AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED, AppointmentStatus.AWAITING_PROVIDER_APPROVAL]),
                 Appointment.start_time >= now,
             )
             .order_by(Appointment.start_time.asc())
@@ -684,7 +697,7 @@ async def _load_active_appointment(
             select(Appointment).where(
                 scope_filter(scope, Appointment),
                 Appointment.id == parsed_id,
-                Appointment.status.in_([AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED]),
+                Appointment.status.in_([AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED, AppointmentStatus.AWAITING_PROVIDER_APPROVAL]),
             )
         )
     ).scalar_one_or_none()
@@ -703,7 +716,7 @@ async def _load_call_owned_appointment(
             .where(
                 scope_filter(scope, Appointment),
                 CallLog.twilio_call_sid == call_sid,
-                Appointment.status.in_([AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED]),
+                Appointment.status.in_([AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED, AppointmentStatus.AWAITING_PROVIDER_APPROVAL]),
             )
             .order_by(Appointment.created_at.desc())
         )
@@ -1597,7 +1610,7 @@ async def stage_booking(
     prior_service = prior.service_description
     prior_staff = prior.preferred_staff
     draft = stage(session, intent)
-    if draft.to_dict() != prior.to_dict() and session.booking_status in {"booked", "rescheduled"}:
+    if draft.to_dict() != prior.to_dict() and session.booking_status in {"booked", "rescheduled", "awaiting_provider_approval"}:
         # stage() mutates the draft synchronously. Drop the old completion state
         # before routing or identity persistence can suspend/cancel this task.
         session.booking_status = "collecting_details"
@@ -1693,9 +1706,11 @@ async def stage_booking(
             draft.end_iso = end.isoformat()
             session.selected_duration = int((end - start).total_seconds() / 60)
 
-        taken = not verdict.available or (not _square_verified(verdict, routing.adapter) and await _has_conflict(
-            db, routing.scope, start, end, routing.capacity, exclude_intent_key=key
-        ))
+        taken = not verdict.available or await _has_conflict(
+            db, routing.scope, start, end,
+            1 if _square_verified(verdict, routing.adapter) else routing.capacity,
+            exclude_intent_key=key, pending_only=_square_verified(verdict, routing.adapter)
+        )
         if taken:
             seeded = list(getattr(verdict, "alternatives", ()) or ())
             if seeded:
@@ -1781,7 +1796,8 @@ def _service_change_refused(existing: Appointment, reason: str) -> BookingResult
         BookingOutcome.CONFLICT,
         message=(
             "Nothing was changed. The caller's existing "
-            f"{existing.title} at {existing.start_time.isoformat()} is still booked "
+            f"{existing.title} at {existing.start_time.isoformat()} is still "
+            f"{'awaiting staff approval' if existing.status == AppointmentStatus.AWAITING_PROVIDER_APPROVAL else 'booked'} "
             "exactly as before. The service on that booking could not be switched "
             f"automatically ({reason}). Tell the caller this, and ask whether they "
             "want to keep the current appointment or have staff make the change. "
@@ -2111,14 +2127,15 @@ async def _move_existing(
                 BookingOutcome.CONFLICT,
                 message=(
                     f"{exc} Nothing was changed; the existing {previous_title} at "
-                    f"{existing.start_time.isoformat()} is still booked. Ask for another time."
+                    f"{existing.start_time.isoformat()} is still "
+                    f"{'awaiting staff approval' if existing.status == AppointmentStatus.AWAITING_PROVIDER_APPROVAL else 'booked'}. Ask for another time."
                 ),
             )
         raise
     await _settle_provider_change(db, session, in_transaction=True)
     existing.start_time = start
     existing.end_time = end
-    existing.status = AppointmentStatus.SCHEDULED
+    existing.status = (AppointmentStatus.AWAITING_PROVIDER_APPROVAL if getattr(moved, "provider_status", None) == "PENDING" else AppointmentStatus.SCHEDULED)
     existing.external_booking_id = moved.external_id
     service_change = service_change or bool(getattr(moved, "service_changed", False))
     if service_change:
@@ -2134,6 +2151,10 @@ async def _move_existing(
     save_draft(session, draft)
     _remember_booked_identity(session, existing, draft, start)
     consume_confirmation_authorization(session)
+    if existing.status == AppointmentStatus.AWAITING_PROVIDER_APPROVAL:
+        session.booking_status = "awaiting_provider_approval"
+        return BookingResult(BookingOutcome.AWAITING_PROVIDER_APPROVAL, appointment=existing,
+                             message="Your updated request was received and is awaiting staff approval. The business will confirm it with you.")
     session.booking_status = "rescheduled"
     await _notify_staff_event(
         routing.spa,
@@ -2171,7 +2192,7 @@ async def confirm_booking(
     """
     result = await _confirm_booking(db, session, intent, test_adapter=test_adapter)
     if (
-        result.outcome in {BookingOutcome.BOOKED, BookingOutcome.RESCHEDULED}
+        result.outcome in {BookingOutcome.BOOKED, BookingOutcome.RESCHEDULED, BookingOutcome.AWAITING_PROVIDER_APPROVAL}
         and result.appointment is not None
         and get_draft(session).is_persisted
     ):
@@ -2370,6 +2391,11 @@ async def _confirm_booking(
             draft.external_booking_id = existing.external_booking_id
             save_draft(session, draft)
             service_change = _requested_service_change(session, draft, existing)
+            if same_window and not service_change and existing.status == AppointmentStatus.AWAITING_PROVIDER_APPROVAL:
+                consume_confirmation_authorization(session)
+                session.booking_status = "awaiting_provider_approval"
+                return BookingResult(BookingOutcome.AWAITING_PROVIDER_APPROVAL, appointment=existing,
+                                     message="Your request was received and is awaiting staff approval. The business will confirm it with you.")
             if same_window and not service_change:
                 # Case (A) from the brief: the "existing" booking is this very
                 # call's own. That is a success to report, not a clash.
@@ -2450,9 +2476,11 @@ async def _confirm_booking(
             draft.end_iso = end.isoformat()
             session.selected_duration = int((end - start).total_seconds() / 60)
 
-        if not verdict.available or (not _square_verified(verdict, routing.adapter) and await _has_conflict(
-            db, routing.scope, start, end, routing.capacity, exclude_intent_key=key
-        )):
+        if not verdict.available or await _has_conflict(
+            db, routing.scope, start, end,
+            1 if _square_verified(verdict, routing.adapter) else routing.capacity,
+            exclude_intent_key=key, pending_only=_square_verified(verdict, routing.adapter)
+        ):
             truth(
                 "AVAILABILITY_REVALIDATION",
                 call_sid=session.call_sid,
@@ -2587,6 +2615,10 @@ async def _confirm_booking(
             draft.appointment_id = str(raced.id)
             draft.external_booking_id = raced.external_booking_id
             save_draft(session, draft)
+            if raced.status == AppointmentStatus.AWAITING_PROVIDER_APPROVAL:
+                session.booking_status = "awaiting_provider_approval"
+                return BookingResult(BookingOutcome.AWAITING_PROVIDER_APPROVAL, appointment=raced,
+                                     message="Your request was received and is awaiting staff approval. The business will confirm it with you.")
             return BookingResult(
                 BookingOutcome.BOOKED,
                 appointment=raced,
@@ -2696,6 +2728,7 @@ async def _confirm_booking(
             raise BookingProviderError("Calendar returned no appointment ID")
         escalation_details["external_booking_id"] = external.external_id
         escalation_details["provider_success_verified"] = True
+        appointment.status = (AppointmentStatus.AWAITING_PROVIDER_APPROVAL if getattr(external, "provider_status", None) == "PENDING" else AppointmentStatus.SCHEDULED)
         appointment.booking_provider = external.provider
         appointment.external_booking_id = external.external_id
         _apply_provider_customer(contact, external)
@@ -2739,6 +2772,15 @@ async def _confirm_booking(
         await _close_pending_create(db, locals().get("pending_create_id"))
         await db.commit()
         await db.refresh(appointment)
+        if appointment.status == AppointmentStatus.AWAITING_PROVIDER_APPROVAL:
+            draft.appointment_id = str(appointment.id)
+            draft.external_booking_id = appointment.external_booking_id
+            save_draft(session, draft)
+            _remember_booked_identity(session, appointment, draft, start)
+            consume_confirmation_authorization(session)
+            session.booking_status = "awaiting_provider_approval"
+            return BookingResult(BookingOutcome.AWAITING_PROVIDER_APPROVAL, appointment=appointment,
+                                 message="Your request was received and is awaiting staff approval. The business will confirm it with you.")
         card_sms = "not_attempted"
         if appointment.card_status == CardStatus.PENDING_CARD and session.entities.get("card_link_delivery") == "email":
             from app.services.card_email import offer_secure_card_email
@@ -2973,6 +3015,10 @@ async def apply_staff_change(
                 )
             if getattr(moved, "external_id", None):
                 appointment.external_booking_id = moved.external_id
+            if getattr(moved, "provider_status", None) == "PENDING":
+                appointment.status = AppointmentStatus.AWAITING_PROVIDER_APPROVAL
+            elif getattr(moved, "provider_status", None) == "ACCEPTED":
+                appointment.status = AppointmentStatus.SCHEDULED
     except BookingProviderError as exc:
         truth("STAFF_CHANGE_REFUSED", appointment_id=str(appointment.id),
               operation=operation, code=exc.code)

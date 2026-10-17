@@ -128,6 +128,8 @@ def _reads_back_current_proposal(session: CallSession, reply: str, tz) -> bool:
 
 def _authoritative_reply(session: CallSession, reply: str) -> str:
     """Prevent model-only booking claims in the Twilio text pipeline."""
+    if session.booking_status == "awaiting_provider_approval":
+        return "Your request was received and is awaiting staff approval. The business will confirm it with you."
     booking_is_persisted = (
         session.booking_status in {"booked", "rescheduled"}
         and session.appointment_id is not None
@@ -872,7 +874,9 @@ async def voice_respond(
             guard_reply = (
                 booking_guard.uncertain_change_speech(session, tz)
                 if session.entities.get("booking_reconciliation_required")
-                else "I wasn't able to cancel that appointment, so it is still booked. "
+                else ("I wasn't able to cancel that request; it is still awaiting staff approval. "
+                        if booking_guard._snapshot_outcome(session) == "awaiting_provider_approval"
+                        else "I wasn't able to cancel that appointment, so it is still booked. ") +
                 "May a team member call you to help with it?"
             )
             guard_statement = True

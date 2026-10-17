@@ -1246,6 +1246,8 @@ class XAIVoiceSession:
         await self._send({"type": "response.cancel"})
 
     def _unverified_success_replacement(self) -> str:
+        if self.session.booking_status == "awaiting_provider_approval":
+            return "Your request was received and is awaiting staff approval. The business will confirm it with you."
         if self.session.booking_status == "conflict":
             return (
                 "That time is not available on the calendar. Nothing has been booked. "
@@ -1803,17 +1805,18 @@ class XAIVoiceSession:
             draft.end_iso = appointment.end_time.isoformat()
             draft.cancelled = False
             save_draft(self.session, draft)
-            self.session.booking_status = BookingOutcome.BOOKED.value
+            approval_pending = getattr(appointment, "status", None) == "awaiting_provider_approval"
+            self.session.booking_status = "awaiting_provider_approval" if approval_pending else BookingOutcome.BOOKED.value
             self.session.appointment_id = str(appointment.id)
             self.session.external_booking_id = appointment.external_booking_id
-            self.session.confirmed_datetime = appointment.start_time.isoformat()
+            self.session.confirmed_datetime = None if approval_pending else appointment.start_time.isoformat()
             self.session.entities["active_appointment_id"] = str(appointment.id)
             self.session.entities.pop("booking_reconciliation_required", None)
             self.session.entities.pop("callback_offer_pending", None)
             card_status = getattr(getattr(appointment, "card_status", None), "value", None)
             output = json.dumps({
-                "status": BookingOutcome.BOOKED.value,
-                "booked": True,
+                "status": self.session.booking_status,
+                "booked": not approval_pending,
                 "appointment_id": str(appointment.id),
                 "external_booking_id": appointment.external_booking_id,
                 "card_status": card_status,
@@ -2806,7 +2809,9 @@ class XAIVoiceSession:
         already_spoken = booking_guard.kept_this_turn(self.session, turn)
         if already_spoken:
             service, booked_iso = booking_guard.booked_details(self.session)
-            spoken = kept_booking_speech(service, booked_iso, self._tz)
+            spoken = ("Your request is unchanged and is awaiting staff approval."
+                      if self.session.booking_status == "awaiting_provider_approval"
+                      else kept_booking_speech(service, booked_iso, self._tz))
         else:
             spoken = booking_guard.keep_existing_booking(
                 self.session, self._tz, turn=turn, call_sid=self.call_id
@@ -2853,7 +2858,9 @@ class XAIVoiceSession:
                     forced = (
                         booking_guard.uncertain_change_speech(self.session, self._tz)
                         if self.session.entities.get("booking_reconciliation_required")
-                        else "I wasn't able to cancel that appointment, so it is still booked. "
+                        else ("I wasn't able to cancel that request; it is still awaiting staff approval. "
+                        if booking_guard._snapshot_outcome(self.session) == "awaiting_provider_approval"
+                        else "I wasn't able to cancel that appointment, so it is still booked. ") +
                         "May a team member call you to help with it?"
                     )
                     if payload.get("status") == "cancelled":
@@ -2934,6 +2941,9 @@ class XAIVoiceSession:
             decision = self._post_booking_decision(
                 model_operation, appointment_id, args, current_before_proposal
             )
+            if decision == "unchanged" and self.session.booking_status == "awaiting_provider_approval":
+                return json.dumps({"status": "awaiting_provider_approval", "booked": False,
+                                   "message": "Your request was received and is awaiting staff approval. Nothing was changed."})
             if decision == "unchanged":
                 return json.dumps({
                     "status": "already_booked",
@@ -3021,6 +3031,7 @@ class XAIVoiceSession:
                                 "appointment_id": str(appt.id),
                                 "start_iso": appt.start_time.isoformat(),
                                 "service": appt.title,
+                                "approval_status": ("awaiting_provider_approval" if getattr(appt, "status", None) == "awaiting_provider_approval" else "accepted"),
                             }
                             for appt in upcoming
                         ],
@@ -3049,6 +3060,7 @@ class XAIVoiceSession:
                             "appointment_id": str(appt.id),
                             "start_iso": appt.start_time.isoformat(),
                             "service": appt.title,
+                            "approval_status": ("awaiting_provider_approval" if getattr(appt, "status", None) == "awaiting_provider_approval" else "accepted"),
                         }
                         for appt in choices
                     ],
@@ -3075,6 +3087,7 @@ class XAIVoiceSession:
                             "appointment_id": str(appt.id),
                             "start_iso": appt.start_time.isoformat(),
                             "service": appt.title,
+                            "approval_status": ("awaiting_provider_approval" if getattr(appt, "status", None) == "awaiting_provider_approval" else "accepted"),
                         }
                         for appt in upcoming
                     ],
@@ -3407,6 +3420,7 @@ class XAIVoiceSession:
                 "appointment_id": str(appt.id),
                 "start_iso": appt.start_time.isoformat(),
                 "service": appt.title,
+                "approval_status": ("awaiting_provider_approval" if getattr(appt, "status", None) == "awaiting_provider_approval" else "accepted"),
             }
             for appt in upcoming
         ]
@@ -3417,7 +3431,7 @@ class XAIVoiceSession:
             "appointments": options,
             "cancellation_policy": cancellation_policy,
             "message": (
-                "These are the caller's upcoming appointments, earliest first. For cancel/reschedule, use only an appointment_id from this list. Before cancellation confirmation, quote only the cancellation_policy returned here."
+                "These are the caller's upcoming appointments and requests, earliest first. A request with approval_status awaiting_provider_approval was received but awaits staff approval; never call it booked or confirmed. For cancel/reschedule, use only an appointment_id from this list. Before cancellation confirmation, quote only the cancellation_policy returned here."
                 if options
                 else "No upcoming appointment was found for this caller."
             ),
@@ -3498,6 +3512,7 @@ class XAIVoiceSession:
                     "appointment_id": str(appt.id),
                     "start_iso": appt.start_time.isoformat(),
                     "service": appt.title,
+                    "approval_status": ("awaiting_provider_approval" if getattr(appt, "status", None) == "awaiting_provider_approval" else "accepted"),
                 }
                 for appt in upcoming
                 if str(appt.id) in allowed
@@ -6123,6 +6138,8 @@ class XAIVoiceSession:
             # booking made it back to the conversation. Ask once whether an SMS
             # arrived, then reconcile read-only on the caller's answer.
             return self._arm_confirmation_text_check()
+        if status == "awaiting_provider_approval":
+            return "Your request was received and is awaiting staff approval. The business will confirm it with you."
         if status not in {"booked", "rescheduled"}:
             return None
         if not payload.get("appointment_id") or not payload.get("external_booking_id"):

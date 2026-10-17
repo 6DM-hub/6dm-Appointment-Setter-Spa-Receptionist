@@ -182,7 +182,10 @@ async def update_appointment(
     old_end = appointment.end_time.replace(tzinfo=timezone.utc) if appointment.end_time.tzinfo is None else appointment.end_time
     new_start = changes.get("start_time", old_start)
     new_end = changes.get("end_time", old_end)
-    active = {AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED}
+    if (appointment.status == AppointmentStatus.AWAITING_PROVIDER_APPROVAL
+            and changes.get("status") in {AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED}):
+        raise HTTPException(status.HTTP_409_CONFLICT, "Provider approval must be verified before confirming this request")
+    active = {AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED, AppointmentStatus.AWAITING_PROVIDER_APPROVAL}
     if appointment.status not in active and (
         (new_start, new_end) != (old_start, old_end) or changes.get("status") in active
     ):
@@ -209,6 +212,9 @@ async def update_appointment(
             )
         except StaffChangeRefused as exc:
             raise HTTPException(exc.status_code, exc.detail) from exc
+    if moving and not cancelling and appointment.booking_provider == "square":
+        # The verified provider reply decides approval; stale form state cannot override it.
+        changes.pop("status", None)
     for field, value in changes.items():
         setattr(appointment, field, value)
     await db.commit()
@@ -229,7 +235,7 @@ async def cancel_appointment(
     await db.refresh(appointment)
     if appointment.status == AppointmentStatus.CANCELLED:
         raise HTTPException(status.HTTP_409_CONFLICT, ALREADY_CANCELLED)
-    if appointment.status not in {AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED}:
+    if appointment.status not in {AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED, AppointmentStatus.AWAITING_PROVIDER_APPROVAL}:
         raise HTTPException(status.HTTP_409_CONFLICT, "An inactive appointment cannot be cancelled")
     try:
         await apply_staff_change(db, scope, appointment, cancel=True)

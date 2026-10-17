@@ -81,6 +81,7 @@ async def get_analytics(
                 select(
                     func.count(Appointment.id).label("total"),
                     _count_if(Appointment.status == AppointmentStatus.SCHEDULED).label("scheduled"),
+                    _count_if(Appointment.status == AppointmentStatus.AWAITING_PROVIDER_APPROVAL).label("awaiting_provider_approval"),
                     _count_if(Appointment.status == AppointmentStatus.CONFIRMED).label("confirmed"),
                     _count_if(Appointment.status == AppointmentStatus.CANCELLED).label("cancelled"),
                     _count_if(Appointment.status == AppointmentStatus.COMPLETED).label("completed"),
