@@ -20,30 +20,34 @@ def payload():
 
 
 @pytest.mark.asyncio
-async def test_timeout_after_square_commit_recovers_without_second_write():
+async def test_timeout_after_square_commit_replays_same_key_then_checks_exact_id():
     p = payload()
     booking = {**p["booking"], "id": "real-booking", "status": "ACCEPTED"}
-    request = AsyncMock(side_effect=[TimeoutError(), {"bookings": [booking]}])
+    request = AsyncMock(side_effect=[TimeoutError(), {"booking": booking}, {"booking": booking}])
     result = await create_with_recovery(SimpleNamespace(_request=request), p)
     assert result["booking"]["id"] == "real-booking"
-    assert [call.args[0] for call in request.call_args_list] == ["POST", "GET"]
+    assert [call.args[0] for call in request.call_args_list] == ["POST", "POST", "GET"]
+    assert request.call_args_list[0].kwargs["json"] == request.call_args_list[1].kwargs["json"] == p
+    assert request.call_args_list[2].args[1] == "/v2/bookings/real-booking"
 
 
 @pytest.mark.asyncio
 async def test_safe_retry_preserves_exact_payload():
-    request = AsyncMock(side_effect=[BookingProviderError("busy", retryable=True), {"bookings": []}, {"booking": {"id": "ok"}}])
     p = payload()
+    record = {**p["booking"], "id": "ok", "status": "ACCEPTED"}
+    request = AsyncMock(side_effect=[BookingProviderError("busy", retryable=True), {"booking": record}, {"booking": record}])
     await create_with_recovery(SimpleNamespace(_request=request), p)
-    assert request.call_args_list[0].kwargs["json"] == request.call_args_list[2].kwargs["json"] == p
+    assert request.call_args_list[0].kwargs["json"] == request.call_args_list[1].kwargs["json"] == p
 
 
 @pytest.mark.asyncio
 async def test_retries_bounded_and_every_uncertain_write_read_back():
-    request = AsyncMock(side_effect=[TimeoutError(), {"bookings": []}, TimeoutError(), {"bookings": []}])
+    request = AsyncMock(side_effect=[TimeoutError(), TimeoutError()])
     with pytest.raises(BookingProviderError) as error:
         await create_with_recovery(SimpleNamespace(_request=request), payload())
     assert error.value.code == "BOOKING_OUTCOME_UNKNOWN"
-    assert request.await_count == 4
+    assert request.await_count == 2
+    assert all(c.args == ("POST", "/v2/bookings") and c.kwargs["json"] == payload() for c in request.call_args_list)
 
 
 @pytest.mark.asyncio

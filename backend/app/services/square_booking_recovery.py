@@ -67,7 +67,7 @@ async def create_with_recovery(delegate, payload):
         try:
             return await delegate._request("POST", "/v2/bookings", json=copy.deepcopy(payload))
         except (BookingProviderError, httpx.TransportError, asyncio.TimeoutError) as error:
-            if str(getattr(error, "code", "") or "").upper() == "BOOKING_OUTCOME_UNKNOWN":
+            if classify(error) in {"unknown_outcome", "temporary"}:
                 # _request maps lost booking-write replies to unknown, not
                 # temporary. Square's same-key replay identifies this exact
                 # operation; a coincidentally matching list row does not.
@@ -92,14 +92,4 @@ async def create_with_recovery(delegate, payload):
                         "The booking outcome cannot be verified; staff must check Square before retrying.",
                         code="BOOKING_OUTCOME_UNKNOWN",
                     ) from recovery_error
-            if classify(error) != "temporary":
-                raise
-            try:
-                recovered = await reconcile(delegate, payload)
-            except Exception as read_error:
-                raise BookingProviderError("The booking outcome cannot be verified; staff must check Square before retrying.", code="BOOKING_OUTCOME_UNKNOWN") from read_error
-            if recovered:
-                return {"booking": recovered}
-            if attempt:
-                raise BookingProviderError("The booking outcome remains uncertain; staff must check Square.", code="BOOKING_OUTCOME_UNKNOWN") from error
-            await asyncio.sleep(0.25)
+            raise
