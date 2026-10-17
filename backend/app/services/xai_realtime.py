@@ -5034,7 +5034,11 @@ class XAIVoiceSession:
             return json.dumps({"status": "stored", "kind": "callback"})
         from app.models.follow_up_request import FollowUpRequest
         from app.services.secure_payment import contains_sensitive_payment
-        from app.services.staff_notifications import callback_request_payload, notify_staff
+        from app.services.staff_notifications import (
+            callback_request_payload,
+            callback_staff_summary,
+            notify_staff,
+        )
 
         try:
             args = json.loads(raw_arguments or "{}")
@@ -5075,7 +5079,7 @@ class XAIVoiceSession:
                     await notify_staff(
                         spa,
                         "callback_requested",
-                        f"Callback requested on call {self.call_id}.",
+                        callback_staff_summary(payload, getattr(spa, "name", None)),
                     )
         except Exception:
             logger.exception("call %s: callback request failed", self.call_id)
