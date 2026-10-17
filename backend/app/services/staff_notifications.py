@@ -98,10 +98,14 @@ async def notify_staff(
     sent: list[dict[str, str]] = []
     if plan["sms_destinations"]:
         if sender is None:
+            from functools import partial
+
             from app.services.twilio_service import TwilioService
 
-            service = TwilioService()
-            sender = service.send_sms
+            # The spa's own Twilio number, like the card-link texts; the
+            # server-wide number is only the fallback inside send_sms.
+            spa_number = str(getattr(spa, "twilio_phone_number", None) or "").strip() or None
+            sender = partial(TwilioService().send_sms, from_number=spa_number)
         for phone in plan["sms_destinations"]:
             try:
                 sid = await sender(phone, plan["summary"])
@@ -110,7 +114,11 @@ async def notify_staff(
                 logger.exception("staff SMS failed for event %s", event)
                 continue
             if sid:
+                # Twilio accepted it; carrier delivery is reported in Twilio's logs.
+                logger.info("staff SMS accepted by Twilio for event %s: %s", event, sid)
                 sent.append({"channel": "sms"})
+            else:
+                logger.warning("staff SMS not sent for event %s (no sender or not accepted)", event)
     emails_sent = 0
     email_status = "none"
     if plan["email_destinations"]:

@@ -33,7 +33,10 @@ async def send_staff(spa, event, summary):
         for destination in dict.fromkeys(destinations):
             try:
                 if channel == "sms":
-                    result = "accepted" if await twilio_service.send_sms(destination, summary) else "failed_or_unknown"
+                    spa_number = str(getattr(spa, "twilio_phone_number", None) or "").strip() or None
+                    result = "accepted" if await twilio_service.send_sms(
+                        destination, summary, from_number=spa_number
+                    ) else "failed_or_unknown"
                 else:
                     result = await send_email(destination, summary)
             except Exception:

@@ -26,6 +26,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -97,6 +98,7 @@ from app.services.booking_state import (
     record_pure_confirmation,
     recover_caller_name_from_history,
     save_draft,
+    spoken_name_from_utterance,
     start_new_intent,
     supplied_caller_name,
     utterance_modifies_booking,
@@ -1022,6 +1024,15 @@ def _first_str(payload: Any, *keys: str) -> str | None:
     return None
 
 
+_CALLBACK_DAY_RE = re.compile(
+    r"\b(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    re.IGNORECASE,
+)
+_CALLBACK_ANY_TIME_RE = re.compile(
+    r"\b(?:any ?time|whenever|doesn'?t matter|no preference|whatever works)\b",
+    re.IGNORECASE,
+)
+
 UNCONNECTED_CALENDAR_CALLBACK_TEXT = (
     "I'm not able to check the schedule directly right now. Would it be okay if I "
     "asked a service provider to call you back to book at their earliest availability?"
@@ -1803,6 +1814,9 @@ class XAIVoiceSession:
         confirmed a booking but never called ``confirm_appointment``. Once a real
         read-back has been recorded, the state machine—not the LLM—owns the write.
         """
+        if await self._handle_callback_details(caller_text):
+            return True
+
         if await self._handle_confirmation_text_answer(caller_text):
             return True
 
@@ -1848,12 +1862,30 @@ class XAIVoiceSession:
         if self.session.entities.get("callback_offer_pending"):
             if is_affirmative(caller_text):
                 self.session.entities["callback_authorized"] = True
-                result = json.loads(await self._run_request_callback(json.dumps({"reason": "Appointment booking assistance requested after repeated availability errors."})))
+                # Save first so a hang-up cannot lose the request; the staff
+                # alert waits for the caller's name and best time (or call end).
+                result = json.loads(await self._run_request_callback(
+                    json.dumps({"reason": self._callback_reason()}), notify=False
+                ))
                 self.session.entities.pop("callback_offer_pending", None)
-                await self._send_force_message(
-                    "I've saved your callback request for the spa team to help with this appointment at their earliest availability."
-                    if result.get("status") == "stored" else "I couldn't save your callback request. Please contact the spa directly."
-                )
+                if result.get("status") != "stored":
+                    await self._send_force_message(
+                        "I couldn't save your callback request. Please contact the spa directly."
+                    )
+                    return True
+                name = recover_caller_name_from_history(self.session)
+                self.session.entities["callback_details"] = {"caller_name": name} if name else {}
+                if name:
+                    self.session.entities["callback_details_pending"] = "time"
+                    await self._send_force_message(
+                        f"Great, I've saved that for the team, {name}. "
+                        "When's a good time for them to call you back?"
+                    )
+                else:
+                    self.session.entities["callback_details_pending"] = "name"
+                    await self._send_force_message(
+                        "Great, I've saved that for the team. What name should I give them?"
+                    )
                 return True
             if is_negative(caller_text):
                 self.session.entities.pop("callback_offer_pending", None)
@@ -5063,7 +5095,124 @@ class XAIVoiceSession:
             or "I'm having trouble completing this appointment. Would it be okay if I asked a service provider to call you back to help at their earliest availability?"
         )
 
-    async def _run_request_callback(self, raw_arguments: str) -> str:
+    def _callback_reason(self) -> str:
+        """What the caller wanted, for the staff alert. Never card data."""
+        context = self.session.entities.get("callback_context") or {}
+        draft = get_draft(self.session)
+        service = " ".join(str(context.get("service") or draft.service_description or "").split())
+        day = ""
+        start = context.get("start_iso") or draft.start_iso
+        if start:
+            try:
+                moment = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+                if moment.tzinfo is not None:
+                    moment = moment.astimezone(self._tz)
+                day = f"{moment:%A}, {moment:%B} {moment.day}"
+            except ValueError:
+                day = ""
+        if not day:
+            for turn in reversed(list(self.session.history or [])):
+                if not isinstance(turn, dict) or turn.get("role") != "user":
+                    continue
+                match = _CALLBACK_DAY_RE.search(str(turn.get("content") or ""))
+                if match:
+                    day = match.group(0).capitalize()
+                    break
+        if service and day:
+            return f"Wants to book {service} on {day}"
+        if service:
+            return f"Wants to book {service}"
+        if day:
+            return f"Wants to book an appointment on {day}"
+        return "Wants help booking an appointment"
+
+    async def _handle_callback_details(self, caller_text: str) -> bool:
+        """Collect the caller's name, then a good time, after a callback yes."""
+        stage = self.session.entities.get("callback_details_pending")
+        if stage not in {"name", "time"}:
+            return False
+        details = dict(self.session.entities.get("callback_details") or {})
+        text = " ".join((caller_text or "").split())
+        if stage == "name":
+            name = spoken_name_from_utterance(text)
+            if name:
+                details["caller_name"] = name
+                draft = get_draft(self.session)
+                if not supplied_caller_name(draft):
+                    draft.caller_name = name
+                    save_draft(self.session, draft)
+            # One ask only: an unclear answer must not trap the caller.
+            self.session.entities["callback_details"] = details
+            self.session.entities["callback_details_pending"] = "time"
+            await self._cancel_active_response()
+            await self._send_force_message(
+                f"Thanks{', ' + name if name else ''}. "
+                "When's a good time for the team to call you back?"
+            )
+            return True
+        if is_negative(text) or _CALLBACK_ANY_TIME_RE.search(text):
+            window = "any time"
+        else:
+            window = text
+        details["preferred_window"] = window[:200]
+        self.session.entities["callback_details"] = details
+        self.session.entities.pop("callback_details_pending", None)
+        await self._cancel_active_response()
+        await self._send_pending_callback_alert()
+        await self._send_force_message(
+            "Got it. I've passed that to the team, and they'll call you back at the "
+            "number you're calling from. Is there anything else I can help with?"
+        )
+        return True
+
+    async def _send_pending_callback_alert(self) -> None:
+        """Send the staff alert once, with whatever details the caller gave."""
+        if not self.session.entities.pop("callback_alert_pending", None):
+            return
+        from app.models.follow_up_request import FollowUpRequest
+        from app.services.staff_notifications import (
+            callback_request_payload,
+            callback_staff_summary,
+            notify_staff,
+        )
+
+        details = dict(self.session.entities.get("callback_details") or {})
+        try:
+            async with AsyncSessionLocal() as db:
+                routing = await _prepare(db, self.session)
+                spa = routing.spa
+                if spa is None:
+                    return
+                row = None
+                row_id = self.session.entities.get("callback_request_id")
+                if row_id:
+                    try:
+                        row = await db.get(FollowUpRequest, uuid.UUID(str(row_id)))
+                    except ValueError:
+                        row = None
+                    if row is not None and row.spa_id != spa.id:
+                        row = None
+                payload = callback_request_payload(
+                    spa_id=spa.id,
+                    call_sid=self.call_id,
+                    caller_phone=self.session.customer_phone,
+                    caller_name=details.get("caller_name") or (row.caller_name if row else None),
+                    reason=(row.reason if row else None) or self._callback_reason(),
+                    preferred_window=details.get("preferred_window"),
+                )
+                if row is not None:
+                    row.caller_name = payload["caller_name"] or row.caller_name
+                    row.preferred_window = payload["preferred_window"] or row.preferred_window
+                    await db.commit()
+                await notify_staff(
+                    spa,
+                    "callback_requested",
+                    callback_staff_summary(payload, getattr(spa, "name", None)),
+                )
+        except Exception:
+            logger.exception("call %s: callback alert failed", self.call_id)
+
+    async def _run_request_callback(self, raw_arguments: str, *, notify: bool = True) -> str:
         if not self.session.entities.get("callback_authorized"):
             return json.dumps({"status": "consent_required", "message": "May I ask a service provider to call you back?"})
         if self.session.entities.get("callback_saved"):
@@ -5100,7 +5249,7 @@ class XAIVoiceSession:
                 if spa is None:
                     return json.dumps({"status": "error", "message": "The business could not be identified."})
                 if spa is not None:
-                    db.add(FollowUpRequest(
+                    row = FollowUpRequest(
                         spa_id=spa.id,
                         call_sid=payload["call_sid"],
                         caller_phone=payload["caller_phone"],
@@ -5109,14 +5258,22 @@ class XAIVoiceSession:
                         preferred_window=payload["preferred_window"],
                         kind="callback",
                         status="open",
-                    ))
+                    )
+                    db.add(row)
+                    await db.flush()
+                    row_id = getattr(row, "id", None)
                     await db.commit()
                     self.session.entities["callback_saved"] = True
-                    await notify_staff(
-                        spa,
-                        "callback_requested",
-                        callback_staff_summary(payload, getattr(spa, "name", None)),
-                    )
+                    if row_id is not None:
+                        self.session.entities["callback_request_id"] = str(row_id)
+                    if notify:
+                        await notify_staff(
+                            spa,
+                            "callback_requested",
+                            callback_staff_summary(payload, getattr(spa, "name", None)),
+                        )
+                    else:
+                        self.session.entities["callback_alert_pending"] = True
         except Exception:
             logger.exception("call %s: callback request failed", self.call_id)
             if self.session.entities.get("callback_saved"):
@@ -6410,6 +6567,14 @@ class XAIVoiceSession:
             if not skip_consultation:
                 await self._consultation_catalog()
                 if self._calendar_unconnected is True:
+                    self.session.entities["callback_context"] = {
+                        "service": str(
+                            parsed_args.get("service_description")
+                            or ", ".join(str(item) for item in parsed_args.get("requested_services") or [])
+                            or ""
+                        )[:120],
+                        "start_iso": parsed_args.get("requested_start_iso"),
+                    }
                     logger.info(
                         "call %s: calendar not connected; offering callback before consultation",
                         self.call_id,
@@ -7143,6 +7308,7 @@ class XAIVoiceSession:
         self._cancel_greeting_watchdog()
         await self._stop_availability_hold_watchdog()
         await self._settle_inflight_tools()
+        await self._send_pending_callback_alert()
         mark_call_ended(self.session)
         store = self._store()
         try:
