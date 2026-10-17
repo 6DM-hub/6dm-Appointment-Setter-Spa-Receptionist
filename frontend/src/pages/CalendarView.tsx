@@ -6,6 +6,7 @@ import { useAuth } from "../auth/AuthContext";
 import { PageHeader, Panel, StateBlock } from "../components/ui/Primitives";
 
 const STATUS_STYLES: Record<string, string> = {
+  awaiting_provider_approval: "bg-violet-400/10 text-violet-300",
   scheduled: "bg-cyan-400/10 text-cyan-300",
   confirmed: "bg-emerald-400/10 text-emerald-300",
   completed: "bg-slate-700/40 text-slate-300",
@@ -127,7 +128,9 @@ export default function CalendarView({
                             "bg-slate-700/40 text-slate-300"
                           }`}
                         >
-                          {appointment.status.replace(/_/g, " ")}
+                          {appointment.status === "awaiting_provider_approval"
+                            ? "Awaiting approval"
+                            : appointment.status.replace(/_/g, " ")}
                         </span>
                         {appointment.card_status && CARD_STATUS_LABELS[appointment.card_status] && (
                           <span

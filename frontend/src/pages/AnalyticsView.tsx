@@ -128,6 +128,7 @@ export default function AnalyticsView({
               <Panel title="Booking status">
                 <Breakdown
                   rows={[
+                    ["Awaiting approval", data.bookings.awaiting_provider_approval ?? 0],
                     ["scheduled", data.bookings.scheduled],
                     ["confirmed", data.bookings.confirmed],
                     ["completed", data.bookings.completed],

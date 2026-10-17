@@ -376,6 +376,7 @@ export interface CallLog {
 }
 
 export type AppointmentStatus =
+  | "awaiting_provider_approval"
   | "scheduled"
   | "confirmed"
   | "cancelled"
@@ -423,6 +424,7 @@ export interface AnalyticsSummary {
   };
   bookings: {
     total: number;
+    awaiting_provider_approval?: number;
     scheduled: number;
     confirmed: number;
     cancelled: number;
