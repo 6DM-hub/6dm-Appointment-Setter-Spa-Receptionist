@@ -4523,6 +4523,19 @@ class XAIVoiceSession:
             offer_turn = duration_turns.get(kind)
             if isinstance(offer_turn, int) and self._user_turn_count > offer_turn:
                 chosen = self._consultation_choice_from_caller(state, caller_text)
+                offered_minutes = [
+                    item.get("minutes")
+                    for item in state.get("duration_choices") or []
+                    if isinstance(item, dict) and isinstance(item.get("minutes"), int)
+                ]
+                if (
+                    chosen is None
+                    and len(set(offered_minutes)) == 1
+                    and is_affirmative(caller_text)
+                ):
+                    # "Would you like the 60-minute treatment?" -> "Yes."
+                    # A yes to the only offered length selects it.
+                    chosen = offered_minutes[0]
                 if chosen is not None:
                     try:
                         state = record_duration_selection(
