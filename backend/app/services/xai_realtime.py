@@ -1022,6 +1022,12 @@ def _first_str(payload: Any, *keys: str) -> str | None:
     return None
 
 
+UNCONNECTED_CALENDAR_CALLBACK_TEXT = (
+    "I'm not able to check the schedule directly right now. Would it be okay if I "
+    "asked a service provider to call you back to book at their earliest availability?"
+)
+
+
 class XAIVoiceSession:
     """One realtime voice call: WebSocket in, CallLog row out."""
 
@@ -1157,6 +1163,9 @@ class XAIVoiceSession:
         self._availability_recent: dict[str, tuple[float, str]] = {}
         self._consultation_catalog_cache: tuple[list[dict[str, Any]], list[dict[str, Any]]] | None = None
         self._consultation_catalog_available: bool | None = None
+        # True when the spa's booking calendar is not connected, so nothing can
+        # be checked or booked. None means unknown; only True changes the flow.
+        self._calendar_unconnected: bool | None = None
         self._availability_lookup_open = False
         self._muted_availability_response_id: str | None = None
         self._availability_model_response_id: str | None = None
@@ -3484,6 +3493,19 @@ class XAIVoiceSession:
                 if not hasattr(routing.spa, "services"):
                     self._consultation_catalog_available = False
                     return [], []
+                try:
+                    from app.services.booking_adapters.spa_router import (
+                        ProviderNotConfiguredAdapter,
+                        SpaBookingAdapter,
+                    )
+
+                    self._calendar_unconnected = isinstance(
+                        SpaBookingAdapter._select_delegate(routing.spa),
+                        ProviderNotConfiguredAdapter,
+                    )
+                except Exception:
+                    logger.exception("call %s: calendar connection check failed", self.call_id)
+                    self._calendar_unconnected = None
                 facts = dashboard_facts(routing.spa)
                 services = [
                     dict(item)
@@ -5024,7 +5046,7 @@ class XAIVoiceSession:
             await self._persist_session()
         return json.dumps(payload)
 
-    async def _offer_staff_callback(self) -> None:
+    async def _offer_staff_callback(self, message: str | None = None) -> None:
         if self.session.entities.get("callback_offer_pending"):
             return
         self.session.entities["callback_offer_pending"] = True
@@ -5037,7 +5059,8 @@ class XAIVoiceSession:
         if stop:
             await stop()
         await self._send_force_message(
-            "I'm having trouble completing this appointment. Would it be okay if I asked a service provider to call you back to help at their earliest availability?"
+            message
+            or "I'm having trouble completing this appointment. Would it be okay if I asked a service provider to call you back to help at their earliest availability?"
         )
 
     async def _run_request_callback(self, raw_arguments: str) -> str:
@@ -6381,6 +6404,32 @@ class XAIVoiceSession:
                 or offer_accepted(self.session)
             )
             raw_args = json.dumps(parsed_args)
+
+            # With no connected calendar nothing can be checked or booked, so
+            # offer the staff callback now instead of after the full intake.
+            if not skip_consultation:
+                await self._consultation_catalog()
+                if self._calendar_unconnected is True:
+                    logger.info(
+                        "call %s: calendar not connected; offering callback before consultation",
+                        self.call_id,
+                    )
+                    await self._send_function_output(
+                        call_ref,
+                        json.dumps({
+                            "status": "needs_staff_help",
+                            "code": "CALENDAR_NOT_CONNECTED",
+                            "available": False,
+                            "booked": False,
+                            "message": (
+                                "The spa's calendar is not connected, so times cannot "
+                                "be checked or booked. Nothing has been booked."
+                            ),
+                        }),
+                        nudge=False,
+                    )
+                    await self._offer_staff_callback(UNCONNECTED_CALENDAR_CALLBACK_TEXT)
+                    return
 
             # Complete the server-owned consultation and its soft choices
             # before asking scheduling questions. This keeps the consultation
