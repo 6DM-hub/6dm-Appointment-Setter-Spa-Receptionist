@@ -22,6 +22,7 @@ unrecognised is logged at debug under `_UNHANDLED` instead of being dropped
 silently. Tighten this once real sessions have been observed.
 """
 import asyncio
+from app.services.appointment_presentation import appointment_provenance, DASHBOARD_CANCELLATION_SPEECH
 import json
 import logging
 import re
@@ -3031,7 +3032,7 @@ class XAIVoiceSession:
                                 "appointment_id": str(appt.id),
                                 "start_iso": appt.start_time.isoformat(),
                                 "service": appt.title,
-                                "approval_status": ("awaiting_provider_approval" if getattr(appt, "status", None) == "awaiting_provider_approval" else "accepted"),
+                                **appointment_provenance(appt),
                             }
                             for appt in upcoming
                         ],
@@ -3060,7 +3061,7 @@ class XAIVoiceSession:
                             "appointment_id": str(appt.id),
                             "start_iso": appt.start_time.isoformat(),
                             "service": appt.title,
-                            "approval_status": ("awaiting_provider_approval" if getattr(appt, "status", None) == "awaiting_provider_approval" else "accepted"),
+                            **appointment_provenance(appt),
                         }
                         for appt in choices
                     ],
@@ -3087,7 +3088,7 @@ class XAIVoiceSession:
                             "appointment_id": str(appt.id),
                             "start_iso": appt.start_time.isoformat(),
                             "service": appt.title,
-                            "approval_status": ("awaiting_provider_approval" if getattr(appt, "status", None) == "awaiting_provider_approval" else "accepted"),
+                            **appointment_provenance(appt),
                         }
                         for appt in upcoming
                     ],
@@ -3388,7 +3389,7 @@ class XAIVoiceSession:
                     "start_iso": appt.start_time.isoformat(),
                     "service": appt.title,
                     "status": appt.status.value,
-                    "source": "verified_booking_record",
+                    **appointment_provenance(appt),
                 }
                 for appt in appointments
             ]
@@ -3398,10 +3399,10 @@ class XAIVoiceSession:
                 "purpose": "history",
                 "appointments": history,
                 "message": (
-                    "These are verified past appointment records for this caller, newest first. "
+                    "These are stored past appointment records for this caller, newest first. Respect each record_notice: dashboard_only entries are not verified external bookings. "
                     "Answer only from these records."
                     if history
-                    else "No verified past appointment record was found for this caller. Do not guess what they booked."
+                    else "No stored past appointment record was found for this caller. Do not guess what they booked."
                 ),
             })
 
@@ -3420,7 +3421,7 @@ class XAIVoiceSession:
                 "appointment_id": str(appt.id),
                 "start_iso": appt.start_time.isoformat(),
                 "service": appt.title,
-                "approval_status": ("awaiting_provider_approval" if getattr(appt, "status", None) == "awaiting_provider_approval" else "accepted"),
+                **appointment_provenance(appt),
             }
             for appt in upcoming
         ]
@@ -3431,7 +3432,7 @@ class XAIVoiceSession:
             "appointments": options,
             "cancellation_policy": cancellation_policy,
             "message": (
-                "These are the caller's upcoming appointments and requests, earliest first. A request with approval_status awaiting_provider_approval was received but awaits staff approval; never call it booked or confirmed. For cancel/reschedule, use only an appointment_id from this list. Before cancellation confirmation, quote only the cancellation_policy returned here."
+                "These are the caller's upcoming appointments and requests, earliest first. Respect each record_notice: dashboard_only entries are not verified external bookings. A request with approval_status awaiting_provider_approval was received but awaits staff approval; never call it booked or confirmed. For cancel/reschedule, use only an appointment_id from this list. Before cancellation confirmation, quote only the cancellation_policy returned here."
                 if options
                 else "No upcoming appointment was found for this caller."
             ),
@@ -3512,7 +3513,7 @@ class XAIVoiceSession:
                     "appointment_id": str(appt.id),
                     "start_iso": appt.start_time.isoformat(),
                     "service": appt.title,
-                    "approval_status": ("awaiting_provider_approval" if getattr(appt, "status", None) == "awaiting_provider_approval" else "accepted"),
+                    **appointment_provenance(appt),
                 }
                 for appt in upcoming
                 if str(appt.id) in allowed
@@ -3523,6 +3524,7 @@ class XAIVoiceSession:
             "booked": False,
             "appointment_id": str(result.appointment.id) if result.appointment else None,
             "external_booking_id": result.appointment.external_booking_id if result.appointment else None,
+            **(appointment_provenance(result.appointment) if result.appointment else {}),
             "cancelled_start_iso": result.appointment.start_time.isoformat() if result.outcome is BookingOutcome.CANCELLED and result.appointment else None,
             "service": result.appointment.title if result.appointment else None,
             "appointment_options": options,
@@ -6085,6 +6087,8 @@ class XAIVoiceSession:
         if tool_name == CANCEL_APPOINTMENT_TOOL["name"]:
             if status != "cancelled" or not payload.get("appointment_id"):
                 return None
+            if payload.get("source") == "dashboard_only":
+                return DASHBOARD_CANCELLATION_SPEECH
             service = str(payload.get("service") or "appointment").strip()
             cancelled_start = payload.get("cancelled_start_iso")
             if not cancelled_start:

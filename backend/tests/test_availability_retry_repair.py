@@ -254,7 +254,7 @@ async def test_voice_cache_invalidation_requires_successful_cancellation(monkeyp
     assert (not v._rejected_probe_signatures_this_turn) is cleared
 
 
-async def test_returning_customer_history_uses_only_verified_records(monkeypatch):
+async def test_returning_customer_history_discloses_unverified_local_records(monkeypatch):
     v = voice()
     past = SimpleNamespace(
         start_time=datetime(2026, 8, 4, 15, tzinfo=timezone.utc),
@@ -271,7 +271,9 @@ async def test_returning_customer_history_uses_only_verified_records(monkeypatch
         "start_iso": "2026-08-04T15:00:00+00:00",
         "service": "60 minute European facial",
         "status": "completed",
-        "source": "verified_booking_record",
+        "source": "dashboard_only",
+        "approval_status": "not_verified",
+        "record_notice": "Entered in CARA only; not verified with an external calendar.",
     }]
 
 

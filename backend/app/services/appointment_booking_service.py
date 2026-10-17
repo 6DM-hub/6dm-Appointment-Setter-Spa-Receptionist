@@ -652,10 +652,11 @@ async def lookup_upcoming_appointments(
 async def lookup_customer_history(
     db: AsyncSession, session: CallSession, limit: int = 5
 ) -> list[Appointment]:
-    """Return verified, non-cancelled past appointments for this phone number.
+    """Return stored, non-cancelled past appointments for this phone number.
 
     This is deliberately read-only and tenant-scoped.  It reports only rows
-    that were actually saved by Cara's booking workflow; it never derives a
+    saved in CARA, including dashboard entries. Presentation discloses provenance;
+    this lookup does not verify the external provider. It never derives a
     previous service from conversation text or from the current draft.
     """
     routing = await _prepare(db, session)
@@ -3326,7 +3327,7 @@ async def cancel_booking(
             appointment=existing,
             message=(
                 f"Appointment on {existing.start_time.isoformat()} was cancelled on "
-                f"{routing.adapter.calendar_label}. Tell the caller it is cancelled, "
+                f"{routing.adapter.calendar_label if existing.external_booking_id else 'CARA only; no external calendar booking was cancelled'}. Tell the caller it is cancelled, "
                 "then ask what day and time they want instead and call "
                 "propose_appointment for that new time. This is a new booking, "
                 "not a change to the cancelled one. Do not say it is rebooked "

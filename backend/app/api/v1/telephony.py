@@ -870,6 +870,11 @@ async def voice_respond(
             # Step one: CARA asks its own question, verbatim.
             guard_reply = message.replace(booking_guard.CANCELLATION_QUESTION_MARKER, "").strip()
             guard_statement = True
+        elif (result.outcome is BookingOutcome.CANCELLED and result.appointment is not None
+              and not result.appointment.external_booking_id and not result.appointment.booking_intent_key):
+            from app.services.appointment_presentation import DASHBOARD_CANCELLATION_SPEECH
+            guard_reply = DASHBOARD_CANCELLATION_SPEECH
+            guard_statement = True
         elif result.outcome is BookingOutcome.ERROR:
             guard_reply = (
                 booking_guard.uncertain_change_speech(session, tz)
