@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 
 
 class AppointmentStatus(str, enum.Enum):
+    AWAITING_PROVIDER_APPROVAL = "awaiting_provider_approval"
     SCHEDULED = "scheduled"
     CONFIRMED = "confirmed"
     CANCELLED = "cancelled"

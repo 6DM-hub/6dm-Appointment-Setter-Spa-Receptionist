@@ -49,6 +49,11 @@ class _RecordingOp:
     def execute(self, statement, *_a, **_k) -> None:
         self.statements.append(statement)
 
+    def get_context(self):
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+        return SimpleNamespace(autocommit_block=nullcontext)
+
     def get_bind(self):
         return _FakeBind(self.statements)
 
