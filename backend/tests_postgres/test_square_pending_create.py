@@ -6,7 +6,7 @@ import uuid
 import pytest
 from sqlalchemy import select
 
-from app.models import Appointment, Contact
+from app.models import Appointment, Contact, SpaAccount
 from app.models.booking_escalation import BookingEscalation
 from app.services import appointment_booking_service as booking
 from app.services import booking_escalations as esc
@@ -20,7 +20,9 @@ from tests_postgres.test_postgres_booking_races import pg  # noqa: F401
 async def test_square_worker_death_then_concurrent_reconcile_preserves_one_booking(pg, monkeypatch):
     maker, spas = pg
     async with maker() as db:
-        _, spa, _, squares = await setup_tenants((db, spas[0]), monkeypatch)
+        # The fixture tenant is detached; load it here so setup commits its menu.
+        tenant = await db.get(SpaAccount, spas[0].id)
+        _, spa, _, squares = await setup_tenants((db, tenant), monkeypatch)
     tenant_id = spa.id
     square = squares["fake-cleaning-token"]
     request = SquareAdapter._request
