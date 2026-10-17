@@ -286,6 +286,13 @@ def square_spa(services=None, **overrides):
 
 def wire(monkeypatch, spa=None, adapter=None):
     """Point the real booking service at in-memory rows and a fake Square."""
+    # Match the simulated call date to its fixed October appointment fixtures.
+    class FixtureClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = THU_2PM_UTC - timedelta(days=2, hours=4)
+            return value.astimezone(tz) if tz else value.replace(tzinfo=None)
+    monkeypatch.setattr("app.services.appointment_booking_service.datetime", FixtureClock)
     spa = spa or square_spa()
     square = FakeSquare()
     adapter = adapter or SpaBookingAdapter(spa)

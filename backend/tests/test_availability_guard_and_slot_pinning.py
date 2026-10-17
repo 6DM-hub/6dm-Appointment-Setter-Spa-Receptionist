@@ -518,6 +518,13 @@ def _spa_for_engine_tests():
 
 def _fake_pending_creates(monkeypatch):
     """Model the new durable-create boundary in this database-free unit test."""
+    # Fixed appointment dates in this fixture need an equally fixed clock.
+    class FixtureClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = datetime(2026, 9, 1, tzinfo=timezone.utc)
+            return value.astimezone(tz) if tz else value.replace(tzinfo=None)
+    monkeypatch.setattr("app.services.appointment_booking_service.datetime", FixtureClock)
     records = {}
 
     async def open_record(db, tenant_id, key, details, *, record_id):

@@ -498,6 +498,13 @@ class _SelectingCalendar:
 
 
 def _patch_booking(monkeypatch, calendar):
+    # Fixed appointment dates in this fixture need an equally fixed clock.
+    class FixtureClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = datetime(2026, 9, 1, tzinfo=timezone.utc)
+            return value.astimezone(tz) if tz else value.replace(tzinfo=None)
+    monkeypatch.setattr("app.services.appointment_booking_service.datetime", FixtureClock)
     spa = SimpleNamespace(id=uuid.uuid4(), timezone="America/Chicago", staff=[])
     monkeypatch.setattr(
         "app.services.appointment_booking_service._load_spa",
