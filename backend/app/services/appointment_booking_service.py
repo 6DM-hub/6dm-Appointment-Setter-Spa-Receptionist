@@ -2021,6 +2021,26 @@ async def _unresolved_change_blocks(
     return details
 
 
+async def _reject_elapsed_start(db: AsyncSession, session: CallSession, start: datetime) -> BookingResult | None:
+    """A read-back cannot authorize a new write after its start has passed.
+
+    Existing exact no-op replays are handled before calling this guard.
+    A still-future offer has no arbitrary age cutoff; its availability is
+    rechecked by the normal pipeline before any provider write.
+    """
+    if utc_instant(start) > datetime.now(timezone.utc):
+        return None
+    await _safe_rollback(db)
+    invalidate_booking_proposal(session, "appointment_start_elapsed")
+    session.booking_status = "collecting_details"
+    return BookingResult(
+        BookingOutcome.MISSING_INFO,
+        message="That appointment time has already passed, so nothing was changed. "
+                "Ask for a new future time, check availability, read back the full "
+                "details, and wait for fresh agreement before booking.",
+    )
+
+
 async def _move_existing(
     db: AsyncSession,
     session: CallSession,
@@ -2102,6 +2122,9 @@ async def _move_existing(
             routing.adapter, session, _draft_intent(draft), start, end,
             selected_slot=draft.selected_slot,
         )
+    expired = await _reject_elapsed_start(db, session, start)
+    if expired is not None:
+        return expired
     refused = await _begin_provider_change(
         db, session, "move", existing, to_start=start, service=draft.service_description,
     )
@@ -2426,6 +2449,10 @@ async def _confirm_booking(
                 service_change=service_change,
             )
 
+        expired = await _reject_elapsed_start(db, session, start)
+        if expired is not None:
+            return expired
+
         # ---------------------------------------------------- first commit
         #
         # Pinned to `draft.selected_slot` when one exists (set by an earlier
@@ -2589,6 +2616,10 @@ async def _confirm_booking(
         guest_name = " ".join((draft.guest_name or "").split())
         if guest_name:
             description += f" Guest: {guest_name}."
+        expired = await _reject_elapsed_start(db, session, start)
+        if expired is not None:
+            return expired
+
         appointment = Appointment(
             contact_id=contact.id,
             title=ctx.title,

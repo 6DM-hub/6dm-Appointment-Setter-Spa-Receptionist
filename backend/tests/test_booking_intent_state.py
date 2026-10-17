@@ -164,6 +164,14 @@ class _FakeDB:
 @pytest.fixture
 def world(monkeypatch):
     """Wire the booking service to the in-memory store and recording calendar."""
+    # The fixture's fixed September 2026 appointments are future test data.
+    # Keep the engine clock equally explicit as elapsed-offer checks evolve.
+    class FixtureClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = datetime(2026, 9, 1, tzinfo=timezone.utc)
+            return value.astimezone(tz) if tz else value.replace(tzinfo=None)
+    monkeypatch.setattr(svc, "datetime", FixtureClock)
     store = _Store()
     adapter = _RecordingAdapter()
     db = _FakeDB(store)
